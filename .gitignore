@@ -1,0 +1,53 @@
+# =============================================================================
+# DockBack — public release repository (closed source, image-only).
+#
+# DEFAULT-DENY: nothing is published unless explicitly allow-listed below.
+# This keeps the source code, secrets, internal docs, and dev tooling OUT of the
+# public repo. Users pull the ready-built multi-arch image from GHCR — they never
+# build from source.
+# =============================================================================
+
+# Ignore everything at the repository root by default...
+/*
+
+# ...then publish ONLY these run + marketing artifacts:
+!/.gitignore
+!/README.md
+!/LICENSE
+!/SECURITY.md
+!/.env.example
+!/docker-compose.yml
+!/deploy/
+!/screenshots/
+
+# Belt-and-suspenders: never publish these even if the rules above change.
+# (Secrets, local state, internal material, source, and dev/prod tooling.)
+.env
+*.env
+!.env.example
+.claude/
+docs/
+backup/
+data/
+backups/
+*.db
+*.sqlite*
+*.key
+*.pem
+*.age
+docker-compose.dev.yml
+docker-compose.prod.yml
+Dockerfile
+.dockerignore
+Makefile
+go.mod
+go.sum
+main.go
+internal/
+frontend/
+scripts/
+.github/
+renovate.json5
+.grype.yaml
+.trivyignore
+node_modules/

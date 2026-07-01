@@ -1,0 +1,161 @@
+DockBack Personal-Use License, Version 1.0
+Source-Available. NOT an Open Source license.
+
+Copyright (c) 2025-2026 aiulian25
+
+===============================================================================
+Summary (non-binding — the terms below control)
+===============================================================================
+
+DockBack is FREE for personal, non-commercial use by individuals (for example,
+a home lab or a hobby project).
+
+ANY other use requires a paid commercial license from the Licensor. This
+includes, without limitation, any use by or for a company, business, non-profit
+or charitable organization, educational or research institution, or government
+or public body, and any use for commercial advantage or monetary compensation —
+even internal use, and even evaluation or testing for such purposes.
+
+The source code is available so you can read, audit, and self-host it, but this
+is not Open Source and does not grant Open Source rights.
+
+===============================================================================
+Terms and Conditions
+===============================================================================
+
+1. Definitions
+
+   "License" means this DockBack Personal-Use License, Version 1.0.
+
+   "Licensor" means aiulian25, the copyright holder of the Software.
+
+   "Software" means DockBack, including its source code, compiled binaries,
+   container images, documentation, configuration, and other assets, in
+   original or modified form, and any derivative works of it.
+
+   "You" (or "Your") means the individual exercising rights under this License.
+
+   "Personal Use" means use by a natural person, acting in their individual
+   capacity, for that person's own private and non-commercial purposes (for
+   example, a home lab, personal projects, or hobby use). Use is NOT Personal
+   Use if it is carried out on behalf of, for the benefit of, at the direction
+   of, or funded by any organization or entity, or if it is for any commercial
+   advantage or monetary compensation.
+
+   "Commercial Use" means any use of the Software that is not Personal Use.
+   Commercial Use includes, without limitation:
+     (a) any use by or for a company, business, sole proprietorship,
+         partnership, or other for-profit entity;
+     (b) any use by or for a non-profit or charitable organization, an
+         educational or research institution, or a government or public body;
+     (c) any use in connection with a product, service, or offering provided to
+         others (whether or not for a fee), including offering the Software as a
+         hosted, managed, or software-as-a-service (SaaS) offering;
+     (d) any use for commercial advantage or monetary compensation; and
+     (e) any evaluation, testing, development, demonstration, or internal use
+         undertaken for or in furtherance of any of the foregoing.
+
+2. Grant for Personal Use
+
+   Subject to Your compliance with this License, the Licensor grants You a
+   worldwide, royalty-free, non-exclusive, non-transferable, revocable license
+   to use, copy, modify, and self-host the Software solely for Personal Use.
+
+3. Commercial Use Requires a Separate License
+
+   Commercial Use of the Software is not permitted under this License and
+   requires a separate, paid commercial license from the Licensor. If You wish
+   to make any Commercial Use of the Software, You must obtain a commercial
+   license before doing so (see "Commercial Licensing" below), or refrain from
+   such use.
+
+4. Redistribution
+
+   You may redistribute unmodified or modified copies of the Software for the
+   Personal Use of others, provided that You:
+     (a) include a complete, unmodified copy of this License and all copyright,
+         license, and attribution notices with every copy; and
+     (b) do not sell, charge for, or otherwise commercialize the Software or
+         its distribution.
+   Each recipient receives their rights directly from the Licensor under this
+   License and only for Personal Use.
+
+5. Conditions and Notices
+
+   You must conspicuously display this License with each copy of the Software.
+   You must not remove, obscure, or alter any copyright, license, trademark, or
+   attribution notices contained in the Software.
+
+6. Trademarks
+
+   This License does not grant You any right to use the "DockBack" name, the
+   DockBack logo, or any other name, trademark, trade name, or logo of the
+   Licensor, except as reasonably necessary to give factual attribution to the
+   origin of the Software. You must not use them in any way that suggests
+   sponsorship or endorsement by the Licensor, and You must not use them in the
+   name or branding of any derivative work distributed to others.
+
+7. Reservation of Rights
+
+   All rights not expressly granted in this License are reserved by the
+   Licensor. No patent rights are granted except as necessary to exercise the
+   rights expressly granted for Personal Use.
+
+8. Termination
+
+   Any use of the Software that does not comply with this License automatically
+   and immediately terminates the rights granted to You under this License. Upon
+   termination, You must cease all use of the Software and destroy all copies in
+   Your possession or control. Sections 1, 6, 7, 9, 10, and 11 survive
+   termination.
+
+9. Disclaimer of Warranty
+
+   TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED ON AN
+   "AS IS" AND "AS AVAILABLE" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AND
+   TITLE. DockBack is a backup and restore tool: You are solely responsible for
+   verifying Your backups and testing Your restores. The Licensor is not
+   responsible for any data loss.
+
+10. Limitation of Liability
+
+    TO THE EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT WILL THE LICENSOR BE
+    LIABLE TO YOU FOR ANY DAMAGES ARISING OUT OF OR RELATED TO THIS LICENSE OR
+    THE USE OF, OR INABILITY TO USE, THE SOFTWARE, INCLUDING ANY DIRECT,
+    INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE
+    DAMAGES, OR ANY LOSS OF DATA, PROFITS, OR GOODWILL, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGES.
+
+11. Miscellaneous
+
+    If any provision of this License is held unenforceable, it will be modified
+    to the minimum extent necessary to make it enforceable, and the remaining
+    provisions will remain in full force and effect. This License constitutes
+    the entire agreement between You and the Licensor regarding the personal,
+    non-commercial use of the Software. The Licensor may publish future versions
+    of the Software under different terms; this License governs the version with
+    which it is distributed.
+
+===============================================================================
+Commercial Licensing
+===============================================================================
+
+To purchase a commercial license for any Commercial Use (including business,
+organizational, non-profit, educational, or governmental use), contact the
+Licensor:
+
+    aiulian25
+    https://github.com/aiulian25
+    To get in touch, open an issue titled "Commercial license" on the project's
+    GitHub repository.
+
+===============================================================================
+Note on AI / machine-learning use
+===============================================================================
+
+The Software and this repository may not be used, in whole or in part, to
+train, fine-tune, evaluate, or build any AI, machine-learning, or large language
+model system or dataset, nor be scraped, crawled, or ingested for such purposes,
+without the Licensor's prior written permission.

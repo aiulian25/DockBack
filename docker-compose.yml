@@ -1,0 +1,97 @@
+# DockBack — ready-to-run deployment.
+#
+# No build required. This pulls the ready-made multi-arch image
+# (linux/amd64 + linux/arm64) from GitHub Container Registry, so it runs the same
+# on a PC, mini-PC, server, Synology, or Raspberry Pi.
+#
+#   1. cp .env.example .env   &&   edit .env (set DOCKBACK_ENCRYPTION_KEY)
+#   2. docker compose up -d
+#   3. docker compose logs dockback | grep -i generated   # first-run admin password
+#   4. open http://127.0.0.1:28734
+#
+# Keep docker-compose.yml, .env and deploy/seccomp.json together in one folder.
+
+networks:
+  # App <-> socket-proxy only. internal: true == no internet access for the
+  # proxy, so a compromised proxy can't reach out.
+  dback_internal:
+    internal: true
+  # Lets the app reach your other Docker hosts and offsite backup destinations.
+  dback_egress:
+
+volumes:
+  dback-data:      # SQLite catalog + config
+  dback-backups:   # local backup target
+
+services:
+  # The ONLY container that touches the host Docker socket — a least-privilege,
+  # filtered proxy. DockBack talks to Docker through this, never the raw socket.
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0@sha256:9e4b9e7517a6b660f2cc903a19b257b1852d5b3344794e3ea334ff00ae677ac2
+    container_name: DockBack-socket-proxy
+    restart: always
+    environment:
+      CONTAINERS: 1   # list/inspect
+      IMAGES: 1       # inspect/pull for the volume sidecar
+      VOLUMES: 1      # inventory
+      NETWORKS: 1     # inventory
+      EXEC: 1         # database dumps + restore import
+      VERSION: 1      # API version negotiation
+      INFO: 1         # ping/health
+      POST: 1         # create/start/stop/exec/wait
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [dback_internal]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: "1.0"
+    pids_limit: 128
+
+  # DockBack itself: non-root, read-only rootfs, no host socket.
+  dockback:
+    image: ghcr.io/aiulian25/dockback:latest
+    container_name: DockBack
+    restart: always
+    depends_on:
+      socket-proxy:
+        condition: service_started
+    environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
+      HOST: 0.0.0.0
+      PORT: 28734
+      # REQUIRED — set a 64-hex-char key in .env. Losing it makes every backup
+      # unrecoverable (openssl rand -hex 32).
+      DOCKBACK_ENCRYPTION_KEY: ${DOCKBACK_ENCRYPTION_KEY:?set a 64-hex-char key in .env}
+      DOCKBACK_ADMIN_USER: ${DOCKBACK_ADMIN_USER:-admin}
+      DOCKBACK_ADMIN_PASSWORD: ${DOCKBACK_ADMIN_PASSWORD:-}
+      DOCKBACK_TRUST_PROXY: ${DOCKBACK_TRUST_PROXY:-false}
+      DOCKBACK_TRUSTED_PROXIES: ${DOCKBACK_TRUSTED_PROXIES:-}
+      DOCKBACK_EGRESS_ALLOW: ${DOCKBACK_EGRESS_ALLOW:-}
+      DOCKBACK_MAX_CONCURRENT_BACKUPS: ${DOCKBACK_MAX_CONCURRENT_BACKUPS:-3}
+      DOCKBACK_MAX_CONCURRENT_PER_NODE: ${DOCKBACK_MAX_CONCURRENT_PER_NODE:-2}
+      DOCKBACK_SCHEDULE_JITTER: ${DOCKBACK_SCHEDULE_JITTER:-30}
+      DOCKBACK_MAX_UPLOAD_MBPS: ${DOCKBACK_MAX_UPLOAD_MBPS:-0}
+      DOCKBACK_WORK_DIR: ${DOCKBACK_WORK_DIR:-/app/backups/.work}
+    ports:
+      # Localhost-only by default (safe). For LAN access change to
+      # "0.0.0.0:28734:28734" and, ideally, put a TLS reverse proxy in front
+      # (then set DOCKBACK_TRUST_PROXY=true).
+      - "127.0.0.1:28734:28734"
+    volumes:
+      - dback-data:/app/data
+      - dback-backups:/app/backups
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt:
+      - "no-new-privileges:true"
+      # Custom seccomp allow-list (stricter than Docker's default). Keep
+      # deploy/seccomp.json next to this file. Remove this line to fall back to
+      # Docker's default profile.
+      - "seccomp=./deploy/seccomp.json"
+    networks: [dback_internal, dback_egress]
+    mem_limit: 1g
+    cpus: "2.0"
+    pids_limit: 512
