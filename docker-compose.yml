@@ -44,10 +44,12 @@ services:
     networks: [dback_internal]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 128m
-    # cpus: "1.0"   # Optional CPU cap. Commented out for broad compatibility:
-    #   some kernels (notably Synology DSM) don't support the CFS scheduler and
-    #   fail with "NanoCPUs can not be set". Uncomment if your kernel supports it.
-    pids_limit: 128
+    # Optional CPU + PID caps — commented out for broad compatibility. Synology
+    # DSM and some kernels lack the CFS scheduler / PIDs cgroup and either fail
+    # ("NanoCPUs can not be set") or warn ("PIDs limit discarded"). Uncomment on
+    # kernels that support them.
+    # cpus: "1.0"
+    # pids_limit: 128
 
   # DockBack itself: non-root, read-only rootfs, no host socket.
   dockback:
@@ -95,7 +97,8 @@ services:
       - "seccomp=./deploy/seccomp.json"
     networks: [dback_internal, dback_egress]
     mem_limit: 1g
-    # cpus: "2.0"   # Optional CPU cap — commented out for broad compatibility
-    #   (Synology DSM and some kernels lack the CFS scheduler and error out with
-    #   "NanoCPUs can not be set"). Uncomment if your kernel supports it.
-    pids_limit: 512
+    # Optional CPU + PID caps — commented out for broad compatibility (Synology
+    # DSM and some kernels lack the CFS scheduler / PIDs cgroup). Uncomment on
+    # kernels that support them.
+    # cpus: "2.0"
+    # pids_limit: 512
