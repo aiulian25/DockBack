@@ -64,8 +64,10 @@ Synology, or Raspberry Pi — just pulls it. The only variable on your side is
 amd64-vs-arm64, and that's handled automatically by the image manifest.
 
 ```bash
-# 1. Get the run files (docker-compose.yml, .env.example, deploy/seccomp.json).
-#    Clone the repo, or download those three into one folder.
+# 1. Clone the repo and run from inside it — this is the reliable way, because
+#    docker-compose.yml references deploy/seccomp.json by relative path.
+git clone https://github.com/aiulian25/DockBack.git
+cd DockBack
 
 # 2. Configure
 cp .env.example .env
@@ -80,6 +82,31 @@ docker compose logs dockback | grep -i generated
 # 5. Open the UI
 #    http://127.0.0.1:28734
 ```
+
+> **Clone the repo — don't copy only `docker-compose.yml`.** The compose applies a
+> custom seccomp profile via `deploy/seccomp.json`, so that file must sit next to
+> the compose. If it's missing you'll get:
+> `opening seccomp profile (./deploy/seccomp.json) failed: ... no such file or directory`.
+> Cloning (or keeping `docker-compose.yml`, `.env` and `deploy/seccomp.json`
+> together in one folder) avoids this.
+
+### Hardening: the seccomp profile is optional
+
+By default the app container runs under a **custom seccomp allow-list**
+(`deploy/seccomp.json`) that's stricter than Docker's default — it blocks extra
+syscalls the app never uses (ptrace, process_vm_*, etc.). You can opt out: remove
+this line from `docker-compose.yml`
+
+```yaml
+      - "seccomp=./deploy/seccomp.json"
+```
+
+**Trade-off:** removing it means you no longer need to ship the profile file, and
+the container falls back to **Docker's default seccomp** (still a solid allow-list).
+You keep every other protection either way — **non-root**, **read-only root
+filesystem**, **all capabilities dropped**, and **`no-new-privileges`**. The custom
+profile is defense-in-depth polish, not the foundation, so opting out is a small,
+reasonable reduction in strictness — not a security hole.
 
 > ⚠️ **Key safety:** if you lose `DOCKBACK_ENCRYPTION_KEY`, every backup becomes
 > permanently unrecoverable. Back it up offline.
