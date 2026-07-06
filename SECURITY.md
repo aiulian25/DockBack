@@ -74,3 +74,32 @@ when a code fix needs longer — the target above is about closing the exposure.
 
 For the runtime hardening details you can verify yourself, see the shipped
 in-app **Docs → Security & Operations**.
+
+## Known issues tracked upstream
+
+We track issues we cannot yet fix in code because the fix is unavailable
+upstream. We assess residual risk against DockBack's actual execution model and
+re-evaluate on each routine update.
+
+### Docker engine (moby) client advisories — `github.com/docker/docker`
+
+- **Advisories:** `GO-2026-5746`, `GO-2026-5668`, `GO-2026-5617`, `GO-2026-4887`,
+  `GO-2026-4883` (CVE-2026-41567 / 41568 / 42306, CVE-2026-34040, CVE-2026-33997),
+  flagged by `govulncheck` in the pinned `github.com/docker/docker@v27.5.1+incompatible`.
+- **Why not simply patched:** the moby project moved the module to
+  `github.com/moby/moby/v2` and ships the fixes **only there**. There is **no fixed
+  release of `github.com/docker/docker`** (the import path we use), and
+  `github.com/moby/moby/v2` is currently a **pre-release (2.0.0-beta)** that does
+  not yet publish the client packages we depend on. Bumping to the newest stable
+  moby tag (v28.5.2) was verified **not** to clear the advisories.
+- **Residual-risk assessment (why exposure is low):** DockBack uses moby purely as
+  an **API client**, and only ever through a hardened `docker-socket-proxy` sidecar
+  with a restricted endpoint allow-list — it never runs the moby daemon or a host
+  Docker socket. Several of these advisories are **daemon/host-side** (e.g. symlink
+  swap on the host, path traversal during daemon-side operations) and are outside
+  DockBack's execution model. `govulncheck` attributes them at module granularity
+  because moby ships daemon, client, and API types as one module without
+  symbol-level fix metadata.
+- **Plan:** migrate to `github.com/moby/moby/v2` once it publishes a **stable client
+  release**, then re-scan to confirm the advisories clear. Tracked; re-checked each
+  routine update.
