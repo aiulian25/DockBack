@@ -46,13 +46,25 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
 - **3-2-1-1-0 ready** — local + multiple offsite destinations (SMB/Synology,
   Nextcloud/WebDAV, S3/Backblaze B2), with **S3/B2 Object-Lock (WORM)** immutable
   copies and a one-click "is this bucket really immutable?" preflight.
-- **Scheduling & retention** — automatic backups, GFS retention, per-container
-  overrides, and low-RPO protection for critical databases.
+- **Scheduling & retention** — multiple named schedules, GFS retention,
+  per-container overrides, low-RPO protection for critical databases, and an
+  optional **scheduled retention prune** that reclaims space fleet-wide even for
+  targets that aren't being actively backed up.
+- **App-native exports** — for supported apps (Paperless, Gitea/Forgejo) DockBack
+  can capture the application's own first-party dump for a portable,
+  version-independent restore — recognized automatically, no setup.
+- **Per-destination upload controls** — an upload-rate throttle and quiet-hours
+  upload window per offsite target, so a slow or metered link never saturates
+  your uplink (a backup still completes locally and mirrors when the window opens).
+- **Insights & proof** — per-container size & growth trends, a recovery timeline,
+  periodic **restore drills** (test-restores into a sandbox) and re-verification
+  **scrubs** against bit-rot, plus persisted, **downloadable per-run logs**.
 - **Proactive alerting** — severity-routed notifications (Gotify, email, webhook)
   and an outbound heartbeat / dead-man's-switch so *silence* can't hide a failure.
-- **Themed web UI**, single-admin auth (argon2id) + optional 2FA, CSRF, audit
-  trail, live log streaming, `/healthz` and Prometheus `/metrics`, and a full
-  in-app documentation section.
+- **Hardened, single-admin web UI** — argon2id auth with optional TOTP 2FA,
+  absolute + idle **auto-logout**, escalating login lockout, CSRF, an audit trail,
+  live log streaming, `/healthz` and Prometheus `/metrics`, and full in-app docs.
+  See **[Access control & account security](#access-control--account-security)** below.
 
 ---
 
@@ -108,13 +120,54 @@ filesystem**, **all capabilities dropped**, and **`no-new-privileges`**. The cus
 profile is defense-in-depth polish, not the foundation, so opting out is a small,
 reasonable reduction in strictness — not a security hole.
 
-> ⚠️ **Key safety:** if you lose `DOCKBACK_ENCRYPTION_KEY`, every backup becomes
-> permanently unrecoverable. Back it up offline.
+> **Warning — key safety:** if you lose `DOCKBACK_ENCRYPTION_KEY`, every backup
+> becomes permanently unrecoverable. Back it up offline.
 
-The UI binds to `127.0.0.1:28734` by default. For LAN access, change the port
-mapping in `docker-compose.yml` to `0.0.0.0:28734:28734` and — ideally — put your
-own ingress in front (**Cloudflare Tunnel, Pangolin, Tailscale, nginx/Caddy/
-Traefik**), then set `DOCKBACK_TRUST_PROXY=true`.
+The UI binds to `127.0.0.1:28734` by default. **Keep it that way** unless you have
+read the section below — DockBack is not meant to be reachable from the internet.
+
+---
+
+## Access it privately — do NOT expose DockBack to the internet
+
+> **Warning — this is a control plane, not a public web app.** DockBack can back
+> up, **restore**, **recreate**, and revert containers across every Docker host you
+> connect, and it holds the keys that decrypt your backups. A foothold here is
+> effectively **root over your fleet and your data**. Treat it like your router's
+> admin page or a domain-admin console: it belongs on a *private* network only.
+
+**Never do any of these:**
+
+- Port-forward `28734` on your router, or bind it to a public IP.
+- Put it behind a bare reverse proxy that terminates on a public hostname.
+- Place it in a public "dashboard" alongside apps you share with others.
+
+**Do this instead — reach it over a private overlay:**
+
+- **[Tailscale](https://tailscale.com/)** or **[WireGuard](https://www.wireguard.com/)**
+  (recommended) — join the host to your tailnet/VPN and browse to it over that
+  private interface. Nothing is published to the internet; only your own devices
+  can reach it.
+- **[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/)** or
+  **[Pangolin](https://github.com/fosrl/pangolin)** — only if you gate it with an
+  identity/access policy (SSO, device posture) in front, never as a plain public
+  ingress.
+
+For LAN/overlay access, change the port mapping in `docker-compose.yml` from
+`127.0.0.1:28734:28734` to bind your private interface (e.g. the Tailscale IP), and
+set `DOCKBACK_TRUST_PROXY=true` **only** when a trusted TLS proxy sits in front.
+Even on a private network, **keep the admin password strong and turn on 2FA** —
+the private overlay is your outer wall, the app's own auth is the inner one.
+
+### Desktop-only, on purpose
+
+DockBack's UI is **intentionally not designed for phones or small screens.** This
+is a deliberate safety guardrail, not an oversight: restoring, recreating, and
+reverting containers are destructive, high-consequence actions, and they should be
+done deliberately from a desktop or laptop — not tapped out one-handed on a phone.
+Pair this with the private-network access above (for example, browse to it from
+your laptop over Tailscale) and operate it the way you'd operate any other piece of
+critical infrastructure.
 
 ---
 
@@ -137,6 +190,58 @@ The app container runs:
 Backups are encrypted with **AES-256-GCM** using a key you provide — never
 hardcoded, never written into the image. The archive format is open and
 self-describing, so backups are recoverable even without DockBack (see below).
+
+---
+
+## Access control & account security
+
+DockBack ships a single **admin** account and a set of guards that are on by
+default — a defense-in-depth complement to the private-network access above.
+
+**Authentication & sessions**
+
+- **argon2id** password hashing (memory-hard); the password is never stored in
+  plaintext and never baked into the image.
+- **Auto-logout, two ways:** an **absolute 12-hour** session lifetime *and* a
+  **30-minute sliding idle** timeout. The UI warns you before either fires and
+  offers a one-time **extend** so you're never dumped mid-task without notice.
+- **Change password** re-authenticates with your current password and then
+  **revokes every other session** — a leaked or shared session is cut off the
+  moment you rotate the password. A manual **"sign out other sessions"** does the
+  same on demand, and **logout** invalidates the session server-side (not just the
+  cookie).
+- **Two-factor authentication (TOTP)** — optional, standard authenticator apps.
+  The secret is **sealed at rest** with your master key, one-time **recovery
+  codes** are stored only as hashes, and a single-use step guard blocks code
+  **replay**.
+
+**Anti-abuse & anti-tamper**
+
+- **Login lockout** — a persisted, escalating per-IP **and** per-account
+  sliding-window lock (survives restarts), plus a concurrency cap on argon2
+  verifications so login can't be turned into a CPU/memory DoS.
+- **CSRF protection** on every state-changing request (double-submit token).
+- **Hardened cookies** — `__Host-` prefix, `HttpOnly`, `SameSite`, and `Secure`
+  when behind TLS; **security headers** including **HSTS** (2-year), a strict
+  **Content-Security-Policy**, `X-Frame-Options: DENY` (clickjacking), `nosniff`,
+  and `Referrer-Policy: no-referrer`.
+- **Audit trail** — logins (ok/failed/locked/2FA-failed), password changes,
+  session revocations, node and policy changes, and admin account events are all
+  recorded.
+
+**Secrets & outbound control**
+
+- **Everything sensitive is sealed at rest** — backup archives (AES-256-GCM), node
+  connection secrets (SSH keys / daemon mTLS material), and the TOTP secret are all
+  encrypted; app-state secrets are unwrapped with an argon2id-derived key at boot.
+- **Egress allow-list** — an optional default-deny outbound policy
+  (`DOCKBACK_EGRESS_ALLOW`) restricts which hosts the app may reach for offsite
+  storage and notifications, so a misconfiguration can't exfiltrate anywhere.
+
+> **Reminder:** these guards harden the app itself; they are the *inner* wall. They
+> are **not** a substitute for keeping DockBack off the public internet (see
+> [Access it privately](#access-it-privately--do-not-expose-dockback-to-the-internet)).
+> Run both walls.
 
 ---
 
