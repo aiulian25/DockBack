@@ -122,6 +122,13 @@ reasonable reduction in strictness — not a security hole.
 
 > **Warning — key safety:** if you lose `DOCKBACK_ENCRYPTION_KEY`, every backup
 > becomes permanently unrecoverable. Back it up offline.
+>
+> **Rotating the key:** use **Settings → Encryption → Rotate encryption key** — it
+> re-wraps existing backups and re-seals node/destination/notification/2FA secrets
+> in place (archives are not re-encrypted). After a successful rotation, update
+> `DOCKBACK_ENCRYPTION_KEY` to the **new** key before the next restart and keep the
+> old key archived until verified. Don't change the variable on its own — that
+> strands every existing backup.
 
 The UI binds to `127.0.0.1:28734` by default. **Keep it that way** unless you have
 read the section below — DockBack is not meant to be reachable from the internet.

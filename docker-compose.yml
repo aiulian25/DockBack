@@ -33,6 +33,7 @@ services:
     environment:
       CONTAINERS: 1   # list/inspect
       IMAGES: 1       # inspect/pull for the volume sidecar
+      DISTRIBUTION: 1 # read-only registry manifest peek for pre-restore image-availability check (no layer download)
       VOLUMES: 1      # inventory
       NETWORKS: 1     # inventory
       EXEC: 1         # database dumps + restore import
