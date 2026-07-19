@@ -81,6 +81,11 @@ services:
       # to accept connections. Raise on slow/loaded hosts (e.g. a NAS) if you ever
       # see "throwaway db not ready". Seconds; default 300.
       DOCKBACK_DB_READY_TIMEOUT: ${DOCKBACK_DB_READY_TIMEOUT:-300}
+      # The tiny helper image used to copy/measure volume data. On an air-gapped
+      # node that can only pull from a private mirror, point this at your mirrored
+      # Alpine (e.g. registry.internal/alpine:3.20). Default alpine:3.20. Also
+      # settable in-app (Settings -> Performance & tuning), which overrides this.
+      DOCKBACK_SIDECAR_IMAGE: ${DOCKBACK_SIDECAR_IMAGE:-alpine:3.20}
     ports:
       # Localhost-only by default (safe). For LAN access change to
       # "0.0.0.0:28734:28734" and, ideally, put a TLS reverse proxy in front
