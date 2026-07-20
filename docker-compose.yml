@@ -93,7 +93,12 @@ services:
       - "127.0.0.1:28734:28734"
     volumes:
       - dback-data:/app/data
-      - dback-backups:/app/backups
+      # Local backups (and the work spool) live here. Default: the managed
+      # "dback-backups" Docker volume. To store backups on a bigger disk — e.g. a
+      # mounted 2TB SSD — set DOCKBACK_BACKUPS_DIR_HOST in .env to a HOST PATH (like
+      # /mnt/ssd/dockback). FIRST give it to the app's non-root user, or writes fail:
+      #   sudo mkdir -p /mnt/ssd/dockback && sudo chown -R 65532:65532 /mnt/ssd/dockback
+      - ${DOCKBACK_BACKUPS_DIR_HOST:-dback-backups}:/app/backups
     read_only: true
     tmpfs:
       - /tmp:size=512m
