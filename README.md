@@ -44,8 +44,10 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   container from its manifest, one-click whole-stack restore, or download a
   decrypted archive for manual/granular recovery.
 - **3-2-1-1-0 ready** — local + multiple offsite destinations (SMB/Synology,
-  Nextcloud/WebDAV, S3/Backblaze B2), with **S3/B2 Object-Lock (WORM)** immutable
-  copies and a one-click "is this bucket really immutable?" preflight.
+  Nextcloud/WebDAV, S3/Backblaze B2, and any **SSH box via SFTP** with pinned
+  host keys), with **S3/B2 Object-Lock (WORM)** immutable copies, a one-click
+  "is this bucket really immutable?" preflight, and optional **sealed manifests**
+  so a cloud storage operator learns nothing about what's inside.
 - **Scheduling & retention** — multiple named schedules, GFS retention,
   per-container overrides, low-RPO protection for critical databases, and an
   optional **scheduled retention prune** that reclaims space fleet-wide even for
@@ -59,10 +61,21 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
 - **Insights & proof** — per-container size & growth trends, a recovery timeline,
   periodic **restore drills** (test-restores into a sandbox) and re-verification
   **scrubs** against bit-rot, plus persisted, **downloadable per-run logs**.
+- **Ransomware tripwire** — a backup whose delta suddenly touches most of a
+  volume (mass encryption / mass deletion) is flagged **suspect**, alerts
+  critically, and **freezes retention** for that container so clean pre-event
+  generations can't be pruned away underneath the attack.
+- **Find any file, in any generation** — every backup stores a complete file
+  index: search a path across all generations, diff two backups
+  (added/changed/deleted), browse without limits, and pull back a single file —
+  all without decrypting whole archives. A **config-drift banner** warns when a
+  container changed since its last backup.
 - **Proactive alerting** — severity-routed notifications (Gotify, email, webhook)
   and an outbound heartbeat / dead-man's-switch so *silence* can't hide a failure.
 - **Hardened, single-admin web UI** — argon2id auth with optional TOTP 2FA,
-  absolute + idle **auto-logout**, escalating login lockout, CSRF, an audit trail,
+  absolute + idle **auto-logout**, escalating login lockout, CSRF, **step-up
+  re-authentication ("sudo mode")** for key-material actions, expiring API
+  tokens, a **tamper-evident (hash-chained) audit trail**,
   live log streaming, `/healthz` and Prometheus `/metrics`, and full in-app docs.
   See **[Access control & account security](#access-control--account-security)** below.
 
