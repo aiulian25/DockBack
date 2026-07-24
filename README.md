@@ -42,7 +42,9 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   `Verified` / `Unverified` / `Failed`. Never downgraded to sampling.
 - **Restore** — re-import volumes + databases into a target container, recreate a
   container from its manifest, one-click whole-stack restore, or download a
-  decrypted archive for manual/granular recovery.
+  decrypted archive for manual/granular recovery. Backups **and** restores can be
+  **canceled mid-run** — a cancel stops at the next safe point, never rolls back
+  behind your back, and says exactly what was left where.
 - **3-2-1-1-0 ready** — local + multiple offsite destinations (SMB/Synology,
   Nextcloud/WebDAV, S3/Backblaze B2, and any **SSH box via SFTP** with pinned
   host keys), with **S3/B2 Object-Lock (WORM)** immutable copies, a one-click
