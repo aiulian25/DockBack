@@ -31,12 +31,30 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
 
 ## Features
 
-- **Multi-node** — manage many Docker hosts from one instance (local socket-proxy,
-  remote socket-proxy/TCP, SSH, or daemon mTLS).
+- **Multi-node, multi-cluster** — manage many Docker hosts from one instance
+  (local socket-proxy, remote socket-proxy/TCP, SSH, or daemon mTLS), grouped
+  into **clusters** (production / homelab / a remote site). Each cluster gets its
+  own dashboard rollup — reachability, backup coverage, and the age of its
+  *stalest* backup — and can carry its own destinations and retention, inherited
+  by every server in it. Removing a cluster removes a grouping only: servers,
+  containers and backups are never deleted.
 - **Auto-discovery** — lists containers and reconstructs Compose stacks via labels.
+- **Machine page** — per node, the actual hardware (vendor, model, BIOS date, CPU,
+  GPU, disks, NICs) beside its live host utilisation: CPU, memory, disk and
+  network throughput, temperatures. Read by a short-lived **unprivileged,
+  read-only** container with the host's `/proc` and `/sys` mounted `:ro` — nothing
+  is written and **serial numbers are never collected**. Unlike the dashboard's
+  container-sum figures, these are whole-machine numbers.
 - **True backups** — live database dumps (`pg_dump`/`mysqldump`/`mongodump` run
   *inside* the target), raw volume archives via a `--volumes-from` sidecar, and
   the container config — compressed (zstd) and encrypted (**AES-256-GCM**).
+- **Write-only backups (optional)** — seal every backup to an X25519 **public** key
+  and keep the private half offline. DockBack can then create, mirror and
+  integrity-check backups but **cannot read them** — so a break-in that owns the
+  container still cannot exfiltrate your backup history. Restoring pastes the
+  offline key once, in memory. Trade-off stated plainly: what DockBack can't read
+  it can't test, so deep verification, restore drills and incrementals are off for
+  those backups. Fully recoverable offline with the bundled Python tool.
 - **Always-on verification** — every backup is integrity-checked (ciphertext
   SHA-256, full decrypt + decompress + archive walk, DB-dump sanity) and marked
   `Verified` / `Unverified` / `Failed`. Never downgraded to sampling.
@@ -51,7 +69,8 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   "is this bucket really immutable?" preflight, and optional **sealed manifests**
   so a cloud storage operator learns nothing about what's inside.
 - **Scheduling & retention** — multiple named schedules, GFS retention,
-  per-container overrides, low-RPO protection for critical databases, and an
+  per-cluster / per-node / per-container overrides resolved most-specific-first,
+  low-RPO protection for critical databases, and an
   optional **scheduled retention prune** that reclaims space fleet-wide even for
   targets that aren't being actively backed up.
 - **App-native exports** — for supported apps (Paperless, Gitea/Forgejo) DockBack
@@ -312,6 +331,38 @@ transport and address, then **Test Connection** before saving:
 
 > Never expose a plaintext `tcp://…:2375` daemon on an untrusted network — that is
 > unauthenticated root on that host.
+
+### Grouping nodes into clusters
+
+A cluster in DockBack is a **grouping over hosts you have already connected** — it
+has no address of its own, and you never connect *to* a cluster. (DockBack talks
+to each host's Docker API directly; Swarm/Kubernetes-style "connect to one
+manager and discover its nodes" is not supported.)
+
+Each node belongs to a cluster (`default` unless you say otherwise). Assign one
+either from the node's Edit form, or from **Settings → Clusters →** expand a
+cluster → **Move servers here**, which lists the rest of your fleet. Either way
+only the grouping changes — never the transport, address, credential or backups.
+Cluster names are matched **without case**, so `prod` and `Prod` are the same
+cluster rather than two half-fleets.
+
+Manage clusters under **Settings → Clusters**: create, describe, colour, rename
+(which moves its servers *and* its policy atomically), and set a **per-cluster
+backup policy** — destinations and/or retention inherited by every server in it.
+Resolution is most-specific-first: `container → node → cluster → global`.
+
+Removing a cluster removes a **grouping**, never data: no server is
+disconnected, no container touched, and not one backup deleted. A cluster that
+still has servers can't be removed until you say which cluster they move to; the
+move and the removal happen in the same transaction. The one thing that *does*
+change is that the cluster's own policy goes away, so its servers fall back to
+the global policy — set the equivalent values on the destination cluster first if
+that matters.
+
+Per-node Prometheus gauges carry a `cluster` label
+(`dockback_node_reachable{node="…",cluster="production"}`) — an added label on the
+existing series, so anything already summing them keeps working and gains a free
+`by (cluster)` split.
 
 ---
 

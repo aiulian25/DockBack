@@ -111,9 +111,27 @@ services:
       # Docker's default profile.
       - "seccomp=./deploy/seccomp.json"
     networks: [dback_internal, dback_egress]
-    mem_limit: 1g
-    # Optional CPU + PID caps — commented out for broad compatibility (Synology
-    # DSM and some kernels lack the CFS scheduler / PIDs cgroup). Uncomment on
-    # kernels that support them.
-    # cpus: "2.0"
+    # Resource ceilings. These are RESOURCE-EXHAUSTION guardrails, not a security
+    # boundary — the boundary is non-root + read-only rootfs + all capabilities
+    # dropped + no-new-privileges + seccomp + the socket-proxy allow-list, none of
+    # which change when you raise these.
+    #
+    # Raise DOCKBACK_MEM_LIMIT if you back up large volumes or run several
+    # backups at once: compression buffers and the volume file index are the two
+    # things that want headroom. DockBack reads the cgroup at boot and sizes its
+    # garbage collector to whatever you set, so the extra memory is actually used
+    # rather than just permitted (it logs what it picked).
+    #
+    # 1g is a safe floor for a small fleet. 2-4g is a better fit once volumes get
+    # large. Keep SOME limit: a ceiling is what stops a runaway backup taking the
+    # host down with it.
+    mem_limit: ${DOCKBACK_MEM_LIMIT:-1g}
+    # CPU is UNCAPPED by default: compression is the bottleneck in a backup and
+    # it parallelises well, so letting it use the host's cores is the single
+    # biggest speed lever. Set DOCKBACK_CPUS (e.g. "4.0") to cap it on a shared
+    # box — DockBack will size GOMAXPROCS to match.
+    #
+    # Left commented because Synology DSM and some kernels lack the CFS scheduler
+    # / PIDs cgroup and either fail ("NanoCPUs can not be set") or warn.
+    # cpus: ${DOCKBACK_CPUS:-4.0}
     # pids_limit: 512
