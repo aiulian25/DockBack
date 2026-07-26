@@ -85,6 +85,14 @@ services:
       # node that can only pull from a private mirror, point this at your mirrored
       # Alpine (e.g. registry.internal/alpine:3.20). Default alpine:3.20. Also
       # settable in-app (Settings -> Performance & tuning), which overrides this.
+      #
+      # This image runs on your servers with read access to the data being backed
+      # up, so DockBack records the digest it actually used on each node the first
+      # time it runs one and REFUSES a different image afterwards — the same
+      # trust-on-first-use posture SSH host keys get. You can pin by digest here
+      # too if you want the reference itself immutable:
+      #   docker inspect --format='{{index .RepoDigests 0}}' alpine:3.20
+      # After deliberately changing this, use "Re-pin" on each node page.
       DOCKBACK_SIDECAR_IMAGE: ${DOCKBACK_SIDECAR_IMAGE:-alpine:3.20}
     ports:
       # Localhost-only by default (safe). For LAN access change to

@@ -89,8 +89,10 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
 - **Find any file, in any generation** — every backup stores a complete file
   index: search a path across all generations, diff two backups
   (added/changed/deleted), browse without limits, and pull back a single file —
-  all without decrypting whole archives. A **config-drift banner** warns when a
-  container changed since its last backup.
+  all without decrypting whole archives. One click **writes a recovered file
+  straight back into the running container** at its original path, with the
+  recorded ownership and mode and a `.bak` of what was there. A **config-drift
+  banner** warns when a container changed since its last backup.
 - **Proactive alerting** — severity-routed notifications (Gotify, email, webhook)
   and an outbound heartbeat / dead-man's-switch so *silence* can't hide a failure.
 - **Hardened, single-admin web UI** — argon2id auth with optional TOTP 2FA,
