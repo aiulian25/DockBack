@@ -72,6 +72,14 @@ services:
       DOCKBACK_TRUST_PROXY: ${DOCKBACK_TRUST_PROXY:-false}
       DOCKBACK_TRUSTED_PROXIES: ${DOCKBACK_TRUSTED_PROXIES:-}
       DOCKBACK_EGRESS_ALLOW: ${DOCKBACK_EGRESS_ALLOW:-}
+      # Sign-in policy. Boot defaults; Settings -> Security -> Sign-in policy can
+      # view/edit all three live (an in-app value overrides these). Session
+      # lifetime is the absolute cap; idle is the inactivity timeout. The minimum
+      # password length has a floor of 12 — a lower value is ignored, and it is
+      # enforced on DOCKBACK_ADMIN_PASSWORD on first run too.
+      DOCKBACK_SESSION_TTL_HOURS: ${DOCKBACK_SESSION_TTL_HOURS:-12}
+      DOCKBACK_SESSION_IDLE_MINUTES: ${DOCKBACK_SESSION_IDLE_MINUTES:-30}
+      DOCKBACK_MIN_PASSWORD_LEN: ${DOCKBACK_MIN_PASSWORD_LEN:-12}
       DOCKBACK_MAX_CONCURRENT_BACKUPS: ${DOCKBACK_MAX_CONCURRENT_BACKUPS:-3}
       DOCKBACK_MAX_CONCURRENT_PER_NODE: ${DOCKBACK_MAX_CONCURRENT_PER_NODE:-2}
       DOCKBACK_SCHEDULE_JITTER: ${DOCKBACK_SCHEDULE_JITTER:-30}
