@@ -51,3 +51,5 @@ renovate.json5
 .grype.yaml
 .trivyignore
 node_modules/
+__pycache__/
+*.pyc
