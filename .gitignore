@@ -53,3 +53,4 @@ renovate.json5
 node_modules/
 __pycache__/
 *.pyc
+build and push.md
