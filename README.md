@@ -334,6 +334,10 @@ transport and address, then **Test Connection** before saving:
 > Never expose a plaintext `tcp://…:2375` daemon on an untrusted network — that is
 > unauthenticated root on that host.
 
+Nodes appear in whatever order you arrange them: grab a card on the **Dashboard**
+or a row on the **Servers** page by its grip handle and drag it. The arrangement
+is saved server-side and both pages share it.
+
 ### Grouping nodes into clusters
 
 A cluster in DockBack is a **grouping over hosts you have already connected** — it
