@@ -63,9 +63,12 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   decrypted archive for manual/granular recovery. Backups **and** restores can be
   **canceled mid-run** — a cancel stops at the next safe point, never rolls back
   behind your back, and says exactly what was left where. Restoring onto a
-  different machine checks every **bind mount source** up front and stops with
-  the full list if any are missing, rather than letting Docker refuse one path at
-  a time — or quietly invent an empty directory where a file belongs.
+  different machine **creates the bind mount sources that host is missing** —
+  each as the directory or the file it actually was, with the ownership and mode
+  it had — instead of letting Docker refuse one path at a time or quietly invent
+  an empty directory where a file belongs. Two things it will not invent: the
+  contents of a file the backup never captured, and any path inside a system
+  location. Those are listed for you, before you confirm, with the command.
 - **3-2-1-1-0 ready** — local + multiple offsite destinations (SMB/Synology,
   Nextcloud/WebDAV, S3/Backblaze B2, and any **SSH box via SFTP** with pinned
   host keys), with **S3/B2 Object-Lock (WORM)** immutable copies, a one-click
