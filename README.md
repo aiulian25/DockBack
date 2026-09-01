@@ -69,7 +69,9 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   an empty directory where a file belongs. Two things it will not invent: the
   contents of a file the backup never captured, and any path inside a system
   location. Those are listed for you, before you confirm, with the command.
-  A move also corrects the three things that quietly break one: **ownership** —
+  When a base directory is needed the dialog checks it as you type, so a path
+  missing its leading slash is caught there rather than coming back as a failed
+  plan. A move also corrects the three things that quietly break one: **ownership** —
   verified afterwards by `stat` on the restored tree, not trusted from the
   archive's headers — a **`user:` override pinned to a NAS uid** that does not
   exist on the new host, and **proxy trust**, which is cleared when the container
