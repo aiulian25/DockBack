@@ -69,6 +69,12 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   an empty directory where a file belongs. Two things it will not invent: the
   contents of a file the backup never captured, and any path inside a system
   location. Those are listed for you, before you confirm, with the command.
+  A move also corrects the three things that quietly break one: **ownership** —
+  verified afterwards by `stat` on the restored tree, not trusted from the
+  archive's headers — a **`user:` override pinned to a NAS uid** that does not
+  exist on the new host, and **proxy trust**, which is cleared when the container
+  lands somewhere else so it cannot keep believing a machine no longer in the
+  path. Every one of those prints the command that puts it back.
 - **3-2-1-1-0 ready** — local + multiple offsite destinations (SMB/Synology,
   Nextcloud/WebDAV, S3/Backblaze B2, and any **SSH box via SFTP** with pinned
   host keys), with **S3/B2 Object-Lock (WORM)** immutable copies, a one-click
@@ -87,7 +93,21 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   your uplink (a backup still completes locally and mirrors when the window opens).
 - **Insights & proof** — per-container size & growth trends, a recovery timeline,
   periodic **restore drills** (test-restores into a sandbox) and re-verification
-  **scrubs** against bit-rot, plus persisted, **downloadable per-run logs**.
+  **scrubs** against bit-rot, plus persisted, **downloadable per-run logs**. A
+  drill gives back any image it had to pull — by ID, so nothing is left untagged
+  and unreclaimable — and while a large transfer is running the dashboard says
+  **"stats paused"** for that node instead of polling a saturated socket and
+  reporting a working machine as down.
+- **It tells you what's wrong with the stack, not just that the backup worked** —
+  every capture audits the container it is copying and reports what a restore
+  would faithfully reproduce: a database with **no healthcheck** (so everything
+  waiting on it races it at boot), a probe that **cannot fail**, a restart policy
+  that will **not survive a reboot**, a `user:` or `PUID` holding an id from a
+  different machine, two containers on **different builds of one image sharing a
+  directory**, and a tag whose registry has **moved on** — so your next `docker
+  pull` is an upgrade nobody scheduled. Findings, with the fix: nothing is
+  silently changed, and the corrections that are offered are opt-in checkboxes on
+  the restore itself.
 - **Ransomware tripwire** — a backup whose delta suddenly touches most of a
   volume (mass encryption / mass deletion) is flagged **suspect**, alerts
   critically, and **freezes retention** for that container so clean pre-event
