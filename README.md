@@ -39,6 +39,22 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   by every server in it. Removing a cluster removes a grouping only: servers,
   containers and backups are never deleted.
 - **Auto-discovery** — lists containers and reconstructs Compose stacks via labels.
+- **The Compose file it writes back describes the container you actually had** —
+  a stack's real `docker-compose.yml` lives on the host, out of reach behind the
+  socket-proxy, so DockBack reconstructs one from what Docker reports. That
+  reconstruction carries the parts that quietly decide whether the stack comes
+  back up: the **`hostname:`** other services resolve each other by — a lost one
+  is a crash loop, not a cosmetic diff — **per-network aliases and static IPs**
+  written in the form that can actually hold them, `network_mode`, the retry
+  count on an `on-failure:5`, and the limits and hardening that were really set
+  (memory and CPU, `security_opt`, `cap_add`/`cap_drop`, `read_only`, `devices`,
+  `tmpfs`, `ulimits`, `sysctls`, `dns`, `extra_hosts`, `shm_size`, `init`,
+  `stop_grace_period`). Values Docker merely derived on its own are left out
+  instead of being written down as though you had chosen them, and environment is
+  **diffed against the image** so the file lists your variables rather than the
+  hundred baked into the base image. App-consistent snapshots record their
+  network topology too, so the quieter capture path no longer produces the
+  thinner file.
 - **Machine page** — per node, the actual hardware (vendor, model, BIOS date, CPU,
   GPU, disks, NICs) beside its live host utilisation: CPU, memory, disk and
   network throughput, temperatures. Read by a short-lived **unprivileged,
@@ -77,6 +93,10 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   exist on the new host, and **proxy trust**, which is cleared when the container
   lands somewhere else so it cannot keep believing a machine no longer in the
   path. Every one of those prints the command that puts it back.
+  A restore in flight reports **which service of how many** has landed, finishes
+  on the whole stack instead of on its first container, and calls a partial
+  failure a failure — the console is told the outcome by the server now, rather
+  than inferring it from the wording of a log line.
 - **3-2-1-1-0 ready** — local + multiple offsite destinations (SMB/Synology,
   Nextcloud/WebDAV, S3/Backblaze B2, and any **SSH box via SFTP** with pinned
   host keys), with **S3/B2 Object-Lock (WORM)** immutable copies, a one-click
