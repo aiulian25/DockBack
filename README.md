@@ -87,7 +87,12 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   location. Those are listed for you, before you confirm, with the command.
   When a base directory is needed the dialog checks it as you type, so a path
   missing its leading slash is caught there rather than coming back as a failed
-  plan. A move also corrects the three things that quietly break one: **ownership** —
+  plan. A restore that **cannot stop** the container it is about to overwrite now
+  stops and tells you, instead of unpacking into a running one; a cancel is
+  honoured mid-archive rather than only between files; and when you restore part
+  of a stack the **free-space verdict is sized to the services you kept**, not to
+  the whole stack you did not ask for. A move also corrects the three things that
+  quietly break one: **ownership** —
   verified afterwards by `stat` on the restored tree, not trusted from the
   archive's headers — a **`user:` override pinned to a NAS uid** that does not
   exist on the new host, and **proxy trust**, which is cleared when the container
@@ -106,7 +111,9 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   per-cluster / per-node / per-container overrides resolved most-specific-first,
   low-RPO protection for critical databases, and an
   optional **scheduled retention prune** that reclaims space fleet-wide even for
-  targets that aren't being actively backed up.
+  targets that aren't being actively backed up. The sweep never deletes a **full
+  backup an incremental still builds on** — keeping a chain that restores, rather
+  than a count of files that happens to look right.
 - **App-native exports** — for supported apps (Paperless, Gitea/Forgejo) DockBack
   can capture the application's own first-party dump for a portable,
   version-independent restore — recognized automatically, no setup.
@@ -301,16 +308,25 @@ default — a defense-in-depth complement to the private-network access above.
   moment you rotate the password. A manual **"sign out other sessions"** does the
   same on demand, and **logout** invalidates the session server-side (not just the
   cookie).
+- **Sessions are stored hashed** — the database keeps a SHA-256 of each session
+  token, never the token itself, so a stolen copy of the database cannot be
+  replayed as a signed-in browser.
 - **Two-factor authentication (TOTP)** — optional, standard authenticator apps.
   The secret is **sealed at rest** with your master key, one-time **recovery
   codes** are stored only as hashes, and a single-use step guard blocks code
-  **replay**.
+  **replay**. Turning 2FA **off** takes a current code (or a recovery code) as
+  well as your password, so a borrowed session cannot quietly remove it.
 
 **Anti-abuse & anti-tamper**
 
 - **Login lockout** — a persisted, escalating per-IP **and** per-account
   sliding-window lock (survives restarts), plus a concurrency cap on argon2
-  verifications so login can't be turned into a CPU/memory DoS.
+  verifications so login can't be turned into a CPU/memory DoS. Behind a reverse
+  proxy it locks the **real caller**: the forwarded chain is read from the end
+  nearest your proxy and only the hops listed in `DOCKBACK_TRUSTED_PROXIES` are
+  believed, so nobody can spoof a header to lock out somebody else — and a proxy
+  list that does not parse stops the app at boot instead of quietly trusting
+  every caller.
 - **CSRF protection** on every state-changing request (double-submit token).
 - **Hardened cookies** — `__Host-` prefix, `HttpOnly`, `SameSite`, and `Secure`
   when behind TLS; **security headers** including **HSTS** (2-year), a strict
@@ -318,13 +334,18 @@ default — a defense-in-depth complement to the private-network access above.
   and `Referrer-Policy: no-referrer`.
 - **Audit trail** — logins (ok/failed/locked/2FA-failed), password changes,
   session revocations, node and policy changes, and admin account events are all
-  recorded.
+  recorded. Exporting it and checking its chain both work **a page at a time**, so
+  years of history come out on a small box instead of having to fit in memory
+  first — and an export that is cut short says so in the trail itself.
 
 **Secrets & outbound control**
 
 - **Everything sensitive is sealed at rest** — backup archives (AES-256-GCM), node
   connection secrets (SSH keys / daemon mTLS material), and the TOTP secret are all
   encrypted; app-state secrets are unwrapped with an argon2id-derived key at boot.
+  Database passwords are never put on a command line either: the dump commands
+  read the container's **own environment variable**, so the value never appears in
+  the process list anyone on that host can read.
 - **Egress allow-list** — an optional default-deny outbound policy
   (`DOCKBACK_EGRESS_ALLOW`) restricts which hosts the app may reach for offsite
   storage and notifications, so a misconfiguration can't exfiltrate anywhere.
@@ -428,6 +449,7 @@ existing series, so anything already summing them keeps working and gains a free
 | `DOCKBACK_ADMIN_USER` | `admin` | Single admin username. |
 | `DOCKBACK_ADMIN_PASSWORD` | *(generated)* | Printed once on first run if blank. |
 | `DOCKBACK_TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto` from your reverse proxy. |
+| `DOCKBACK_TRUSTED_PROXIES` | *(empty)* | Source ranges whose forwarded headers are believed, e.g. `172.16.0.0/12`. List every proxy in the chain. Empty trusts any caller, which DockBack alerts on. An entry that does not parse refuses to start. |
 | `DOCKBACK_EGRESS_ALLOW` | *(empty)* | Optional default-deny outbound allow-list. |
 | `DOCKBACK_MAX_CONCURRENT_BACKUPS` | `3` | Total backups running at once. |
 | `DOCKBACK_MAX_CONCURRENT_PER_NODE` | `2` | Backups at once on any one node. |
