@@ -1,56 +1,70 @@
 # =============================================================================
-# DockBack — public release repository (closed source, image-only).
+# DockBack — public source repository.
 #
-# DEFAULT-DENY: nothing is published unless explicitly allow-listed below.
-# This keeps the source code, secrets, internal docs, and dev tooling OUT of the
-# public repo. Users pull the ready-built multi-arch image from GHCR — they never
-# build from source.
+# DEFAULT-DENY: nothing is published unless it is listed below. The repo holds
+# exactly what builds and runs DockBack. Notes, backups, local settings and the
+# private deploy files stay on this machine, and anything new stays private
+# until it is added here on purpose.
 # =============================================================================
 
 # Ignore everything at the repository root by default...
 /*
 
-# ...then publish ONLY these run + marketing artifacts:
+# ...then publish what builds the image...
+!/Dockerfile
+!/.dockerignore
+!/Makefile
+!/.trivyignore
+!/.grype.yaml
+!/go.mod
+!/go.sum
+!/main.go
+!/embed_recover.go
+!/internal/
+!/frontend/
+!/scripts/
+
+# ...what runs it...
+!/docker-compose.yml
+!/deploy/
+!/.env.example
+
+# ...and the project's front page.
 !/.gitignore
 !/README.md
 !/LICENSE
 !/SECURITY.md
-!/.env.example
-!/docker-compose.yml
-!/deploy/
 !/screenshots/
 
-# Belt-and-suspenders: never publish these even if the rules above change.
-# (Secrets, local state, internal material, source, and dev/prod tooling.)
+# Inside what is published: dependencies, build output, caches and test debris.
+/frontend/node_modules/
+/frontend/tsconfig.tsbuildinfo
+/internal/web/dist/
+/internal/api/_app/
+__pycache__/
+*.pyc
+*~
+*.swp
+
+# Never publish these, even if a rule above is loosened later. Secret file
+# types match at any depth; the private folders are pinned to the root, because
+# unpinned "backup/" and "backups/" would also swallow internal/backup (the
+# backup engine) and the in-app help pages under docs/content/backups.
 .env
 *.env
 !.env.example
-.claude/
-docs/
-backup/
-data/
-backups/
 *.db
 *.sqlite*
 *.key
 *.pem
 *.age
-docker-compose.dev.yml
-docker-compose.prod.yml
-Dockerfile
-.dockerignore
-Makefile
-go.mod
-go.sum
-main.go
-internal/
-frontend/
-scripts/
-.github/
-renovate.json5
-.grype.yaml
-.trivyignore
-node_modules/
-__pycache__/
-*.pyc
-build and push.md
+/.claude/
+/backup/
+/data/
+/backups/
+/docker-compose.dev.yml
+/docker-compose.prod.yml
+
+# Private extensions compiled into this machine's builds but never published:
+# app profiles for applications that belong to this deployment, not the project.
+/internal/**/private_*.go

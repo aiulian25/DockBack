@@ -1,0 +1,267 @@
+@import "@fontsource-variable/inter";
+@import "@fontsource/geist-mono";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================================
+   THEME PALETTES
+   Each token is `--c-<name>: R G B` (space-separated channels) so Tailwind's
+   alpha-aware `rgb(var(--c-x) / <alpha>)` works (e.g. bg-primary/10). Switch at
+   runtime by setting `data-theme` on <html> (see theme.ts). Default = Midnight.
+   Dashboard-only accents (segments, gauges) are plain --dash-* vars used inline.
+   ============================================================================ */
+
+/* ---- Midnight (the dashboard redesign reference) — default ---- */
+:root,
+[data-theme="midnight"] {
+  color-scheme: dark;
+  --c-surface: 10 14 22;            /* #0a0e16 page */
+  --c-surface-dim: 10 14 22;
+  --c-surface-bright: 42 58 77;     /* #2a3a4d */
+  --c-surface-lowest: 12 17 27;     /* #0c111b inner panels */
+  --c-surface-low: 13 19 32;        /* #0d1320 inputs */
+  --c-surface-container: 16 21 31;  /* #10151f card */
+  --c-surface-high: 22 30 41;       /* #161e29 */
+  --c-surface-highest: 28 37 51;    /* #1c2533 */
+  --c-on-surface: 230 237 243;      /* #e6edf3 */
+  --c-on-surface-variant: 139 148 158; /* #8b949e */
+  --c-outline: 110 120 133;         /* #6e7885 dim labels */
+  --c-outline-variant: 28 37 51;    /* #1c2533 borders */
+  --c-primary: 77 143 214;          /* #4d8fd6 */
+  --c-primary-container: 37 99 184; /* #2563b8 */
+  --c-on-primary: 255 255 255;
+  --c-secondary: 70 179 169;        /* #46b3a9 teal */
+  --c-secondary-container: 37 99 184;
+  --c-tertiary: 205 213 223;        /* #cdd5df */
+  --c-error: 248 81 73;             /* #f85149 */
+  --c-error-container: 147 0 10;    /* #93000a */
+  --c-success: 63 185 80;           /* #3fb950 */
+  --c-warning: 216 162 58;          /* #d8a23a */
+  --c-docker-blue: 77 143 214;      /* #4d8fd6 */
+
+  --dash-seg-running: #3fb950;
+  --dash-seg-stopped: #586472;
+  --dash-seg-paused: #d8a23a;
+  --dash-seg-restarting: #4d8fd6;
+  --dash-seg-track: #161e29;
+  --dash-gauge-cpu: #5b9bd5;
+  --dash-gauge-mem: #46b3a9;
+  --dash-gauge-track: #1a2330;
+  --dash-card-shadow: 0 0 0 0 transparent;
+  --dash-card-hover-border: 42 58 77; /* #2a3a4d */
+}
+
+/* ---- Classic (original Technical Infrastructure Core) ---- */
+[data-theme="classic"] {
+  color-scheme: dark;
+  --c-surface: 5 20 36;             /* #051424 */
+  --c-surface-dim: 5 20 36;
+  --c-surface-bright: 44 58 76;     /* #2c3a4c */
+  --c-surface-lowest: 1 15 31;      /* #010f1f */
+  --c-surface-low: 13 28 45;        /* #0d1c2d */
+  --c-surface-container: 18 33 49;  /* #122131 */
+  --c-surface-high: 28 43 60;       /* #1c2b3c */
+  --c-surface-highest: 39 54 71;    /* #273647 */
+  --c-on-surface: 212 228 250;      /* #d4e4fa */
+  --c-on-surface-variant: 191 199 212; /* #bfc7d4 */
+  --c-outline: 137 145 157;         /* #89919d */
+  --c-outline-variant: 64 71 82;    /* #404752 */
+  --c-primary: 156 202 255;         /* #9ccaff */
+  --c-primary-container: 36 150 237; /* #2496ed */
+  --c-on-primary: 0 50 86;          /* #003256 */
+  --c-secondary: 112 210 255;       /* #70d2ff */
+  --c-secondary-container: 0 179 232; /* #00b3e8 */
+  --c-tertiary: 193 199 210;        /* #c1c7d2 */
+  --c-error: 255 180 171;           /* #ffb4ab */
+  --c-error-container: 147 0 10;    /* #93000a */
+  --c-success: 90 209 155;          /* #5ad19b */
+  --c-warning: 255 206 90;          /* #ffce5a */
+  --c-docker-blue: 36 150 237;      /* #2496ed */
+
+  --dash-seg-running: #5ad19b;
+  --dash-seg-stopped: #586472;
+  --dash-seg-paused: #ffce5a;
+  --dash-seg-restarting: #2496ed;
+  --dash-seg-track: #1c2b3c;
+  --dash-gauge-cpu: #2496ed;
+  --dash-gauge-mem: #00b3e8;
+  --dash-gauge-track: #1c2b3c;
+  --dash-card-shadow: 0 0 0 0 transparent;
+  --dash-card-hover-border: 36 150 237;
+}
+
+/* ---- Light ---- */
+[data-theme="light"] {
+  color-scheme: light;
+  --c-surface: 238 241 245;         /* #eef1f5 page */
+  --c-surface-dim: 231 235 241;     /* #e7ebf1 */
+  --c-surface-bright: 215 221 230;  /* #d7dde6 */
+  --c-surface-lowest: 255 255 255;  /* #ffffff inputs/insets */
+  --c-surface-low: 246 248 251;     /* #f6f8fb */
+  --c-surface-container: 255 255 255; /* #ffffff cards */
+  --c-surface-high: 238 241 245;    /* #eef1f5 */
+  --c-surface-highest: 227 232 238; /* #e3e8ee */
+  --c-on-surface: 27 36 48;         /* #1b2430 */
+  --c-on-surface-variant: 91 102 117; /* #5b6675 */
+  --c-outline: 138 147 160;         /* #8a93a0 */
+  --c-outline-variant: 215 221 229; /* #d7dde5 */
+  --c-primary: 31 111 208;          /* #1f6fd0 */
+  --c-primary-container: 36 150 237; /* #2496ed */
+  --c-on-primary: 255 255 255;
+  --c-secondary: 10 143 134;        /* #0a8f86 */
+  --c-secondary-container: 0 179 232;
+  --c-tertiary: 58 70 84;           /* #3a4654 */
+  --c-error: 200 55 45;             /* #c8372d */
+  --c-error-container: 255 218 214; /* #ffdad6 */
+  --c-success: 31 157 87;           /* #1f9d57 */
+  --c-warning: 180 121 10;          /* #b4790a */
+  --c-docker-blue: 36 150 237;      /* #2496ed */
+
+  --dash-seg-running: #1f9d57;
+  --dash-seg-stopped: #9aa4b2;
+  --dash-seg-paused: #c98a12;
+  --dash-seg-restarting: #2496ed;
+  --dash-seg-track: #e3e8ee;
+  --dash-gauge-cpu: #2563b8;
+  --dash-gauge-mem: #0a8f86;
+  --dash-gauge-track: #e3e8ee;
+  --dash-card-shadow: 0 1px 2px rgb(15 23 42 / 0.06), 0 1px 3px rgb(15 23 42 / 0.08);
+  --dash-card-hover-border: 31 111 208;
+}
+
+/* Global density: a 15px base (down from the 16px default) trims fonts AND
+   rem-based spacing app-wide for a tighter, less clunky feel. */
+html {
+  font-size: 15px;
+  /* Pre-paint fallback (perf Fix 10): the page ground matches the active theme
+     even before the body's utility classes apply (overscroll, first paint). */
+  background: rgb(var(--c-surface));
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-surface text-on-surface font-sans antialiased;
+}
+
+/* Pro-tool scrollbars (theme-aware) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: rgb(var(--c-surface-low));
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--c-surface-highest));
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--c-outline-variant));
+}
+
+/* Tabular figures for aligned numeric columns */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Responsive card-tile grid — shared by every card grid (backups, destinations)
+   so column count adapts to screen width. Each grid tunes --tile-min. */
+.tile-grid {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(auto-fill, minmax(min(var(--tile-min, 22rem), 100%), 1fr));
+}
+
+/* Pulsing status dot / wifi indicator */
+.status-pulse {
+  animation: status-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* Backup in progress (BackupCloudIcon): the arrow rises into the cloud, fades,
+   and comes up again from below. Transform and opacity only, so it never makes
+   the browser repaint the page around it. */
+.backup-cloud-active .backup-cloud-arrow {
+  animation: backup-cloud-lift 1.6s ease-in-out infinite;
+}
+@keyframes backup-cloud-lift {
+  0% { transform: translateY(5px); opacity: 0; }
+  25% { transform: translateY(0); opacity: 1; }
+  65% { transform: translateY(-2px); opacity: 1; }
+  100% { transform: translateY(-7px); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .backup-cloud-active .backup-cloud-arrow { animation: none; }
+}
+
+/* Undo-toast countdown bar (A3): shrinks over the grace window. */
+@keyframes toast-countdown {
+  from { width: 100%; }
+  to { width: 0%; }
+}
+
+/* Print (C3 runbook → PDF): drop the app chrome so the document prints clean. */
+@media print {
+  aside, header { display: none !important; }
+  main { overflow: visible !important; padding: 0 !important; }
+  .no-print { display: none !important; }
+  .dr-runbook { color: #000; }
+}
+
+/* ---- Docs (react-markdown rendered content) — theme-aware ---- */
+.doc-md { color: rgb(var(--c-on-surface-variant)); line-height: 1.7; font-size: 0.95rem; max-width: 80ch; }
+.doc-md > *:first-child { margin-top: 0; }
+.doc-md h1 { font-size: 1.7rem; font-weight: 800; color: rgb(var(--c-on-surface)); margin: 0 0 0.5rem; letter-spacing: -0.01em; }
+.doc-md h2 { font-size: 1.25rem; font-weight: 700; color: rgb(var(--c-on-surface)); margin: 2rem 0 0.75rem; padding-bottom: 0.4rem; border-bottom: 1px solid rgb(var(--c-outline-variant)); }
+.doc-md h3 { font-size: 1.05rem; font-weight: 700; color: rgb(var(--c-on-surface)); margin: 1.5rem 0 0.5rem; }
+.doc-md p { margin: 0.75rem 0; }
+.doc-md a { color: rgb(var(--c-primary)); text-decoration: none; }
+.doc-md a:hover { text-decoration: underline; }
+.doc-md ul, .doc-md ol { margin: 0.75rem 0; padding-left: 1.5rem; }
+.doc-md li { margin: 0.35rem 0; }
+.doc-md ul { list-style: disc; }
+.doc-md ol { list-style: decimal; }
+.doc-md code { font-family: "Geist Mono", monospace; font-size: 0.85em; background: rgb(var(--c-surface-highest)); color: rgb(var(--c-primary)); padding: 0.12rem 0.4rem; border-radius: 4px; }
+.doc-md pre { background: rgb(var(--c-surface-lowest)); border: 1px solid rgb(var(--c-outline-variant)); border-radius: 8px; padding: 1rem; overflow-x: auto; margin: 1rem 0; }
+.doc-md pre code { background: none; color: rgb(var(--c-on-surface-variant)); padding: 0; font-size: 0.82rem; line-height: 1.6; }
+.doc-md blockquote { border-left: 3px solid rgb(var(--c-primary)); background: rgb(var(--c-primary) / 0.06); margin: 1rem 0; padding: 0.6rem 1rem; border-radius: 0 6px 6px 0; color: rgb(var(--c-on-surface-variant)); }
+.doc-md table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.88rem; }
+.doc-md th, .doc-md td { border: 1px solid rgb(var(--c-outline-variant)); padding: 0.5rem 0.75rem; text-align: left; }
+.doc-md th { background: rgb(var(--c-surface-high)); color: rgb(var(--c-on-surface)); font-weight: 600; }
+.doc-md hr { border: none; border-top: 1px solid rgb(var(--c-outline-variant)); margin: 1.75rem 0; }
+.doc-md strong { color: rgb(var(--c-on-surface)); font-weight: 650; }
+
+/* ---- Decorative card watermark (F172) ----
+   A faint icon in the corner of a card. Purely decorative: it carries no
+   meaning, no state and no interaction.
+
+   It needs a per-theme value because one alpha cannot blend on three different
+   card colours. Light ink on the near-black Midnight card and dark ink on the
+   white card are not symmetrical — 3% black on white reads as a visible grey,
+   while 3% white on #10151f is barely a sheen — so the light theme gets a
+   lower figure rather than the same one.
+
+   In forced-colors mode it is removed entirely. Decoration rendered at full
+   system contrast stops being decoration and becomes a large glyph across the
+   card, which is the opposite of what it is for. */
+.card-watermark { color: rgb(var(--c-on-surface) / 0.035); }
+[data-theme="classic"] .card-watermark { color: rgb(var(--c-on-surface) / 0.04); }
+[data-theme="light"] .card-watermark { color: rgb(var(--c-on-surface) / 0.022); }
+@media (forced-colors: active) { .card-watermark { display: none; } }
+
+/* ---- Theme-aware brand logo (branding) ----
+   The wordmark's "Dock" is navy; on dark themes it's swapped for a light-blue
+   variant so it pops, while the light theme keeps the navy. Both are the same
+   logo art; we just show the right one for the active theme. */
+.brand-logo-light { display: none; }
+[data-theme="light"] .brand-logo-dark { display: none; }
+[data-theme="light"] .brand-logo-light { display: block; }

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en" data-theme="midnight">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/dockback-mark.png" />
+    <title>DockBack</title>
+    <!-- No inline scripts: the CSP is strict (default-src 'self', no unsafe-inline).
+         theme-init.js (external, same-origin — CSP-clean) applies the SAVED theme
+         before first paint; main.tsx re-applies at module load as a fallback. -->
+    <script src="/theme-init.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

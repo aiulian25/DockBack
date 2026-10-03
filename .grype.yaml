@@ -1,0 +1,8 @@
+# Grype config (Security.md §5). Mirrors .trivyignore.
+# See .trivyignore for the full justification of each accepted advisory.
+ignore:
+  # Moby daemon authorization-bypass (no importable Go-module fix yet; daemon-side
+  # code, not reachable via DockBack's client-only socket-proxy use). Grype keys
+  # it by GHSA; Trivy by CVE — list both aliases.
+  - vulnerability: CVE-2026-34040
+  - vulnerability: GHSA-x744-4wpc-v9h2

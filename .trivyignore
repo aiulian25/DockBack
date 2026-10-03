@@ -1,0 +1,11 @@
+# Accepted image-scan findings (Security.md §5). Review each release.
+#
+# CVE-2026-34040 — Moby daemon authorization-bypass shipped inside the
+# github.com/docker/docker SDK module. Fixed in Moby 29.3.1, but that is NOT yet
+# available as an importable Go module (github.com/docker/docker tops out at
+# v28.5.2+incompatible). It is daemon-side code: DockBack is a *client* that
+# only talks to the hardened, allow-listed socket-proxy and never runs dockerd,
+# so the path is not reachable — confirmed by govulncheck (reachability) which
+# does NOT report it. Remove + bump the SDK once v29.x is importable.
+CVE-2026-34040
+GHSA-x744-4wpc-v9h2

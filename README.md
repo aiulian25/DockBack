@@ -155,6 +155,10 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   re-authentication ("sudo mode")** for key-material actions, expiring API
   tokens, a **tamper-evident (hash-chained) audit trail**,
   live log streaming, `/healthz` and Prometheus `/metrics`, and full in-app docs.
+  A backup you start shows its **live console right on the page you started it
+  from**, and every place a backup is running — buttons, history rows, the
+  dashboard — shows the same cloud with its arrow lifting while data moves (it
+  holds still for anyone whose system asks for reduced motion).
   See **[Access control & account security](#access-control--account-security)** below.
 
 ---
@@ -266,6 +270,24 @@ done deliberately from a desktop or laptop — not tapped out one-handed on a ph
 Pair this with the private-network access above (for example, browse to it from
 your laptop over Tailscale) and operate it the way you'd operate any other piece of
 critical infrastructure.
+
+---
+
+## Build from source
+
+The full source is in this repo, and the image builds from it with nothing
+installed but Docker:
+
+```bash
+git clone https://github.com/aiulian25/DockBack.git
+cd DockBack
+docker build -t dockback:local .
+```
+
+Then point `image:` in your compose at `dockback:local` and `docker compose up -d`
+as above. The published image comes from the same Dockerfile, built for
+`linux/amd64` and `linux/arm64`. For development, `make test` runs the frontend
+tests and build, then the Go tests (Go 1.26, Node 22).
 
 ---
 

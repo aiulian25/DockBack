@@ -1,0 +1,32 @@
+# Allow-list: the image build sees only what the Dockerfile builds from.
+# Everything else in the project — notes, backup/ with its source tarballs (each
+# carrying the real .env), compose files, docs, CI, screenshots — stays out, and
+# anything added to the project later stays out too until it is listed here.
+# The finished image takes nothing from this context but the compiled binary.
+*
+
+# Backend stage: go build, which embeds the offline recovery tool.
+!go.mod
+!go.sum
+!main.go
+!embed_recover.go
+!internal/
+!scripts/dockback-recover.py
+
+# Frontend stage: npm ci && npm run build.
+!frontend/
+
+# Inside what is allowed: rebuilt in the image anyway, or only read by tests.
+frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
+internal/web/dist/
+**/*_test.go
+frontend/src/**/*.test.ts
+frontend/src/**/*.test.tsx
+
+# Secrets and local data never belong in a build, even inside allowed folders.
+**/.env*
+**/*.db
+**/*.sqlite*
+**/*.key
+**/*.pem

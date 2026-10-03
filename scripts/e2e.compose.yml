@@ -1,0 +1,68 @@
+# Isolated stack for the end-to-end DR drill (PLAN §6.11/§9.4). Mirrors the
+# production topology (app reaches Docker only through the socket-proxy; app is
+# non-root, read-only rootfs) but on its own project/port/volumes so it never
+# collides with a running dev instance. Brought up + torn down by scripts/e2e.sh.
+networks:
+  # app <-> socket-proxy only (no egress), mirroring the production topology.
+  # Pinned subnets so the drill works even when Docker's auto address-pool is
+  # exhausted on a busy host with many networks.
+  e2e_internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.213.207.0/24
+  # Non-internal network so the app's published localhost port is reachable.
+  e2e_pub:
+    ipam:
+      config:
+        - subnet: 10.213.208.0/24
+
+volumes:
+  e2e-data:
+  e2e-backups:
+
+services:
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0@sha256:9e4b9e7517a6b660f2cc903a19b257b1852d5b3344794e3ea334ff00ae677ac2
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      VOLUMES: 1
+      NETWORKS: 1
+      EXEC: 1
+      VERSION: 1
+      INFO: 1
+      POST: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [e2e_internal]
+    security_opt: ["no-new-privileges:true"]
+
+  backup-app:
+    build:
+      context: ..
+      args:
+        VERSION: ${VERSION:-e2e}
+    image: dockback:latest
+    depends_on:
+      socket-proxy:
+        condition: service_started
+    environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
+      HOST: 0.0.0.0
+      PORT: 28734
+      DOCKBACK_ENCRYPTION_KEY: ${DOCKBACK_ENCRYPTION_KEY:?e2e key required}
+      DOCKBACK_ADMIN_USER: ${DOCKBACK_ADMIN_USER:-admin}
+      DOCKBACK_ADMIN_PASSWORD: ${DOCKBACK_ADMIN_PASSWORD:?e2e admin password required}
+    ports:
+      - "127.0.0.1:${E2E_PORT:-28999}:28734"
+    volumes:
+      - e2e-data:/app/data
+      - e2e-backups:/app/backups
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [e2e_internal, e2e_pub]
