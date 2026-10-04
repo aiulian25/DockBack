@@ -137,6 +137,10 @@ func (s *Server) composeDigest(now time.Time, includeDR bool) (title, body strin
 			fmt.Fprintf(&b, " RPO: %d of %d critical database%s breaching target.", breaches, rpoTotal, plural(rpoTotal))
 		}
 	}
+	if cov, err := s.computeCoverage(now); err == nil {
+		b.WriteString(coverageDigestLine(cov, now.Unix()))
+		b.WriteString(offMachineDigestLine(cov))
+	}
 	// F60: DR-confidence block from the SAME catalog pass (no Docker/network probes).
 	if includeDR {
 		b.WriteString(drConfidenceLine(s.drConfidence(list, now.Unix())))

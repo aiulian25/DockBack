@@ -159,9 +159,12 @@ export default function Dashboard() {
   // fleet-wide banner so the risk is pinned to the exact node.
   const unprotByNode = useMemo(() => {
     const m: Record<string, number> = {};
-    coverage?.nodes.forEach((nd) => { m[nd.node_id] = nd.unprotected.length; });
+    coverage?.nodes.forEach((nd) => { m[nd.node_id] = nd.unprotected.length + (nd.stale?.length || 0); });
     return m;
   }, [coverage]);
+  // Every copy on this one machine: a disk failure takes the backups with it.
+  // Only said once there is a backup to lose.
+  const allCopiesHere = !!coverage && coverage.off_machine_destinations === 0 && coverage.nodes.some((nd) => nd.last_backup_at > 0);
   // Per-node stopped-with-data-but-no-backup count (F13) — a quieter, separate
   // risk kept out of the primary "unprotected running" number above.
   const stoppedByNode = useMemo(() => {
@@ -252,6 +255,18 @@ export default function Dashboard() {
         </div>
       </div>
 
+
+      {allCopiesHere && (
+        <div className="mb-5 flex flex-wrap items-center gap-3 rounded-lg border border-warning/30 bg-warning/10 p-3 text-warning">
+          <AlertTriangle size={18} className="shrink-0" />
+          <div className="min-w-0 flex-1 break-words text-sm">
+            <strong>Every backup is on this machine.</strong> One disk failure takes the backups with it. Add a destination that leaves this machine: another server, a NAS or cloud storage.
+          </div>
+          <button onClick={() => navigate("/settings?tab=destinations")} className="shrink-0 rounded border border-current/30 px-3 py-1 text-xs font-semibold hover:bg-current/10">
+            Add a destination
+          </button>
+        </div>
+      )}
 
       {/* Cluster filter (only shown for multi-cluster fleets, PLAN §4.13) */}
       {multiCluster && (
@@ -439,7 +454,7 @@ function NodeCard({ n, unprotected, stoppedAtRisk, menuOpen, menuRef, onCard, on
               ))}
               {/* Running-but-unprotected (B2) — the real backup gap; amber when any exist. */}
               <div
-                title={unprotected > 0 ? `${unprotected} of ${s.total} containers have no backup — open the node to protect them` : "Every container has a backup"}
+                title={unprotected > 0 ? `${unprotected} of ${s.total} containers have no recent backup — never backed up, or older than their schedule allows. Open the node to protect them` : "Every container has a recent backup"}
                 className={`flex min-w-0 items-center gap-[7px] rounded-lg border px-[9px] py-[7px] ${unprotected > 0 ? "border-warning/40 bg-warning/[0.09]" : "border-outline-variant bg-surface-high/40"}`}
               >
                 <Shield size={14} strokeWidth={1.9} className={`shrink-0 ${unprotected > 0 ? "text-warning" : "text-outline"}`} />

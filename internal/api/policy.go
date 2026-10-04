@@ -158,6 +158,17 @@ func (sc Schedule) nextRun(from time.Time) time.Time {
 	return s.Next(from)
 }
 
+// interval is the gap between the schedule's next two runs after `from`, or zero
+// if it cannot be scheduled. For a custom cron with uneven gaps it is the next
+// gap, which is the one a backup taken now has to last through.
+func (sc Schedule) interval(from time.Time) time.Duration {
+	first := sc.nextRun(from)
+	if first.IsZero() {
+		return 0
+	}
+	return sc.nextRun(first).Sub(first)
+}
+
 // loadPolicy reads the policy from settings.
 func (s *Server) loadPolicy() Policy {
 	var p Policy

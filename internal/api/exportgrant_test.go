@@ -284,3 +284,53 @@ func TestPruneExportTickets(t *testing.T) {
 		t.Error("an expired ticket should be swept")
 	}
 }
+
+// Step 25: one download for a whole stack, behind the same step-up and one-shot
+// ticket as a single backup's.
+func TestStackDownloadIsGuardedLikeABackupDownload(t *testing.T) {
+	s := stackKeyServer(t)
+	mkStackMember(t, s, "b-app", "n1", "arr", "sonarr", "arr-sonarr")
+
+	grant := func(project string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/api/nodes/n1/stacks/"+project+"/export-grant", strings.NewReader("{}"))
+		r.SetPathValue("id", "n1")
+		r.SetPathValue("project", project)
+		rec := httptest.NewRecorder()
+		s.handleStackExportGrant(rec, r)
+		return rec
+	}
+	if rec := grant("nothing-here"); rec.Code != http.StatusNotFound {
+		t.Errorf("a stack with no backups is refused before any password prompt: %d", rec.Code)
+	}
+	if rec := grant("arr"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("the grant must not be issued without a fresh password: %d %s", rec.Code, rec.Body.String())
+	}
+
+	r := httptest.NewRequest("GET", "/api/nodes/n1/stacks/arr/download?ticket=forged", nil)
+	r.SetPathValue("id", "n1")
+	r.SetPathValue("project", "arr")
+	rec := httptest.NewRecorder()
+	s.handleStackDownload(rec, r)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("a download without a valid ticket is refused before a byte is decrypted: %d", rec.Code)
+	}
+}
+
+// Step 28: a node's evidence is exported like a backup — behind a fresh
+// password and a one-shot ticket.
+func TestEvidenceIsGuardedLikeAnExport(t *testing.T) {
+	s := stackKeyServer(t)
+	call := func(handler http.HandlerFunc, method, node string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "/api/nodes/"+node+"/evidence", strings.NewReader("{}"))
+		r.SetPathValue("id", node)
+		rec := httptest.NewRecorder()
+		handler(rec, r)
+		return rec
+	}
+	if rec := call(s.handleEvidenceGrant, "POST", "no-such-node"); rec.Code != http.StatusNotFound {
+		t.Errorf("an unknown node is refused before any password prompt: %d", rec.Code)
+	}
+	if rec := call(s.handleEvidence, "GET", "n1"); rec.Code != http.StatusForbidden {
+		t.Errorf("evidence without a ticket must be refused: %d", rec.Code)
+	}
+}

@@ -570,3 +570,38 @@ func mustAudit(t *testing.T, s *Server) []*store.AuditEntry {
 	}
 	return entries
 }
+
+// Step 23: a files-only restore overwrites nothing, so a protected container
+// needs no fresh password for it.
+func TestFilesOnlyRestoreNeedsNoStepUp(t *testing.T) {
+	s := stepUpRestoreServer(t)
+	mkRestorable(t, s, "b1", "n1", "prod-db")
+	crit := s.loadCriticalDBs()
+	crit[critKey("n1", "prod-db")] = CriticalDB{NodeID: "n1", Name: "prod-db", RPOSeconds: 300}
+	_ = s.saveCriticalDBs(crit)
+
+	rec := postRestore(s, "b1", map[string]any{
+		"node_id": "n1", "target_id": "cid", "confirm": true, "files_only": true,
+	})
+	if rec.Code == http.StatusUnauthorized || strings.Contains(rec.Body.String(), "step_up_required") {
+		t.Fatalf("files-only changes no container and must not demand step-up: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Files only changes no container, so it cannot also be a copy or a revert.
+func TestFilesOnlyRestoreRefusesACopyOrARevert(t *testing.T) {
+	s := stepUpRestoreServer(t)
+	mkRestorable(t, s, "b1", "n1", "app")
+	for _, extra := range []map[string]any{
+		{"as_name": "app-copy", "isolated": true},
+		{"recreate": true},
+	} {
+		body := map[string]any{"node_id": "n1", "target_id": "cid", "confirm": true, "files_only": true}
+		for k, v := range extra {
+			body[k] = v
+		}
+		if rec := postRestore(s, "b1", body); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "files-only") {
+			t.Errorf("files_only with %v must be refused: %d %s", extra, rec.Code, rec.Body.String())
+		}
+	}
+}

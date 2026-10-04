@@ -182,6 +182,9 @@ type Manifest struct {
 	// original, preferred over the reconstruction when rebuilding by hand. Only ever
 	// set for SSH-transport nodes; the socket-proxy transports can't read host files.
 	HasOriginalCompose bool `json:"has_original_compose,omitempty"`
+	// ProjectFolder is the compose project's own folder (scripts, READMEs,
+	// config), captured without its bind-mounted data (step 24).
+	ProjectFolder *ProjectFolderRef `json:"project_folder,omitempty"`
 
 	// SQLiteDumps records SQLite database files found under the captured volumes
 	// that were snapshotted CONSISTENTLY (sqlite3 online backup) into a sidecar
@@ -234,6 +237,14 @@ type Manifest struct {
 	// blunt the warning that catches the second. So the archive says what was
 	// dropped and why, and nothing is graded down for a choice made on purpose.
 	ExcludedRegenerable []ExcludedPath `json:"excluded_regenerable,omitempty"`
+
+	// ArchiveExcluded lists every container path deliberately kept out of the
+	// volume archive: a bundled database's data directory once its dump exists,
+	// regenerable folders, and paths with no restore value. The file index still
+	// lists them (incremental backups diff against it), so a restore must know
+	// these were never in the archive — above all that a dumped data directory is
+	// MEANT to be empty until its dump is imported.
+	ArchiveExcluded []string `json:"archive_excluded,omitempty"`
 
 	// AtomicVolumes records container paths this archive was REQUIRED to contain
 	// together, because the application's state is split across them and half of

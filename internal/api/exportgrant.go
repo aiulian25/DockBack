@@ -1,6 +1,11 @@
 package api
 
 import (
+	"archive/zip"
+	"context"
+	"dockback/internal/dockercli"
+	"dockback/internal/version"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -42,7 +47,12 @@ const (
 	exportPurposeDownload  = "download"
 	exportPurposeExtract   = "extract"
 	exportPurposeAppBackup = "app-backup"
+	exportPurposeStack     = "stack"
+	exportPurposeEvidence  = "evidence"
 )
+
+// evidenceTimeout bounds reading a node's whole configuration.
+const evidenceTimeout = 2 * time.Minute
 
 // exportTicketKey namespaces a ticket in the settings table, BY HASH.
 //
@@ -142,6 +152,143 @@ func (s *Server) handleExportGrant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ticket":     ticket,
 		"expires_in": int(exportTicketTTL.Seconds()),
+	})
+}
+
+// stackExportTarget is what a stack download's ticket is bound to.
+func stackExportTarget(nodeID, project string) string { return nodeID + "/" + project }
+
+// handleStackExportGrant is the same exchange for a whole stack's download
+// (step 25): the Arr archives had to be fetched one at a time in the
+// 2026-10-04 recovery.
+func (s *Server) handleStackExportGrant(w http.ResponseWriter, r *http.Request) {
+	var req stepUpBody
+	_ = readJSON(r, &req)
+	nodeID, project := r.PathValue("id"), r.PathValue("project")
+	if plan, _, err := s.engine.PlanStack(nodeID, project, ""); err != nil || len(plan) == 0 {
+		errJSON(w, http.StatusNotFound, "this stack has no backups to download")
+		return
+	}
+	if !s.requireFreshAuth(w, r, req) {
+		return
+	}
+	ticket := randToken()
+	g := exportGrant{
+		Purpose:   exportPurposeStack,
+		Target:    stackExportTarget(nodeID, project),
+		SessionFP: sessionFP(r),
+		Expires:   time.Now().Add(exportTicketTTL).Unix(),
+	}
+	if err := s.store.SetSetting(exportTicketKey(ticket), g.encode()); err != nil {
+		errJSON(w, http.StatusInternalServerError, "could not issue an export ticket")
+		return
+	}
+	_ = s.store.Audit(userFrom(r), "export.grant", g.Target,
+		fmt.Sprintf("purpose=%s; one-shot ticket valid %s; step-up ok", exportPurposeStack, humanShort(exportTicketTTL)))
+	writeJSON(w, http.StatusOK, map[string]any{"ticket": ticket, "expires_in": int(exportTicketTTL.Seconds())})
+}
+
+// handleStackDownload streams one zip holding every service's newest backup as
+// its own decrypted tar, the same archive a single download gives, chosen the
+// way a stack restore chooses. A zip because its entries stream without their
+// size up front, which a tar of decrypted archives would need.
+func (s *Server) handleStackDownload(w http.ResponseWriter, r *http.Request) {
+	nodeID, project := r.PathValue("id"), r.PathValue("project")
+	target := stackExportTarget(nodeID, project)
+	if !s.requireExportTicket(w, r, exportPurposeStack, target) {
+		return
+	}
+	plan, _, err := s.engine.PlanStack(nodeID, project, "")
+	if err != nil || len(plan) == 0 {
+		errJSON(w, http.StatusNotFound, "this stack has no backups to download")
+		return
+	}
+	_ = s.store.Audit(userFrom(r), "export.download", target, fmt.Sprintf("decrypted archives of %d service(s) streamed as one zip", len(plan)))
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", "dockback-stack-"+safeLogName(project)+".zip"))
+	zw := zip.NewWriter(w)
+	for _, entry := range plan {
+		part, cerr := zw.CreateHeader(&zip.FileHeader{
+			Name:     safeLogName(entry.Service) + "-" + entry.BackupID + ".tar",
+			Method:   zip.Store,
+			Modified: time.Unix(entry.CreatedAt, 0),
+		})
+		if cerr != nil {
+			s.logSink("stack:"+project, "ERR", "Stack download failed: "+cerr.Error())
+			return
+		}
+		if derr := s.engine.DecryptTo(r.Context(), entry.BackupID, part); derr != nil {
+			// The headers are already sent; the truncated zip fails to open, which
+			// is the honest outcome, and the log says which service broke it.
+			s.logSink("stack:"+project, "ERR", fmt.Sprintf("Stack download failed at %s: %v", entry.Service, derr))
+			return
+		}
+	}
+	if err := zw.Close(); err != nil {
+		s.logSink("stack:"+project, "ERR", "Stack download failed: "+err.Error())
+	}
+}
+
+// handleEvidenceGrant is the same exchange for a node's frozen evidence (step
+// 28). It holds no environment values, but commands and labels can still carry
+// secrets, so it asks for the password like any export.
+func (s *Server) handleEvidenceGrant(w http.ResponseWriter, r *http.Request) {
+	var req stepUpBody
+	_ = readJSON(r, &req)
+	nodeID := r.PathValue("id")
+	if _, err := s.store.GetNode(nodeID); err != nil {
+		errJSON(w, http.StatusNotFound, "node not found")
+		return
+	}
+	if !s.requireFreshAuth(w, r, req) {
+		return
+	}
+	ticket := randToken()
+	g := exportGrant{Purpose: exportPurposeEvidence, Target: nodeID, SessionFP: sessionFP(r), Expires: time.Now().Add(exportTicketTTL).Unix()}
+	if err := s.store.SetSetting(exportTicketKey(ticket), g.encode()); err != nil {
+		errJSON(w, http.StatusInternalServerError, "could not issue an export ticket")
+		return
+	}
+	_ = s.store.Audit(userFrom(r), "export.grant", nodeID,
+		fmt.Sprintf("purpose=%s; one-shot ticket valid %s; step-up ok", exportPurposeEvidence, humanShort(exportTicketTTL)))
+	writeJSON(w, http.StatusOK, map[string]any{"ticket": ticket, "expires_in": int(exportTicketTTL.Seconds())})
+}
+
+// handleEvidence writes the node's frozen evidence as one JSON file: every
+// container's inspect record (environment values reduced to names), its
+// networks and its volumes, with when and from which node it was taken.
+func (s *Server) handleEvidence(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.PathValue("id")
+	if !s.requireExportTicket(w, r, exportPurposeEvidence, nodeID) {
+		return
+	}
+	node, err := s.store.GetNode(nodeID)
+	if err != nil {
+		errJSON(w, http.StatusNotFound, "node not found")
+		return
+	}
+	cli, err := s.reg.Get(nodeID)
+	if err != nil {
+		errJSON(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), evidenceTimeout)
+	defer cancel()
+	ev, err := dockercli.CollectEvidence(ctx, cli)
+	if err != nil {
+		errJSON(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	now := time.Now().UTC()
+	_ = s.store.Audit(userFrom(r), "export.download", nodeID, fmt.Sprintf("evidence of %d container(s)", len(ev.Containers)))
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q",
+		"dockback-evidence-"+safeLogName(node.Name)+"-"+now.Format("20060102-150405")+".json"))
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(map[string]any{
+		"node_id": node.ID, "node_name": node.Name, "captured_at": now.Format(time.RFC3339),
+		"dockback_version": version.Version, "evidence": ev,
 	})
 }
 

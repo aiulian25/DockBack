@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -22,17 +24,40 @@ import (
 	"dockback/internal/config"
 	"dockback/internal/dockercli"
 	"dockback/internal/store"
+	"dockback/internal/version"
 	"dockback/internal/web"
 )
 
+// exitUsage is the conventional exit status for a command-line mistake.
+const exitUsage = 2
+
 func main() {
-	// `dockback -healthcheck` is the Docker HEALTHCHECK entry: the distroless
-	// image has no shell/curl, so the binary probes its own liveness endpoint.
-	if len(os.Args) > 1 && (os.Args[1] == "-healthcheck" || os.Args[1] == "--healthcheck") {
-		os.Exit(healthcheck())
+	if len(os.Args) > 1 {
+		os.Exit(runCommand(os.Args[1:], os.Stdout, os.Stderr))
 	}
 	if err := run(); err != nil {
 		log.Fatalf("fatal: %v", err)
+	}
+}
+
+// runCommand handles the binary's one-shot flags and refuses everything else.
+//
+// Refusing matters: an unrecognised argument used to fall through to the
+// server, so `dockback -version` run inside the container booted a SECOND
+// DockBack against the live data directory. It cleared the work directories
+// and every session before failing on the busy port.
+func runCommand(args []string, stdout, stderr io.Writer) int {
+	switch args[0] {
+	case "-healthcheck", "--healthcheck":
+		// The Docker HEALTHCHECK entry: the distroless image has no shell or
+		// curl, so the binary probes its own liveness endpoint.
+		return healthcheck()
+	case "-version", "--version":
+		fmt.Fprintln(stdout, version.Version)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "dockback: unknown argument %q. Supported: -healthcheck, -version; run with no arguments to start the server.\n", args[0])
+		return exitUsage
 	}
 }
 
@@ -77,6 +102,15 @@ func run() error {
 		}
 	}
 
+	// One DockBack per data directory, settled BEFORE anything below touches
+	// shared state: the startup cleanup deletes work directories and clears
+	// sessions, which a second instance must never do to a running one.
+	releaseLock, err := config.AcquireInstanceLock(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
+
 	// Clear crash-orphaned backup spool dirs (a backup interrupted mid-run leaves
 	// a dback-* work dir; nothing is running yet at startup, so they're junk) —
 	// reclaims disk before we begin (pairs with FailRunningBackups below).
@@ -94,7 +128,12 @@ func run() error {
 		log.Printf("restore: %v", err)
 	}
 
-	st, err := store.Open(filepath.Join(cfg.DataDir, "dockback.db"))
+	// A database that does not exist yet is a fresh install: the only moment
+	// DockBack chooses defaults on the operator's behalf.
+	dbPath := filepath.Join(cfg.DataDir, "dockback.db")
+	_, statErr := os.Stat(dbPath)
+	freshInstall := errors.Is(statErr, fs.ErrNotExist)
+	st, err := store.Open(dbPath)
 	if err != nil {
 		return err
 	}
@@ -150,6 +189,15 @@ func run() error {
 				return err
 			}
 			log.Printf("registered local node via %s", cfg.LocalDockerHost)
+		}
+	}
+
+	if freshInstall {
+		_, localErr := st.GetNode("local")
+		if summary, err := api.ApplyFreshInstallDefaults(st, localErr == nil); err != nil {
+			log.Printf("fresh install: could not apply the defaults: %v", err)
+		} else {
+			log.Printf("fresh install: %s", summary)
 		}
 	}
 

@@ -40,9 +40,13 @@ func runSidecar(ctx context.Context, c *client.Client, targetID, cmd string, tim
 	if err := ensureSidecar(ctx, c); err != nil {
 		return err
 	}
+	hostConfig, err := restoreHostConfig(ctx, c, targetID)
+	if err != nil {
+		return err
+	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sh", "-c", cmd}},
-		&container.HostConfig{VolumesFrom: []string{targetID}},
+		hostConfig,
 		nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("sidecar create: %w", err)
@@ -53,7 +57,12 @@ func runSidecar(ctx context.Context, c *client.Client, targetID, cmd string, tim
 	}
 	waitCh, errCh := c.ContainerWait(ctx, created.ID, container.WaitConditionNotRunning)
 	select {
-	case <-waitCh:
+	case result := <-waitCh:
+		// The exit status IS the answer. It used to be dropped, so a wipe that
+		// left files behind or a config edit that failed reported success.
+		if result.StatusCode != 0 {
+			return fmt.Errorf("sidecar exited with status %d", result.StatusCode)
+		}
 		return nil
 	case e := <-errCh:
 		return e

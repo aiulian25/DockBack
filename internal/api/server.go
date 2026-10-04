@@ -1248,6 +1248,10 @@ func (s *Server) Handler(uiFS fs.FS) http.Handler {
 	// schedule target instead of one per service, plus a first backup.
 	mux.Handle("POST /api/nodes/{id}/stacks/{project}/protect", s.auth(s.csrf(http.HandlerFunc(s.handleProtectStack))))
 	mux.Handle("POST /api/nodes/{id}/stacks/{project}/restore", s.auth(s.csrf(http.HandlerFunc(s.handleRestoreStack))))
+	mux.Handle("POST /api/nodes/{id}/stacks/{project}/export-grant", s.auth(s.csrf(http.HandlerFunc(s.handleStackExportGrant)))) // step 25
+	mux.Handle("GET /api/nodes/{id}/stacks/{project}/download", s.auth(http.HandlerFunc(s.handleStackDownload)))                 // step 25
+	mux.Handle("POST /api/nodes/{id}/evidence-grant", s.auth(s.csrf(http.HandlerFunc(s.handleEvidenceGrant))))                   // step 28
+	mux.Handle("GET /api/nodes/{id}/evidence", s.auth(http.HandlerFunc(s.handleEvidence)))                                       // step 28
 	// App-consistent snapshot groups available to restore this stack from (F43) — read-only.
 	mux.Handle("GET /api/nodes/{id}/stacks/{project}/groups", s.auth(http.HandlerFunc(s.handleStackGroups)))
 	mux.Handle("GET /api/nodes/{id}/stacks/{project}/restore-plan", s.auth(http.HandlerFunc(s.handleStackRestorePlan))) // F82 read-only pre-restore plan

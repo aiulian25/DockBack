@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/network"
+
 	"dockback/internal/backup"
 	"dockback/internal/dockercli"
 )
@@ -22,9 +24,9 @@ import (
 // This compares the recorded requirements against the target and says what it
 // cannot provide, BEFORE the restore runs.
 //
-// It never blocks. The operator may know something DockBack cannot — that the
-// device will be attached shortly, that the sysctl is set at boot — so this
-// informs a deliberate choice rather than refusing one.
+// The warnings never block. A device the target verifiably lacks does (step 27),
+// until the operator confirms it: they may know it will be attached shortly,
+// and a restore that fails after writing the data helps nobody.
 
 // hostFacts is what we managed to learn about a target host. Separated from the
 // probing so the judgement below is pure and table-testable without Docker.
@@ -34,6 +36,75 @@ type hostFacts struct {
 	HasGPU    bool            // an NVIDIA/DRI node is present
 	LogDriver string          // the daemon's default logging driver ("" = unknown)
 	Target    string          // node name, for the messages
+}
+
+// missingDevices lists the recorded devices the target verifiably lacks. Only
+// a fact counts: a device list that could not be read blocks nothing. Pure.
+func missingDevices(req *backup.HostRequirements, facts hostFacts) []string {
+	if req == nil || !facts.DevKnown {
+		return nil
+	}
+	var missing []string
+	for _, d := range req.Devices {
+		if !facts.Devices[d] {
+			missing = append(missing, d)
+		}
+	}
+	return missing
+}
+
+// missingDevicesOn is missingDevices for a cross-host restore, and nothing for
+// one that stays on its own node (step 27). gluetun without /dev/net/tun and
+// Plex without its GPU were created, started and then failed with a raw Docker
+// error, after the data had been written; a missing device now stops the
+// restore until the operator says it will be there.
+func (s *Server) missingDevicesOn(ctx context.Context, man *backup.Manifest, originNodeID, targetNodeID string) []string {
+	if targetNodeID == "" || targetNodeID == originNodeID || man == nil || man.Requires == nil || len(man.Requires.Devices) == 0 {
+		return nil
+	}
+	return missingDevices(man.Requires, s.targetHostFacts(ctx, targetNodeID))
+}
+
+// sharedNetworksMissing lists the networks a container joins without owning
+// them that the target does not have (step 27). A network the stack owns is
+// recreated as recorded, which is right; one another stack or the operator
+// created (a proxy network, a macvlan) recreated as a plain bridge cuts the
+// container off from everything it was meant to reach. Pure.
+func sharedNetworksMissing(man *backup.Manifest, project string, existing map[string]bool) []string {
+	if man == nil {
+		return nil
+	}
+	var missing []string
+	for _, n := range man.Networks {
+		owned := project != "" && n.Labels["com.docker.compose.project"] == project
+		if !owned && !existing[n.Name] {
+			missing = append(missing, n.Name)
+		}
+	}
+	return missing
+}
+
+// sharedNetworksMissingOn is sharedNetworksMissing for a cross-host restore.
+// Silent when the target's networks cannot be listed: that is not a fact.
+func (s *Server) sharedNetworksMissingOn(ctx context.Context, man *backup.Manifest, project, originNodeID, targetNodeID string) []string {
+	if targetNodeID == "" || targetNodeID == originNodeID || man == nil || len(man.Networks) == 0 {
+		return nil
+	}
+	cli, err := s.reg.Get(targetNodeID)
+	if err != nil {
+		return nil
+	}
+	lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	nets, err := cli.NetworkList(lctx, network.ListOptions{})
+	if err != nil {
+		return nil
+	}
+	existing := make(map[string]bool, len(nets))
+	for _, n := range nets {
+		existing[n.Name] = true
+	}
+	return sharedNetworksMissing(man, project, existing)
 }
 
 // portabilityWarnings judges a backup's host requirements against a target.

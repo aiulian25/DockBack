@@ -15,6 +15,10 @@ This closes a real gap rather than adding ceremony. Until now a browser left ope
 
 Automation is unaffected: API tokens were never permitted to reach these endpoints at all, at any scope.
 
+## A whole stack in one download
+
+On a stack's restore page, **Download stack** gives you one zip holding every service's newest backup, each as its own decrypted archive (`<service>-<backup id>.tar`), chosen the same way a stack restore chooses them. It asks for your password like any export, and the same one-shot rules apply. One click instead of one per service: on the night that prompted it, the Arr stack's seven archives were fetched one at a time.
+
 ## Recover just one file (Browse files)
 
 You don't need the whole archive to get back one config file or one photo. Open a backup's drawer and expand **Browse files**: DockBack lists every file in the backup's volume data (path + size) — read straight from the archive, nothing is downloaded yet. Filter to find what you want, then click the **download** icon on a row to pull **just that file**, decrypted and streamed on its own. It's the fast path for "I deleted one file and need it back" — no multi-gigabyte download, no destructive restore.

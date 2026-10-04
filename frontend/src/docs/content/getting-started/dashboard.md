@@ -19,7 +19,9 @@ Click a node to drill into its **container list**. From there, click any contain
 
 Each node card flags containers that could be lost:
 
-- **Unprotected** (amber `N/total`) — **running** containers with no successful backup that aren't covered by the schedule. This is the number to drive to zero.
+> **"Every backup is on this machine."** This amber banner appears above the node grid when no enabled destination leaves this machine (a *local* destination is a folder on it, so it doesn't count) and there is at least one backup. One disk failure would take the backups with the machine. **Add a destination** opens Settings → Destinations.
+
+- **Unprotected** (amber `N/total`) — **running** containers with no **recent** backup: never backed up, or last backed up longer ago than twice the interval of the schedule that covers them (8 days if no schedule does). A schedule alone doesn't count until it has produced a backup. The node's page lists the two kinds separately, with when each was last backed up. This is the number to drive to zero.
 - **Stopped, no backup** (a quieter, muted pill) — **stopped** containers that still hold a **named data volume** and have no backup. A stopped container is usually intentionally off, so it's kept out of the "unprotected running" count and never nags — but an app you run occasionally, or one that crashed, is exactly what you can lose. Containers with only throwaway mounts (tmpfs or anonymous volumes) are not counted.
 
 Open the node to protect either kind: the node page's coverage banner lists them with a one-click **Protect** (smart defaults + a first backup), and a **Protect all (N)** that clears the whole list in one action.

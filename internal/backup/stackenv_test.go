@@ -1,8 +1,11 @@
 package backup
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"dockback/internal/dockercli"
 )
 
 // F231 — the stack's own .env, captured and brought back through the remaps.
@@ -268,6 +271,63 @@ func TestEnvKeysIgnoresCommentsAndBlanks(t *testing.T) {
 	}
 }
 
+// Compose strips `export`, and ends a name at `=` or `:`. Read differently, a key
+// the operator already defines looks missing, and the merge appends it again.
+func TestDotenvKeyReadsLikeCompose(t *testing.T) {
+	for line, want := range map[string]string{
+		"TUNNEL_TOKEN=abc":          "TUNNEL_TOKEN",
+		"export TUNNEL_TOKEN=abc":   "TUNNEL_TOKEN",
+		"export\tTUNNEL_TOKEN=abc":  "TUNNEL_TOKEN",
+		"  BAR = 2":                 "BAR",
+		"TZ: Europe/London":         "TZ",
+		"URL=http://x:8080/a=b":     "URL",
+		"exportFOO=1":               "exportFOO",
+		"app.name-1[0]=x":           "app.name-1[0]",
+		"# COMMENTED=1":             "",
+		"=novalue":                  "",
+		"no separator here":         "",
+		"not a key=1":               "",
+		"MIIBIjANBgkq+hkiG9w0B/A==": "",
+		"":                          "",
+	} {
+		if got := dotenvKey(line); got != want {
+			t.Errorf("dotenvKey(%q) = %q, want %q", line, got, want)
+		}
+	}
+}
+
+// The 2026-10-04 recovery: cloudflare's .env came back with TUNNEL_TOKEN twice. An
+// operator's `export TUNNEL_TOKEN=` was not recognised, so the merge added the
+// generated one as a second definition — and Compose used DockBack's copy.
+func TestMergeEnvFilesRecognisesExportedKeys(t *testing.T) {
+	original := []byte("export TUNNEL_TOKEN=theirs\nTZ: Europe/London\n")
+	generated := []byte("TUNNEL_TOKEN=extracted\nTZ=UTC\n")
+	got := MergeEnvFiles(original, generated)
+	if string(got) != string(original) {
+		t.Errorf("every generated key is already defined, so the file must be untouched, got:\n%s", got)
+	}
+	if dups := duplicateEnvKeys(got); len(dups) != 0 {
+		t.Errorf("the merge must never create a duplicate, got %v", dups)
+	}
+}
+
+func TestDuplicateEnvKeysNamesEveryLineInOrder(t *testing.T) {
+	env := []byte("# tunnel\nTUNNEL_TOKEN=one\nTZ=UTC\nexport TUNNEL_TOKEN=two\nA=1\nTZ: Europe/London\nTUNNEL_TOKEN=three\n")
+	got := duplicateEnvKeys(env)
+	if len(got) != 2 {
+		t.Fatalf("want 2 duplicated keys, got %v", got)
+	}
+	if got[0].Key != "TUNNEL_TOKEN" || fmt.Sprint(got[0].Lines) != "[2 4 7]" {
+		t.Errorf("first duplicate = %+v, want TUNNEL_TOKEN on lines [2 4 7]", got[0])
+	}
+	if got[1].Key != "TZ" || fmt.Sprint(got[1].Lines) != "[3 6]" {
+		t.Errorf("second duplicate = %+v, want TZ on lines [3 6]", got[1])
+	}
+	if dups := duplicateEnvKeys([]byte("A=1\nB=2\n")); len(dups) != 0 {
+		t.Errorf("no key repeats, so nothing to report, got %v", dups)
+	}
+}
+
 // F230 — a folder DockBack just created must not be root's.
 func TestHostFileOwnerPrecedence(t *testing.T) {
 	env := []string{"PUID=1000", "PGID=1000"}
@@ -326,5 +386,75 @@ func TestCapturedBindDestinationsIgnoresRemappedSources(t *testing.T) {
 func TestCapturedBindDestinationsHandlesNilManifest(t *testing.T) {
 	if got := capturedBindDestinations(nil); len(got) != 0 {
 		t.Errorf("a nil manifest must yield no captured destinations, got %v", got)
+	}
+}
+
+// The 2026-10-04 recovery: six reconstructions had to be swapped for the originals by
+// hand. When the backup holds the stack's own compose file, that is the file
+// Compose reads, and the reconstruction sits beside it under a name Compose
+// ignores.
+func TestPlanStackFolderPrefersTheOriginal(t *testing.T) {
+	reconstruction := []byte("services: {rebuilt: {}}\n")
+	originals := []dockercli.NamedFile{
+		{Name: "compose.yaml", Content: []byte("services: {other-dir: {}}\n")},
+		{Name: "docker-compose.override.yml", Content: []byte("services: {override: {}}\n")},
+		{Name: "docker-compose.yml", Content: []byte("services: {mine: {}}\n")},
+	}
+	layout := planStackFolder("docker-compose.yml", reconstruction, originals)
+	if !layout.PrimaryOriginal || string(layout.Primary) != "services: {mine: {}}\n" {
+		t.Fatalf("the original named like the stack's compose file must be primary, got %+v", layout)
+	}
+	want := map[string]string{
+		reconstructionComposeName:     "services: {rebuilt: {}}\n",
+		"docker-compose.override.yml": "services: {override: {}}\n",
+		// A default name beside the primary would be read instead of it.
+		"compose.yaml.original-from-backup": "services: {other-dir: {}}\n",
+	}
+	if len(layout.Beside) != len(want) {
+		t.Fatalf("beside = %+v, want %v", layout.Beside, want)
+	}
+	for _, f := range layout.Beside {
+		if want[f.Name] != string(f.Content) {
+			t.Errorf("beside %s = %q, want %q", f.Name, f.Content, want[f.Name])
+		}
+		if dockercli.IsDefaultComposeName(f.Name) {
+			t.Errorf("%s would be read by Compose instead of the primary", f.Name)
+		}
+	}
+}
+
+func TestPlanStackFolderFallsBackToTheReconstruction(t *testing.T) {
+	reconstruction := []byte("services: {rebuilt: {}}\n")
+	// The captured file is not under the stack's compose name (its first file
+	// could not be read at capture), so it cannot stand in for the project.
+	layout := planStackFolder("docker-compose.yml", reconstruction,
+		[]dockercli.NamedFile{{Name: "docker-compose.prod.yml", Content: []byte("x: 1\n")}})
+	if layout.PrimaryOriginal || string(layout.Primary) != string(reconstruction) {
+		t.Fatalf("with no original under the compose name the reconstruction is primary, got %+v", layout)
+	}
+	if len(layout.Beside) != 1 || layout.Beside[0].Name != "docker-compose.prod.yml.original-from-backup" {
+		t.Errorf("captured files must go aside, got %+v", layout.Beside)
+	}
+	if empty := planStackFolder("docker-compose.yml", reconstruction, nil); empty.PrimaryOriginal || len(empty.Beside) != 0 {
+		t.Errorf("no originals: reconstruction alone, got %+v", empty)
+	}
+}
+
+// commafeed came back without a compose file because its database had no
+// backup. A restore of part of a project writes the operator's own file, which
+// describes all of it, and never a reconstruction of the part.
+func TestPartialStackFolderWritesOnlyTheOriginal(t *testing.T) {
+	originals := []dockercli.NamedFile{{Name: "docker-compose.yml", Content: []byte("services: {app: {}, postgresql: {}}\n")}}
+	layout, ok := partialStackFolder(planStackFolder("docker-compose.yml", []byte("services: {app: {}}\n"), originals))
+	if !ok || !layout.PrimaryOriginal || string(layout.Primary) != "services: {app: {}, postgresql: {}}\n" {
+		t.Fatalf("the original describes the whole project and must be written, got %+v ok=%v", layout, ok)
+	}
+	for _, f := range layout.Beside {
+		if f.Name == reconstructionComposeName {
+			t.Errorf("a reconstruction of part of the project must not be written: %+v", layout.Beside)
+		}
+	}
+	if _, ok := partialStackFolder(planStackFolder("docker-compose.yml", []byte("services: {app: {}}\n"), nil)); ok {
+		t.Error("with no original, nothing describes the whole project, so nothing may be written")
 	}
 }

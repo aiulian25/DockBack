@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go.yaml.in/yaml/v3"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -169,6 +171,19 @@ type StackRestoreOptions struct {
 	// Backups page. The dependency order among the KEPT services is unchanged —
 	// this narrows the set, it does not reorder it.
 	Services []string
+
+	// AllowDifferentImage is RestoreOptions.AllowDifferentImage for every member.
+	AllowDifferentImage bool
+
+	// FilesOnly is RestoreOptions.FilesOnly for the whole stack: its folder,
+	// once, and every member's missing single-file binds (step 23).
+	FilesOnly bool
+
+	// MissingMembers are the stack's services with no backup at all, which this
+	// restore cannot bring back. Like a narrowed Services list, they make the
+	// restore cover only part of the project, which decides what may be written
+	// as the stack's compose file.
+	MissingMembers []string
 
 	// GroupID, when set, restricts selection to backups whose manifest
 	// ConsistencyGroup matches — so every service is restored from ONE app-consistent
@@ -347,6 +362,9 @@ type StackPlanEntry struct {
 	// cross-host restore (F94). Empty when restoring onto the origin node, or
 	// when the service asks nothing special of its host.
 	Portability []string `json:"portability,omitempty"`
+	// MissingDevices are the recorded devices the target verifiably lacks; a
+	// restore stops on them until confirmed (step 27).
+	MissingDevices []string `json:"missing_devices,omitempty"`
 
 	// RestoreBlock (F174) is a problem that would stop THIS service's restore,
 	// known from its manifest before anything is touched. Distinct from
@@ -488,8 +506,9 @@ func (e *Engine) RestoreStack(ctx context.Context, sourceNodeID, targetNodeID, p
 	}
 	// F146: an application whose services are only meaningful together must be
 	// restored as one unit, from one snapshot. Judged here, before the first
-	// service is touched, so a refusal costs nothing.
-	if aerr := StackAtomicGroupVerdict(manifestsOf(byService)); aerr != nil {
+	// service is touched, so a refusal costs nothing. Files-only touches no
+	// service, so it is not judged.
+	if aerr := StackAtomicGroupVerdict(manifestsOf(byService)); aerr != nil && !sopts.FilesOnly {
 		e.logf(logID, "ERROR", "Stack restore refused: %v", aerr)
 		return aerr
 	}
@@ -505,6 +524,11 @@ func (e *Engine) RestoreStack(ctx context.Context, sourceNodeID, targetNodeID, p
 		return kerr
 	}
 
+	if sopts.FilesOnly {
+		return e.restoreStackFilesOnly(ctx, targetNodeID, project, topoOrder(byService), sopts, logID)
+	}
+
+	e.fillDependsOnFromCompose(ctx, byService, sopts.Source, logID)
 	order := topoOrder(byService)
 	names := make([]string, len(order))
 	for i, s := range order {
@@ -518,9 +542,16 @@ func (e *Engine) RestoreStack(ctx context.Context, sourceNodeID, targetNodeID, p
 
 	// A service that restored fully but failed only its HEALTH GATE doesn't
 	// abort the stack: on a fresh host it frequently becomes healthy once the
-	// services after it (or its late-ordered dependency) exist. Anything else
-	// (a real restore failure) still aborts — dependents would be garbage.
+	// services after it (or its late-ordered dependency) exist.
+	//
+	// A real failure doesn't abort it either. It used to: in a real recovery a
+	// one-shot helper was restored first, failed, and the six services that
+	// mattered were never attempted. Now only the services that DEPEND on a
+	// failed one are skipped — they would come up against nothing — and the rest
+	// are restored. The run ends with what happened to each.
 	var unhealthy []*stackService
+	failed := map[string]error{}
+	skipped := map[string]string{}
 	for i, s := range order {
 		// Operator canceled between services: stop cleanly here rather than start
 		// another destructive service restore. Everything already restored stays.
@@ -528,8 +559,15 @@ func (e *Engine) RestoreStack(ctx context.Context, sourceNodeID, targetNodeID, p
 			e.logf(logID, "WARN", "Stack restore CANCELED after %d of %d service(s) — the services restored so far are in place; the rest were not touched", i, len(order))
 			return fmt.Errorf("%w after %d of %d service(s)", ErrRestoreCanceled, i, len(order))
 		}
+		if dep := failedDependency(s, failed, skipped); dep != "" {
+			skipped[s.service] = dep
+			e.logf(logID, "WARN", "[%d/%d] Skipping service %q — it depends on %q, which did not restore", i+1, len(order), s.service, dep)
+			continue
+		}
 		e.logf(logID, "INFO", "[%d/%d] Restoring service %q (%s)…", i+1, len(order), s.service, s.backup.TargetName)
-		err := e.Restore(ctx, stackServiceRestoreOptions(s, targetNodeID, sopts))
+		memberOpts := stackServiceRestoreOptions(s, targetNodeID, sopts)
+		memberOpts.SnapshotLogID = logID
+		err := e.Restore(ctx, memberOpts)
 		switch {
 		case errors.Is(err, ErrRestoreCanceled):
 			e.logf(logID, "WARN", "[%d/%d] Service %q: %v — stopping the stack restore here", i+1, len(order), s.service, err)
@@ -540,25 +578,18 @@ func (e *Engine) RestoreStack(ctx context.Context, sourceNodeID, targetNodeID, p
 			e.logf(logID, "WARN", "[%d/%d] Service %q restored but not healthy yet — continuing with the remaining services and re-checking it afterwards", i+1, len(order), s.service)
 			unhealthy = append(unhealthy, s)
 		default:
-			e.logf(logID, "ERR", "Service %q failed: %v", s.service, err)
-			return fmt.Errorf("service %q: %w", s.service, err)
+			failed[s.service] = err
+			e.logf(logID, "ERR", "[%d/%d] Service %q failed: %v — carrying on with the services that do not depend on it", i+1, len(order), s.service, err)
 		}
 	}
 
 	// F190: one compose file for the whole project, written once now that every
 	// service is in place — not one per service into the same path.
 	if sopts.ReconstructHost {
-		// F213: but never from a SUBSET. This writes ONE file describing the whole
-		// project, so a partial restore would replace the stack's compose file
-		// with one naming only the services that happened to be selected. The
-		// displaced original is kept beside it, but the file the operator's tools
-		// read would then describe a fraction of their stack — and a restore of
-		// one service has no business rewriting the other four.
-		if len(sopts.Services) > 0 {
-			e.logf(logID, "INFO", "Not rewriting %q's compose file — this restore covered only some of its services, and that file describes the whole project", project)
-		} else {
-			e.reconstructStackCompose(ctx, targetNodeID, project, order, sopts, logID)
-		}
+		// F213: a partial restore writes no file rebuilt from its subset —
+		// reconstructStackCompose decides that, because the operator's own file
+		// describes the whole project and is still worth writing.
+		e.reconstructStackCompose(ctx, targetNodeID, project, order, sopts, logID)
 	} else if len(order) > 0 {
 		// Said once for the stack rather than once per service: the files are one
 		// set, in one folder, and the operator makes one decision about them.
@@ -601,8 +632,14 @@ func (e *Engine) RestoreStack(ctx context.Context, sourceNodeID, targetNodeID, p
 		}
 		if len(still) > 0 {
 			e.logf(logID, "ERR", "Stack %q restored, but %d service(s) did not become healthy: %s — investigate them; their data IS restored", project, len(still), strings.Join(still, ", "))
-			return fmt.Errorf("stack restored, but service(s) not healthy: %s%s", strings.Join(still, ", "), whyNotHealthy(still, reasons))
+			if len(failed) == 0 && len(skipped) == 0 {
+				return fmt.Errorf("stack restored, but service(s) not healthy: %s%s", strings.Join(still, ", "), whyNotHealthy(still, reasons))
+			}
 		}
+	}
+	if len(failed) > 0 || len(skipped) > 0 {
+		e.logStackOutcome(logID, order, failed, skipped)
+		return stackIncompleteError(len(order), failed, skipped)
 	}
 	// F170: with every service up, ask the application's own database which
 	// optional subsystems are switched on and say what each one still needs. The
@@ -612,7 +649,67 @@ func (e *Engine) RestoreStack(ctx context.Context, sourceNodeID, targetNodeID, p
 	e.stackPostRestoreNotes(ctx, targetNodeID, order, logID)
 
 	e.logf(logID, "INFO", "Stack %q restored — all %d services are running", project, len(order))
+	if targetNodeID != sourceNodeID {
+		var addressVars []string
+		for _, s := range order {
+			addressVars = append(addressVars, AddressEnvKeys(s.man)...)
+		}
+		slices.Sort(addressVars)
+		e.logMovedChecklist(logID, sourceNodeID, targetNodeID, slices.Compact(addressVars))
+	}
 	return nil
+}
+
+// failedDependency names the first dependency of s that failed or was itself
+// skipped, or "" when every dependency is in place. The order is topological,
+// so a skip propagates down a chain without looking further than one level.
+func failedDependency(s *stackService, failed map[string]error, skipped map[string]string) string {
+	for _, dep := range s.man.DependsOn {
+		if _, bad := failed[dep]; bad {
+			return dep
+		}
+		if _, gone := skipped[dep]; gone {
+			return dep
+		}
+	}
+	return ""
+}
+
+// logStackOutcome ends an incomplete stack restore with one line per service,
+// so what came back and what did not is in one place, not scattered through the
+// run.
+func (e *Engine) logStackOutcome(logID string, order []*stackService, failed map[string]error, skipped map[string]string) {
+	e.logf(logID, "INFO", "What happened to each service:")
+	for _, s := range order {
+		switch {
+		case failed[s.service] != nil:
+			e.logf(logID, "ERR", "  %s — FAILED: %v", s.service, failed[s.service])
+		case skipped[s.service] != "":
+			e.logf(logID, "WARN", "  %s — skipped: it depends on %s, which did not restore", s.service, skipped[s.service])
+		default:
+			e.logf(logID, "INFO", "  %s — restored", s.service)
+		}
+	}
+}
+
+// stackIncompleteError summarises an incomplete stack restore in one line.
+func stackIncompleteError(total int, failed map[string]error, skipped map[string]string) error {
+	failedNames := make([]string, 0, len(failed))
+	for name := range failed {
+		failedNames = append(failedNames, name)
+	}
+	sort.Strings(failedNames)
+	skippedNames := make([]string, 0, len(skipped))
+	for name := range skipped {
+		skippedNames = append(skippedNames, name)
+	}
+	sort.Strings(skippedNames)
+	restored := total - len(failed) - len(skipped)
+	msg := fmt.Sprintf("stack restore incomplete: %d of %d service(s) restored; failed: %s", restored, total, strings.Join(failedNames, ", "))
+	if len(skippedNames) > 0 {
+		msg += "; skipped because a dependency failed: " + strings.Join(skippedNames, ", ")
+	}
+	return errors.New(msg)
 }
 
 // whyNotHealthy appends the one service's own reason to the failure, when there
@@ -756,9 +853,9 @@ func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, proj
 	// that leaks on sight.
 	merged, envFile, movedSecrets := splitComposeSecrets(merged)
 	// F231: the project's OWN .env, captured from the source host and put through
-	// the same remaps, goes underneath DockBack's extracted secrets — theirs wins
-	// on any key both define. Taken from the anchor member, because a compose
-	// project has one .env beside its one compose file.
+	// the same remaps. Taken from the anchor member, because a compose project
+	// has one .env beside its one compose file.
+	var originalEnv []byte
 	for _, s := range order {
 		if s == nil || s.backup == nil {
 			continue
@@ -766,12 +863,10 @@ func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, proj
 		if orig := e.stackEnvFromArchive(ctx, s.backup, sopts.Source, logID,
 			sopts.RemapFromIP, sopts.RemapToIP, sopts.RemapFromDomain, sopts.RemapToDomain,
 			sopts.RemapFromPath, sopts.RemapToPath); len(orig) > 0 {
-			envFile = MergeEnvFiles(orig, envFile)
+			originalEnv = orig
 			break
 		}
 	}
-
-	e.logf(logID, "INFO", "Writing one compose file for %q (%d service(s)) at %s", project, len(docs), stackDir)
 	// F230: the folder belongs to whoever the stack's data was restored for, when
 	// DockBack just created its parent. Taken from the anchor service — the
 	// members of a project share one folder, and its owner is one answer.
@@ -786,10 +881,9 @@ func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, proj
 			break
 		}
 	}
-	// F57: the project's OWN compose file(s) from the source host, beside the
-	// merged reconstruction under a non-canonical name. Taken from the same anchor
-	// member the .env came from — a compose project has one folder, and the
-	// originals in it describe that one project.
+	// F57: the project's OWN compose file(s) from the source host, taken from the
+	// same anchor member the .env came from — a compose project has one folder,
+	// and the originals in it describe that one project.
 	var originals []dockercli.NamedFile
 	for _, s := range order {
 		if s == nil || s.backup == nil {
@@ -802,27 +896,66 @@ func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, proj
 			break
 		}
 	}
-	res, rerr := dockercli.ReconstructStackDirWithEnv(ctx, cli, stackDir, composeFile, merged, envFile, stackOwner, originals...)
+	layout := planStackFolder(composeFile, merged, originals)
+	// F213: a restore that covers only part of the project — services left out,
+	// or members with no backup — rebuilds a file from that part alone. Written
+	// as the stack's compose file, it would describe a fraction of the project,
+	// so it is not written at all. The operator's own file describes the whole
+	// project and still is: commafeed came back without one because its database
+	// had no backup.
+	if len(sopts.Services) > 0 || len(sopts.MissingMembers) > 0 {
+		narrowed, ok := partialStackFolder(layout)
+		if !ok {
+			e.logf(logID, "INFO", "Not writing %q's compose file — this restore covers only some of its services, the backup holds no original compose file, and one rebuilt from a subset would describe a fraction of the project", project)
+			return
+		}
+		layout, envFile, movedSecrets = narrowed, originalEnv, 0
+		e.logf(logID, "INFO", "This restore covers only some of %q's services, so only your own compose file and .env are written — they describe the whole project", project)
+	} else if len(originalEnv) > 0 {
+		envFile = MergeEnvFiles(originalEnv, envFile)
+	}
+	e.warnDuplicateEnvKeys(logID, envFile)
+
+	checker := e.openComposeChecker(ctx, cli, logID)
+	if checker != nil {
+		defer checker.Close()
+	}
+	layout = e.guardReconstruction(ctx, checker, layout, envFile, project, logID)
+
+	e.logf(logID, "INFO", "Writing the compose file for %q at %s", project, stackDir)
+	res, rerr := dockercli.ReconstructStackDirWithEnv(ctx, cli, stackDir, composeFile, layout.Primary, envFile, stackOwner, layout.Beside...)
 	if rerr != nil {
 		e.logf(logID, "WARN", "Host stack reconstruction skipped: %v", rerr)
 		return
 	}
-	switch {
-	case res.Unchanged:
-		e.logf(logID, "INFO", "The compose file at %s already matches this stack — left exactly as it is", res.Path)
-	case res.Displaced != "":
-		e.logf(logID, "INFO", "Wrote the stack's compose file to %s. The file that was there is kept as %s — nothing was deleted.", res.Path, res.Displaced)
-		e.logf(logID, "WARN", "That file is built from the containers' AS-RESTORED configuration — env_file, profiles and comments from your own compose are not carried over. Compare it against %s before you rely on it.", res.Displaced)
-	default:
-		e.logf(logID, "INFO", "Wrote the stack's compose file to %s", res.Path)
+	e.logStackFolder(logID, res, layout, movedSecrets)
+	// The project's other files, from the first member that captured them: a
+	// project has one folder, and every member that captured it holds the same.
+	for _, s := range order {
+		if s != nil && s.man != nil && s.man.ProjectFolder != nil && s.man.ProjectFolder.Entries > 0 {
+			e.restoreProjectFolder(ctx, cli, s.backup, s.man, sopts.Source, logID, res.Dir)
+			break
+		}
 	}
-	if res.EnvPath != "" {
-		e.logf(logID, "INFO", "Wrote %d secret value(s) to %s (mode 600) — the compose file references them as ${VAR} and carries no secrets itself. Keep the .env out of version control.", movedSecrets, res.EnvPath)
+	e.reportComposeCheck(ctx, cli, checker, res, layout, project, true, logID)
+}
+
+// restoreStackFilesOnly puts back the stack's folder once, and every member's
+// missing single-file binds (step 23). No service is stopped or changed.
+func (e *Engine) restoreStackFilesOnly(ctx context.Context, targetNodeID, project string, order []*stackService, sopts StackRestoreOptions, logID string) error {
+	cli, err := e.Reg.Get(targetNodeID)
+	if err != nil {
+		return err
 	}
-	if res.EnvDisplaced != "" {
-		e.logf(logID, "INFO", "The .env that was there is kept as %s — nothing was deleted.", res.EnvDisplaced)
+	e.logf(logID, "INFO", "Files-only restore of stack %q: putting back its files on the host. No service is stopped or changed, and nothing that exists is overwritten.", project)
+	for _, s := range order {
+		memberOpts := stackServiceRestoreOptions(s, targetNodeID, sopts)
+		e.restoreMissingBindFiles(ctx, cli, s.backup, s.man, memberOpts, logID)
+		e.reportMissingDataFolders(ctx, cli, s.man, memberOpts, logID)
 	}
-	e.logRestoredOriginals(logID, res.Originals)
+	e.reconstructStackCompose(ctx, targetNodeID, project, order, sopts, logID)
+	e.logf(logID, "INFO", "Stack %q: files restored — no service was stopped or changed", project)
+	return nil
 }
 
 // liveComposeDoc builds one service's compose document from its container AS
@@ -910,6 +1043,8 @@ func stackServiceRestoreOptions(s *stackService, targetNodeID string, sopts Stac
 		Volumes:              true,
 		Database:             true,
 		Recreate:             sopts.Recreate,
+		AllowDifferentImage:  sopts.AllowDifferentImage,
+		FilesOnly:            sopts.FilesOnly,
 		Snapshot:             sopts.Snapshot,
 		ReconstructHost:      sopts.ReconstructHost,
 		HostBaseDir:          sopts.HostBaseDir,
@@ -991,6 +1126,88 @@ func checkStackPrivateKey(byService map[string]*stackService, priv string) error
 		}
 	}
 	return nil
+}
+
+// fillDependsOnFromCompose recovers depends_on from the stack's own compose
+// file when no member's container recorded one — a stack manager that creates
+// containers itself may not set the label. Without it the order falls back to
+// tiers and names, which is how a helper that depends on two services was
+// restored before both of them in a real recovery.
+//
+// Only when NO member recorded any: a stack where some did has its labels, and
+// a service with no dependencies is then genuinely independent. Reads the
+// smallest member's archive that holds the compose file.
+func (e *Engine) fillDependsOnFromCompose(ctx context.Context, svcs map[string]*stackService, source, logID string) {
+	if len(svcs) < 2 {
+		return
+	}
+	var donor *stackService
+	for _, s := range svcs {
+		if len(s.man.DependsOn) > 0 {
+			return
+		}
+		if s.man.HasOriginalCompose && (donor == nil || s.backup.SizeBytes < donor.backup.SizeBytes) {
+			donor = s
+		}
+	}
+	if donor == nil {
+		return
+	}
+	merged := map[string][]string{}
+	for _, body := range e.originalComposeFromArchive(ctx, donor.backup, source) {
+		for service, deps := range dependsOnDeclaredIn(body) {
+			merged[service] = append(merged[service], deps...)
+		}
+	}
+	if filled := fillMissingDependsOn(svcs, merged); len(filled) > 0 {
+		e.logf(logID, "INFO", "depends_on for %s taken from the stack's own compose file — its containers carried no depends_on label", strings.Join(filled, ", "))
+	}
+}
+
+// dependsOnDeclaredIn reads each service's depends_on from a compose file, in
+// either form Compose accepts: a list of names, or a map of name → {condition}.
+func dependsOnDeclaredIn(compose []byte) map[string][]string {
+	var doc struct {
+		Services map[string]struct {
+			DependsOn yaml.Node `yaml:"depends_on"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(compose, &doc); err != nil {
+		return nil
+	}
+	out := map[string][]string{}
+	for service, def := range doc.Services {
+		node := def.DependsOn
+		switch node.Kind {
+		case yaml.SequenceNode:
+			for _, item := range node.Content {
+				if item.Kind == yaml.ScalarNode && item.Value != "" {
+					out[service] = append(out[service], item.Value)
+				}
+			}
+		case yaml.MappingNode:
+			for i := 0; i+1 < len(node.Content); i += 2 {
+				out[service] = append(out[service], node.Content[i].Value)
+			}
+		}
+	}
+	return out
+}
+
+// fillMissingDependsOn gives each member with no recorded depends_on the one
+// the compose file declares, and returns the members it filled, sorted.
+func fillMissingDependsOn(svcs map[string]*stackService, declared map[string][]string) []string {
+	var filled []string
+	for service, s := range svcs {
+		deps := declared[service]
+		if len(s.man.DependsOn) > 0 || len(deps) == 0 {
+			continue
+		}
+		s.man.DependsOn = deps
+		filled = append(filled, service)
+	}
+	sort.Strings(filled)
+	return filled
 }
 
 // topoOrder returns services ordered so each comes after its dependencies; among

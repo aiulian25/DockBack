@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +34,14 @@ type RestoreOptions struct {
 	Volumes  bool   // restore volume data
 	Database bool   // re-import database dumps
 	Recreate bool   // force recreate-from-manifest even if a container exists
+	// FilesOnly puts back only the files a stack keeps on the host (step 23):
+	// compose, .env, the project's other files and missing single-file binds. No
+	// container is stopped or changed and nothing that exists is overwritten.
+	FilesOnly bool
+	// AllowDifferentImage lets a recreate run the tag's current image when the
+	// image the backup ran can be neither found nor pulled. Off by default: a
+	// newer version on older data is a migration some applications cannot undo.
+	AllowDifferentImage bool
 	// PromoteRestartPolicy rewrites a policy that will not survive a reboot to
 	// `unless-stopped` (#8). Off by default — the finding at capture is the
 	// default behaviour, and changing an availability setting unasked is the
@@ -44,6 +54,11 @@ type RestoreOptions struct {
 	// so everything downstream races the database on every boot.
 	InjectHealthchecks bool
 	Snapshot           bool // back up the target's CURRENT state before overwriting so a bad restore is reversible
+	// SnapshotLogID is a second log to announce the safety snapshot in — a stack
+	// restore's run log. Each member logs under its own backup, which the stack
+	// console does not show, so without this the rollback point is invisible
+	// exactly where the operator is watching.
+	SnapshotLogID string
 	// Source picks which copy to read from: "" = auto (local first, then
 	// offsite), "local", or a destination ID. A chosen copy that is unreachable
 	// or corrupt falls back to the others.
@@ -203,6 +218,11 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 			e.privGate.Unlock()
 		}()
 	}
+	// Step 23: files-only changes no container and restores no volume, so the
+	// verdicts below, which guard data, do not apply to it.
+	if opts.FilesOnly {
+		return e.restoreFilesOnly(ctx, b, man, opts)
+	}
 	// F141: some applications keep one configuration in two volumes, and half of
 	// it restores into a broken or factory-fresh deployment. Checked FIRST —
 	// before the target is resolved, before the safety snapshot, before anything
@@ -275,6 +295,16 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		}
 	}
 
+	// Whether the target was running before this restore touched it — so a
+	// restore that fails without a snapshot to roll back to can at least start it
+	// again, rather than leaving a working application stopped.
+	wasRunning := false
+	if !clone {
+		if info, ierr := cli.ContainerInspect(ctx, opts.TargetID); ierr == nil && info.State != nil && info.State.Running {
+			wasRunning = true
+		}
+	}
+
 	// Safety snapshot before an in-place overwrite: back up the target's
 	// CURRENT state so a bad restore is reversible. Only when the container exists
 	// (nothing to capture when recreating from scratch). Abort the restore if the
@@ -287,6 +317,9 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 				snapNode = n.Name
 			}
 			e.logf(b.ID, "INFO", "Safety snapshot: backing up current state before overwrite")
+			if opts.SnapshotLogID != "" {
+				e.logf(opts.SnapshotLogID, "INFO", "Safety snapshot of %q: backing up its current state before overwriting it", b.TargetName)
+			}
 			sid, serr := e.Run(ctx, snapNode, Options{
 				NodeID: opts.NodeID, ContainerID: opts.TargetID, Compression: "balanced",
 				DestinationsExplicit: true, // local-only — an immediate rollback point, not an offsite copy
@@ -303,6 +336,9 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 			}
 			snapID = sid
 			e.logf(b.ID, "INFO", "Safety snapshot created (%s) — restore it to roll back this restore", short(snapID))
+			if opts.SnapshotLogID != "" {
+				e.logf(opts.SnapshotLogID, "INFO", "Safety snapshot of %q created (%s) — restore it to roll %q back", b.TargetName, short(snapID), b.TargetName)
+			}
 		}
 	}
 
@@ -426,7 +462,7 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 				e.logf(b.ID, "INFO", "Bundled image loaded")
 			}
 		} else if man.ImageDigest != "" {
-			e.logf(b.ID, "INFO", "Re-pulling identical image by digest: %s", man.ImageDigest)
+			e.logf(b.ID, "INFO", "Using the identical image this backup ran — from this host if it is here, else pulled by digest: %s", man.ImageDigest)
 		}
 		var cloneOpts *dockercli.CloneOptions
 		if clone {
@@ -480,7 +516,7 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		if !clone {
 			netSpecs = networkSpecsFrom(man.Networks)
 		}
-		newID, name, netWarnings, err := dockercli.RecreateContainer(ctx, cli, inspectBytes, man.ImageDigest, cloneOpts, netSpecs)
+		newID, name, netWarnings, err := dockercli.RecreateContainer(ctx, cli, inspectBytes, man.ImageDigest, cloneOpts, netSpecs, opts.AllowDifferentImage)
 		if err != nil {
 			return fmt.Errorf("recreate container: %w", err)
 		}
@@ -519,6 +555,21 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		opts.TargetID = newID
 	}
 
+	// In-place restores need the host-side pieces too. They used to happen only
+	// on a recreate, so restoring a container that was still RUNNING — the usual
+	// state after a host's stack folders are deleted — wrote no single-file bind
+	// back and recreated no missing bind source. Docker then invented empty,
+	// root-owned directories in their place when the container restarted,
+	// including where a secret file belonged.
+	if !missing && !opts.Recreate && !clone && opts.Volumes {
+		if _, raw, ierr := cli.ContainerInspectWithRaw(ctx, opts.TargetID, false); ierr == nil {
+			e.restoreBindFiles(ctx, cli, b, man, opts)
+			if berr := e.materializeBindSources(ctx, cli, b, man, raw); berr != nil {
+				return e.recoverFromFailedRestore(ctx, cli, b, opts, snapID, wasRunning, berr)
+			}
+		}
+	}
+
 	// Run the appropriate restore path, then gate on health (F4).
 	var rerr error
 	switch {
@@ -541,7 +592,10 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		rerr = e.restoreFiles(ctx, cli, b, man, opts)
 	}
 	if rerr != nil {
-		return rerr
+		if opts.rollback || clone {
+			return rerr // an internal rollback must not recurse; a clone touched nothing
+		}
+		return e.recoverFromFailedRestore(ctx, cli, b, opts, snapID, wasRunning, rerr)
 	}
 
 	// F140: post-restore application steps, BEFORE the health gate. For Nextcloud
@@ -585,7 +639,28 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 	// the credentials that came back. Advisory — a dependency being unreachable
 	// is not a defect in the backup.
 	e.probeUpstream(ctx, cli, b, man, opts)
+	if man.NodeID != "" && man.NodeID != opts.NodeID && !opts.stackMember {
+		e.logMovedChecklist(b.ID, man.NodeID, opts.NodeID, AddressEnvKeys(man))
+	}
 	return nil
+}
+
+// logMovedChecklist ends a cross-host restore with what may still point at the
+// machine it came from (step 27). Docker cannot see any of it: proxy hosts,
+// tunnel targets, DNS records, cron jobs, monitors. In the 2026-10-04 recovery those were
+// the things checked by hand, one by one.
+func (e *Engine) logMovedChecklist(logID, originNodeID, targetNodeID string, addressVars []string) {
+	origin, target := originNodeID, targetNodeID
+	if n, err := e.Store.GetNode(originNodeID); err == nil {
+		origin = n.Name
+	}
+	if n, err := e.Store.GetNode(targetNodeID); err == nil {
+		target = n.Name
+	}
+	e.logf(logID, "INFO", "Moved from %s to %s. Outside Docker, these may still point at the old machine: reverse-proxy hosts (Nginx Proxy Manager, Traefik, Caddy), tunnel targets (Pangolin, Cloudflare), DNS records (Pi-hole, the router), cron jobs on the old machine, monitors (Uptime Kuma) and bookmarks by address.", origin, target)
+	if len(addressVars) > 0 {
+		e.logf(logID, "INFO", "These environment variables hold addresses, so check they suit the new machine: %s", strings.Join(addressVars, ", "))
+	}
 }
 
 // Post-restore health-gate timeout (F4/F30): how long the gate waits for the
@@ -740,6 +815,67 @@ const (
 	// restoreAlertTailLines is what leaves the machine in a notification.
 	restoreAlertTailLines = 15
 )
+
+// failedRestoreStep is what a failed restore does about the state it left.
+type failedRestoreStep int
+
+const (
+	failedRestoreLeave failedRestoreStep = iota
+	failedRestoreRollBack
+	failedRestoreRestart
+)
+
+// failedRestoreAction decides it. A cancel is the operator's own stop, not a
+// failure: it stops where it is and never rolls back behind their back. With a
+// safety snapshot, roll back to it. Without one, an application that was
+// running is started again rather than left down.
+func failedRestoreAction(haveSnapshot, wasRunning, canceled bool) failedRestoreStep {
+	if canceled {
+		return failedRestoreLeave
+	}
+	if haveSnapshot {
+		return failedRestoreRollBack
+	}
+	if wasRunning {
+		return failedRestoreRestart
+	}
+	return failedRestoreLeave
+}
+
+// recoverFromFailedRestore handles a restore that failed BEFORE the health
+// gate. It used to return the error and nothing else, so a restore that died
+// half-way left the container stopped on partly-overwritten data with nothing
+// said about it. The rollback here is the same one the health gate performs.
+func (e *Engine) recoverFromFailedRestore(ctx context.Context, cli *client.Client, b *store.Backup, opts RestoreOptions, snapID string, wasRunning bool, cause error) error {
+	canceled := errors.Is(cause, ErrRestoreCanceled) || ctx.Err() != nil
+	switch failedRestoreAction(snapID != "", wasRunning, canceled) {
+	case failedRestoreRollBack:
+		e.logf(b.ID, "WARN", "Restore failed (%v) — rolling back to the pre-restore snapshot (%s)", cause, short(snapID))
+		rbErr := e.Restore(ctx, RestoreOptions{
+			BackupID: snapID, NodeID: opts.NodeID, TargetID: opts.TargetID,
+			Volumes: true, Database: true, Source: "local", rollback: true,
+		})
+		if rbErr != nil {
+			e.logf(b.ID, "WARN", "Rollback to the safety snapshot FAILED: %v", rbErr)
+			e.notify(notify.KindRestoreFailed, "Restore FAILED and rollback FAILED: "+b.TargetName,
+				fmt.Sprintf("Restoring %s failed (%v), and the automatic rollback to the pre-restore snapshot failed too (%v). The container may be in an intermediate state — restore the safety snapshot %s by hand.", b.TargetName, cause, rbErr, short(snapID)))
+			return fmt.Errorf("restore failed (%v) and the rollback to safety snapshot %s failed (%v) — restore it by hand", cause, short(snapID), rbErr)
+		}
+		e.logf(b.ID, "INFO", "Rolled back to the pre-restore snapshot — %s is back in its prior state", b.TargetName)
+		e.notify(notify.KindRestoreRolledBack, "Restore rolled back: "+b.TargetName,
+			fmt.Sprintf("Restoring %s failed (%v), so DockBack rolled back to the pre-restore safety snapshot. The container is back in its prior state; investigate before retrying.", b.TargetName, cause))
+		return fmt.Errorf("restore failed (%v) — rolled back to the pre-restore snapshot %s, so nothing was lost", cause, short(snapID))
+	case failedRestoreRestart:
+		if serr := cli.ContainerStart(ctx, opts.TargetID, container.StartOptions{}); serr != nil {
+			e.logf(b.ID, "ERR", "Restore failed (%v), no safety snapshot was taken, and %s could not be started again: %v", cause, b.TargetName, serr)
+			return fmt.Errorf("restore failed (%v); no safety snapshot to roll back to, and restarting the container failed (%v)", cause, serr)
+		}
+		e.logf(b.ID, "WARN", "Restore failed (%v). No safety snapshot was taken, so nothing could be rolled back. %s was running before, so it has been started again — on whatever its mounts hold now, which may be PARTLY restored. Check its data before relying on it.", cause, b.TargetName)
+		return fmt.Errorf("restore failed (%v) — no safety snapshot to roll back to; the container was started again and its data may be partly restored", cause)
+	default:
+		return cause
+	}
+}
 
 // gateRestoreHealth waits for the restored container to become healthy and, if it
 // doesn't, either rolls back to the pre-restore safety snapshot (when one was
@@ -1662,6 +1798,9 @@ func (e *Engine) restoreEmbeddedDBApp(ctx context.Context, cli *client.Client, b
 	// already do. This path was the one that did not, so the operator had to
 	// delete the directory by hand before every cross-host restore.
 	if d != nil && strings.TrimSpace(d.DataDir) != "" {
+		if perr := e.proveBeforeClearing(ctx, b, man, opts, d.DataDir); perr != nil {
+			return perr
+		}
 		e.logf(b.ID, "INFO", "Clearing the bundled %s data directory %s so it re-initialises fresh for the dump", eng, d.DataDir)
 		if serr := stopBeforeOverwrite(ctx, cli, opts.TargetID, b.TargetName); serr != nil {
 			return serr
@@ -2051,21 +2190,127 @@ func (e *Engine) originalsForHost(ctx context.Context, b *store.Backup, source, 
 	return out
 }
 
-// logRestoredOriginals says what was put on the host and, plainly, why it is not
-// the file `docker compose` will run (F57).
+// reconstructionComposeName is where DockBack's reconstruction goes when the
+// backup holds the operator's own compose file: beside it, under a name
+// `docker compose` does not read unless it is passed with -f.
+const reconstructionComposeName = "docker-compose.dockback.yml"
+
+// stackFolderLayout is the compose file `docker compose` will read in a restored
+// stack folder, and the files written beside it.
+type stackFolderLayout struct {
+	Primary         []byte
+	PrimaryOriginal bool
+	Beside          []dockercli.NamedFile
+}
+
+// planStackFolder makes the operator's own compose file the one Compose reads
+// whenever the backup holds it under the stack's compose name, with the
+// reconstruction beside it for comparison.
 //
-// The distinction is the whole point: the reconstruction is guaranteed to match
-// the containers that were just restored, and the original — hand-tuned,
-// commented, with the env_file and profiles a reconstruction cannot reproduce —
-// is the one worth reading before adopting.
-func (e *Engine) logRestoredOriginals(logID string, originals []string) {
-	if len(originals) == 0 {
-		return
+// The 2026-10-04 recovery had to swap six reconstructions for the originals by hand:
+// they re-declared shared networks under a project prefix, left named volumes
+// undeclared and blanked `$` values. The original is the file the stack was
+// actually running from. Only with no original does the reconstruction take
+// the name, with any captured files kept aside under names Compose ignores.
+//
+// Another original that has one of Compose's default names goes aside too, or
+// Compose would pick it over the primary. Pure.
+func planStackFolder(composeName string, reconstruction []byte, originals []dockercli.NamedFile) stackFolderLayout {
+	primary := slices.IndexFunc(originals, func(o dockercli.NamedFile) bool { return o.Name == composeName })
+	if primary < 0 {
+		layout := stackFolderLayout{Primary: reconstruction}
+		for _, o := range originals {
+			if name := dockercli.AsideName(o.Name); name != "" {
+				layout.Beside = append(layout.Beside, dockercli.NamedFile{Name: name, Content: o.Content})
+			}
+		}
+		return layout
 	}
-	e.logf(logID, "INFO", "Also restored the genuine compose file(s) from the source host as %s. "+
-		"They are NOT what `docker compose` runs here: they may reference env_file targets, relative paths or profiles that do not exist on this machine. "+
-		"The canonical file beside them matches what is actually running — read these before adopting them.",
-		strings.Join(originals, ", "))
+	layout := stackFolderLayout{
+		Primary:         originals[primary].Content,
+		PrimaryOriginal: true,
+		Beside:          []dockercli.NamedFile{{Name: reconstructionComposeName, Content: reconstruction}},
+	}
+	for i, o := range originals {
+		if i == primary {
+			continue
+		}
+		name := o.Name
+		if dockercli.IsDefaultComposeName(name) {
+			name = dockercli.AsideName(name)
+		}
+		layout.Beside = append(layout.Beside, dockercli.NamedFile{Name: name, Content: o.Content})
+	}
+	return layout
+}
+
+// partialStackFolder is what a restore covering only part of a project may
+// write: the operator's own files, never a reconstruction rebuilt from the part.
+// ok is false when the backup holds no original, so there is nothing to write.
+func partialStackFolder(layout stackFolderLayout) (stackFolderLayout, bool) {
+	if !layout.PrimaryOriginal {
+		return stackFolderLayout{}, false
+	}
+	layout.Beside = slices.DeleteFunc(slices.Clone(layout.Beside), func(f dockercli.NamedFile) bool {
+		return f.Name == reconstructionComposeName
+	})
+	return layout, true
+}
+
+// logStackFolder says what a restore laid down in the stack folder, and which
+// of the files is the one `docker compose` runs.
+func (e *Engine) logStackFolder(logID string, res *dockercli.HostReconstructResult, layout stackFolderLayout, movedSecrets int) {
+	kept := ""
+	if res.Displaced != "" {
+		kept = fmt.Sprintf(" The file that was there is kept as %s — nothing was deleted.", res.Displaced)
+	}
+	switch {
+	case res.Path == "":
+		e.logf(logID, "INFO", "Wrote no compose file under the stack's name in %s; the rebuilt one is beside it as %s.", res.Dir, reconstructionComposeName)
+	case res.Unchanged:
+		e.logf(logID, "INFO", "The compose file at %s already matches — left exactly as it is", res.Path)
+	case layout.PrimaryOriginal:
+		e.logf(logID, "INFO", "Wrote your own compose file from the backup to %s — the file `docker compose` runs.%s", res.Path, kept)
+	default:
+		e.logf(logID, "INFO", "Wrote the reconstructed compose file to %s.%s", res.Path, kept)
+		e.logf(logID, "WARN", "This backup holds no original compose file, so that one is rebuilt from the containers' AS-RESTORED configuration — env_file, profiles and comments are not in it. Read it before you rely on it.")
+	}
+	if layout.PrimaryOriginal && slices.Contains(res.Beside, path.Join(res.Dir, reconstructionComposeName)) {
+		e.logf(logID, "INFO", "DockBack's reconstruction from the restored containers is beside it as %s, for comparison. Compose ignores it unless you pass it with -f.",
+			path.Join(res.Dir, reconstructionComposeName))
+	}
+	captured := slices.DeleteFunc(slices.Clone(res.Beside), func(p string) bool { return path.Base(p) == reconstructionComposeName })
+	if !layout.PrimaryOriginal && len(captured) > 0 {
+		e.logf(logID, "INFO", "Also restored the compose file(s) captured from the source host as %s. Compose ignores them; compare them with the reconstruction before adopting either.",
+			strings.Join(captured, ", "))
+	}
+	switch {
+	case res.EnvPath != "" && movedSecrets > 0:
+		e.logf(logID, "INFO", "Wrote the .env to %s (mode 600), with %d secret value(s) the reconstruction references as ${VAR}. Keep the .env out of version control.", res.EnvPath, movedSecrets)
+	case res.EnvPath != "":
+		e.logf(logID, "INFO", "Wrote the .env to %s (mode 600). Keep the .env out of version control.", res.EnvPath)
+	}
+	if res.EnvDisplaced != "" {
+		e.logf(logID, "INFO", "The .env that was there is kept as %s — nothing was deleted.", res.EnvDisplaced)
+	}
+	if len(res.BesideDisplaced) > 0 {
+		e.logf(logID, "INFO", "Files that were in the way are kept as %s — nothing was deleted.", strings.Join(res.BesideDisplaced, ", "))
+	}
+}
+
+// warnDuplicateEnvKeys names every variable the .env about to be written
+// defines more than once, and which definition Compose will use. Line numbers,
+// never values: the values are secrets.
+func (e *Engine) warnDuplicateEnvKeys(logID string, env []byte) {
+	for _, duplicate := range duplicateEnvKeys(env) {
+		lines := make([]string, len(duplicate.Lines))
+		for i, n := range duplicate.Lines {
+			lines[i] = strconv.Itoa(n)
+		}
+		last := duplicate.Lines[len(duplicate.Lines)-1]
+		e.logf(logID, "WARN", "The .env defines %s %d times (lines %s). Compose uses only the last one, line %d — delete the others so nobody edits a copy that has no effect.",
+			duplicate.Key, len(duplicate.Lines), strings.Join(lines, ", "), last)
+	}
 }
 
 // reconstructHostStack rebuilds the on-host compose project directory and writes
@@ -2180,43 +2425,30 @@ func (e *Engine) reconstructHostStack(ctx context.Context, cli *client.Client, b
 		opts.RemapFromPath, opts.RemapToPath); len(orig) > 0 {
 		envFile = MergeEnvFiles(orig, envFile)
 	}
+	e.warnDuplicateEnvKeys(b.ID, envFile)
 
 	e.logf(b.ID, "INFO", "Reconstructing on-host stack layout at %s", stackDir)
 	// F230: who the folder belongs to when DockBack just created its parent.
 	uid, gid, pinned := e.RestoreOwnership(opts.NodeID, b.TargetName)
-	// F57: the operator's OWN compose file(s), restored beside the reconstruction
-	// under a non-canonical name. The reconstruction keeps the name
-	// `docker compose` reads because it describes the containers as they now are;
-	// the original describes the SOURCE machine and may reference env_file targets
-	// or paths that do not exist here.
 	originals := e.originalsForHost(ctx, b, opts.Source, b.ID,
 		opts.RemapFromIP, opts.RemapToIP, opts.RemapFromDomain, opts.RemapToDomain,
 		opts.RemapFromPath, opts.RemapToPath)
-	res, rerr := dockercli.ReconstructStackDirWithEnv(ctx, cli, stackDir, composeFile, composeBytes, envFile,
-		HostFileOwner(uid, gid, pinned, dockercli.ContainerEnv(inspectBytes)), originals...)
+	layout := planStackFolder(composeFile, composeBytes, originals)
+	checker := e.openComposeChecker(ctx, cli, b.ID)
+	if checker != nil {
+		defer checker.Close()
+	}
+	project := firstNonEmpty(b.Stack, composeProjectName(name))
+	layout = e.guardReconstruction(ctx, checker, layout, envFile, project, b.ID)
+	res, rerr := dockercli.ReconstructStackDirWithEnv(ctx, cli, stackDir, composeFile, layout.Primary, envFile,
+		HostFileOwner(uid, gid, pinned, dockercli.ContainerEnv(inspectBytes)), layout.Beside...)
 	if rerr != nil {
 		e.logf(b.ID, "WARN", "Host stack reconstruction skipped: %v", rerr)
 		return
 	}
-	switch {
-	case res.Unchanged:
-		e.logf(b.ID, "INFO", "The compose file at %s already matches this container — left exactly as it is", res.Path)
-	case res.Displaced != "":
-		// F176: the reconstruction takes the canonical name, so `docker compose`
-		// in that folder acts on what is actually running. The previous file is
-		// renamed, never deleted.
-		e.logf(b.ID, "INFO", "Wrote the reconstructed compose file to %s. The file that was there is kept as %s — nothing was deleted.", res.Path, res.Displaced)
-		e.logf(b.ID, "WARN", "That reconstruction is built from the container's AS-RESTORED configuration — env_file, profiles and comments from your own compose are not carried over. Compare it against %s before you rely on it.", res.Displaced)
-	default:
-		e.logf(b.ID, "INFO", "Wrote reconstructed compose file to %s", res.Path)
-	}
-	if res.EnvPath != "" {
-		e.logf(b.ID, "INFO", "Wrote %d secret value(s) to %s (mode 600) — the compose file references them as ${VAR} and carries no secrets itself. Keep the .env out of version control.", movedSecrets, res.EnvPath)
-	}
-	if res.EnvDisplaced != "" {
-		e.logf(b.ID, "INFO", "The .env that was there is kept as %s — nothing was deleted.", res.EnvDisplaced)
-	}
-	e.logRestoredOriginals(b.ID, res.Originals)
+	e.logStackFolder(b.ID, res, layout, movedSecrets)
+	e.restoreProjectFolder(ctx, cli, b, man, opts.Source, b.ID, res.Dir)
+	e.reportComposeCheck(ctx, cli, checker, res, layout, project, b.Stack != "", b.ID)
 	if res.Owner != "" && res.Owner != "0:0" {
 		e.logf(b.ID, "INFO", "Reconstructed folder ownership set to %s (matched to its parent directory)", res.Owner)
 	} else {
@@ -2363,6 +2595,24 @@ func (e *Engine) resolveRestoreChain(b *store.Backup, man *Manifest) ([]*store.B
 		out = append(out, bk)
 	}
 	return out, nil
+}
+
+// proveBeforeClearing checks the backup end to end — the stored ciphertext's
+// hash, every encrypted block, the archive walk, and a sane header on each
+// database dump — BEFORE a restore clears a database's data directory.
+//
+// Clearing first and finding out afterwards that the replacement could not be
+// used is how a real recovery lost a database that had survived the incident:
+// the directory was emptied, the restore then stopped, and the dump was never
+// imported. Verifying first costs one extra read of the archive.
+func (e *Engine) proveBeforeClearing(ctx context.Context, b *store.Backup, man *Manifest, opts RestoreOptions, dataDir string) error {
+	if rep := e.Verify(ctx, b, man, opts.Source); !rep.OK {
+		return fmt.Errorf("this backup failed its pre-restore check, so %s was NOT cleared: %s", dataDir, rep.Summary())
+	}
+	if !opts.Snapshot && !opts.rollback {
+		e.logf(b.ID, "WARN", "No safety snapshot was taken for this restore — once %s is cleared, DockBack holds no copy of its current contents to bring back if the import fails", dataDir)
+	}
+	return nil
 }
 
 // stopBeforeOverwrite stops the container whose data is about to be replaced.
@@ -3093,6 +3343,11 @@ func (e *Engine) restoreDatabaseFromDump(ctx context.Context, cli *client.Client
 		}
 	}
 
+	if dataDir != "" {
+		if perr := e.proveBeforeClearing(ctx, b, man, opts, dataDir); perr != nil {
+			return perr
+		}
+	}
 	e.logf(b.ID, "INFO", "Stopping database for a clean restore")
 	if serr := stopBeforeOverwrite(ctx, cli, opts.TargetID, b.TargetName); serr != nil {
 		return serr
@@ -3150,7 +3405,83 @@ func (e *Engine) restoreDatabaseFromDump(ctx context.Context, cli *client.Client
 		}
 	}
 	e.logf(b.ID, "INFO", "Database restored from consistent dump — %s is running with healthy data", eng)
+	if opts.Volumes {
+		e.restoreDatabaseSideMounts(ctx, cli, b, man, opts, dataDir)
+	}
 	return nil
+}
+
+// restoreDatabaseSideMounts puts back a database container's OTHER mounts, its
+// init scripts and configuration folders, which a restore from the dump used to
+// leave out entirely (step 24). After the import, so init scripts do not run on
+// the fresh cluster and collide with the dump. The data directory is filtered
+// out of the stream as well as out of the capture: an old backup that still
+// carries raw data files must never land them on the imported database.
+// Best-effort: the database itself is already restored.
+func (e *Engine) restoreDatabaseSideMounts(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, dataDir string) {
+	if dataDir == "" || man.Incremental || !hasMountsBesides(man, dataDir) {
+		return
+	}
+	dataPrefix := strings.Trim(dataDir, "/")
+	var kept int
+	err := e.streamArchive(ctx, b, opts.Source, func(tr *tar.Reader, hdr *tar.Header) (bool, error) {
+		if hdr.Name != "volumes.tar" {
+			return true, nil
+		}
+		pr, pw := io.Pipe()
+		go func() {
+			n, ferr := copyTarWithout(tr, pw, dataPrefix)
+			kept = n
+			pw.CloseWithError(ferr)
+		}()
+		uerr := dockercli.UntarToVolumes(ctx, cli, opts.TargetID, pr)
+		_ = pr.CloseWithError(uerr)
+		return false, uerr
+	})
+	if err != nil {
+		e.logf(b.ID, "WARN", "The database is restored, but its other mounts (init scripts, configuration) were not: %v", err)
+		return
+	}
+	if kept > 0 {
+		e.logf(b.ID, "INFO", "Restored the database container's other mounts (init scripts, configuration): %d entries", kept)
+	}
+}
+
+// hasMountsBesides reports whether the backup recorded a mount other than the
+// database's data directory.
+func hasMountsBesides(man *Manifest, dataDir string) bool {
+	return slices.ContainsFunc(man.Volumes, func(v VolumeRef) bool {
+		return v.Destination != "" && v.Destination != dataDir
+	})
+}
+
+// copyTarWithout copies a tar stream, leaving out every entry at or under
+// prefix (an archive path, no leading slash). Returns how many entries it kept.
+func copyTarWithout(src io.Reader, dst io.Writer, prefix string) (int, error) {
+	in := tar.NewReader(src)
+	out := tar.NewWriter(dst)
+	kept := 0
+	for {
+		hdr, err := in.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return kept, err
+		}
+		name := strings.TrimPrefix(strings.TrimPrefix(hdr.Name, "./"), "/")
+		if name == prefix || strings.HasPrefix(name, prefix+"/") {
+			continue
+		}
+		if err := out.WriteHeader(hdr); err != nil {
+			return kept, err
+		}
+		if _, err := io.Copy(out, in); err != nil {
+			return kept, err
+		}
+		kept++
+	}
+	return kept, out.Close()
 }
 
 // restoreDatabaseSubset restores a PER-DATABASE subset dump (F8) into the RUNNING
@@ -3229,6 +3560,9 @@ func (e *Engine) restoreRedisFromDump(ctx context.Context, cli *client.Client, b
 	dataDir := dockercli.DBDataDir("redis") // /data
 	e.logf(b.ID, "INFO", "Redis container — restoring from a consistent RDB snapshot (not raw files)")
 
+	if perr := e.proveBeforeClearing(ctx, b, man, opts, dataDir); perr != nil {
+		return perr
+	}
 	e.logf(b.ID, "INFO", "Stopping Redis for a clean restore")
 	if serr := stopBeforeOverwrite(ctx, cli, opts.TargetID, b.TargetName); serr != nil {
 		return serr
@@ -3606,25 +3940,139 @@ func (e *Engine) restoreBindFiles(ctx context.Context, cli *client.Client, b *st
 		return
 	}
 	written := 0
-	for _, v := range man.Volumes {
-		if v.Kind != dockercli.MountKindFile || v.Archive == "" || v.Source == "" {
-			continue
+	for _, v := range fileBinds(man) {
+		if e.writeBindFile(ctx, cli, b, v, opts, b.ID) {
+			written++
 		}
-		data, err := e.extractEntry(ctx, b, opts.Source, v.Archive)
-		if err != nil {
-			e.logf(b.ID, "WARN", "This backup records the file mounted at %s but the archive does not hold it (%v) — the application will start without it", v.Destination, err)
-			continue
-		}
-		host := dockercli.RemapHostPath(v.Source, opts.RemapFromPath, opts.RemapToPath)
-		if werr := dockercli.WriteHostFile(ctx, cli, host, data, v.Owner, v.Mode); werr != nil {
-			e.logf(b.ID, "WARN", "Could not write the file mounted at %s to %s (%v) — put it there yourself before starting the container, or it will come up without it", v.Destination, host, werr)
-			continue
-		}
-		written++
-		e.logf(b.ID, "INFO", "Wrote file bind %s (%s, %s) — mounted at %s", host, recordedOwnerLabel(v.Owner), recordedModeLabel(v.Mode), v.Destination)
 	}
 	if written > 0 {
-		e.logf(b.ID, "INFO", "Wrote %d file bind(s) to this host before recreating the container", written)
+		e.logf(b.ID, "INFO", "Wrote %d file bind(s) to this host before starting the container", written)
+	}
+}
+
+// fileBinds are the recorded binds whose root is a file the archive carries.
+func fileBinds(man *Manifest) []VolumeRef {
+	var out []VolumeRef
+	for _, v := range man.Volumes {
+		if v.Kind == dockercli.MountKindFile && v.Archive != "" && v.Source != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// writeBindFile writes one file bind to the host, with its recorded owner and
+// mode, logging under logID. Reports whether it was written.
+func (e *Engine) writeBindFile(ctx context.Context, cli *client.Client, b *store.Backup, v VolumeRef, opts RestoreOptions, logID string) bool {
+	data, err := e.extractEntry(ctx, b, opts.Source, v.Archive)
+	if err != nil {
+		e.logf(logID, "WARN", "This backup records the file mounted at %s but the archive does not hold it (%v) — the application will start without it", v.Destination, err)
+		return false
+	}
+	host := dockercli.RemapHostPath(v.Source, opts.RemapFromPath, opts.RemapToPath)
+	if werr := dockercli.WriteHostFile(ctx, cli, host, data, v.Owner, v.Mode); werr != nil {
+		e.logf(logID, "WARN", "Could not write the file mounted at %s to %s (%v) — put it there yourself before starting the container, or it will come up without it", v.Destination, host, werr)
+		return false
+	}
+	e.logf(logID, "INFO", "Wrote file bind %s (%s, %s) — mounted at %s", host, recordedOwnerLabel(v.Owner), recordedModeLabel(v.Mode), v.Destination)
+	return true
+}
+
+// restoreFilesOnly puts back the files a stack keeps on the host, and nothing
+// else (step 23): the compose file and .env, the project's other files, and
+// any single-file bind that is missing. No container is stopped, recreated or
+// changed, and nothing that exists is overwritten. That was the 2026-10-04 recovery
+// night: every container kept running and only the stack folders were gone,
+// yet the only way to get the files back was a full restore.
+func (e *Engine) restoreFilesOnly(ctx context.Context, b *store.Backup, man *Manifest, opts RestoreOptions) error {
+	cli, err := e.Reg.Get(opts.NodeID)
+	if err != nil {
+		return err
+	}
+	logID := firstNonEmpty(opts.SnapshotLogID, b.ID)
+	e.logf(logID, "INFO", "Files-only restore of %s: putting back the files it keeps on the host. No container is stopped or changed, and nothing that exists is overwritten.", b.TargetName)
+	if !opts.stackMember {
+		inspectBytes, ierr := e.liveOrArchivedInspect(ctx, cli, b, man, opts)
+		if ierr != nil {
+			return fmt.Errorf("reading the container's configuration: %w", ierr)
+		}
+		opts.ReconstructHost = true
+		e.reconstructHostStack(ctx, cli, b, man, opts, inspectBytes)
+	}
+	e.restoreMissingBindFiles(ctx, cli, b, man, opts, logID)
+	e.reportMissingDataFolders(ctx, cli, man, opts, logID)
+	e.logf(logID, "INFO", "Files-only restore of %s finished", b.TargetName)
+	return nil
+}
+
+// liveOrArchivedInspect is the running container's configuration when it is
+// there, so the reconstruction describes what runs now, else the backup's.
+func (e *Engine) liveOrArchivedInspect(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions) ([]byte, error) {
+	name := firstNonEmpty(man.TargetName, b.TargetName)
+	if id, ok := dockercli.FindContainerByName(ctx, cli, name); ok {
+		if _, raw, err := cli.ContainerInspectWithRaw(ctx, id, false); err == nil {
+			return raw, nil
+		}
+	}
+	return e.extractEntry(ctx, b, opts.Source, "config/inspect.json")
+}
+
+// restoreMissingBindFiles writes back the single-file binds that are missing,
+// or that Docker replaced with an empty directory, and keeps every one that is
+// there: a key that exists may be newer than the backup.
+func (e *Engine) restoreMissingBindFiles(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, logID string) {
+	binds := fileBinds(man)
+	if len(binds) == 0 {
+		return
+	}
+	hosts := make([]string, len(binds))
+	for i, v := range binds {
+		hosts[i] = dockercli.RemapHostPath(v.Source, opts.RemapFromPath, opts.RemapToPath)
+	}
+	kinds, err := dockercli.ProbeHostPaths(ctx, cli, hosts)
+	if err != nil {
+		e.logf(logID, "WARN", "Could not check which file binds are missing (%v), so none were written", err)
+		return
+	}
+	for i, v := range binds {
+		if kinds[hosts[i]] == dockercli.HostPathFile {
+			e.logf(logID, "INFO", "File bind %s is there — kept as it is", hosts[i])
+			continue
+		}
+		e.writeBindFile(ctx, cli, b, v, opts, logID)
+	}
+}
+
+// reportMissingDataFolders names the bind-mounted folders that are gone from
+// the host. Files-only brings back no data, and a running container still holds
+// its deleted folder open, so this is the moment to say a full restore is
+// needed before that container restarts onto an empty folder.
+func (e *Engine) reportMissingDataFolders(ctx context.Context, cli *client.Client, man *Manifest, opts RestoreOptions, logID string) {
+	var folders []VolumeRef
+	for _, v := range man.Volumes {
+		if v.Type == "bind" && v.Kind != dockercli.MountKindFile && v.Source != "" {
+			folders = append(folders, v)
+		}
+	}
+	if len(folders) == 0 {
+		return
+	}
+	hosts := make([]string, len(folders))
+	for i, v := range folders {
+		hosts[i] = dockercli.RemapHostPath(v.Source, opts.RemapFromPath, opts.RemapToPath)
+	}
+	kinds, err := dockercli.ProbeHostPaths(ctx, cli, hosts)
+	if err != nil {
+		return
+	}
+	var missing []string
+	for i, v := range folders {
+		if kinds[hosts[i]] == dockercli.HostPathMissing {
+			missing = append(missing, fmt.Sprintf("%s (mounted at %s)", hosts[i], v.Destination))
+		}
+	}
+	if len(missing) > 0 {
+		e.logf(logID, "WARN", "These data folders are gone from the host: %s. A files-only restore brings back no data. The running container still holds them open, so run a full restore before it restarts onto an empty folder.", strings.Join(missing, ", "))
 	}
 }
 

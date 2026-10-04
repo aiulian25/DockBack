@@ -39,22 +39,23 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   by every server in it. Removing a cluster removes a grouping only: servers,
   containers and backups are never deleted.
 - **Auto-discovery** — lists containers and reconstructs Compose stacks via labels.
-- **The Compose file it writes back describes the container you actually had** —
-  a stack's real `docker-compose.yml` lives on the host, out of reach behind the
-  socket-proxy, so DockBack reconstructs one from what Docker reports. That
-  reconstruction carries the parts that quietly decide whether the stack comes
-  back up: the **`hostname:`** other services resolve each other by — a lost one
-  is a crash loop, not a cosmetic diff — **per-network aliases and static IPs**
-  written in the form that can actually hold them, `network_mode`, the retry
-  count on an `on-failure:5`, and the limits and hardening that were really set
-  (memory and CPU, `security_opt`, `cap_add`/`cap_drop`, `read_only`, `devices`,
+- **Your own Compose file comes back as the real file** — every backup carries
+  the stack's own compose file(s), its `.env` and the rest of its project folder
+  (scripts, READMEs; bind-mounted data and caches left out, plus anything listed
+  in a `.dockbackignore`), and a restore writes them back as the files
+  `docker compose` runs. DockBack's own reconstruction, built from what Docker
+  reports, goes beside them as `docker-compose.dockback.yml`: it joins shared
+  networks instead of re-declaring them, declares named volumes, writes every `$`
+  literally, and carries the parts that quietly decide whether a stack comes back
+  up — the **`hostname:`** other services resolve each other by, **per-network
+  aliases and static IPs**, `network_mode`, the retry count on an `on-failure:5`,
+  and the limits and hardening that were really set (memory, CPU quota, GPUs,
+  `pids_limit`, `security_opt`, `cap_add`/`cap_drop`, `read_only`, `devices`,
   `tmpfs`, `ulimits`, `sysctls`, `dns`, `extra_hosts`, `shm_size`, `init`,
-  `stop_grace_period`). Values Docker merely derived on its own are left out
-  instead of being written down as though you had chosen them, and environment is
-  **diffed against the image** so the file lists your variables rather than the
-  hundred baked into the base image. App-consistent snapshots record their
-  network topology too, so the quieter capture path no longer produces the
-  thinner file.
+  `stop_grace_period`), with environment **diffed against the image**. Every file
+  a restore writes is then **checked with Docker Compose itself**: valid or not,
+  what it warns about, and whether `docker compose up -d` would change anything.
+  A reconstruction Compose rejects never takes the compose file's name.
 - **Machine page** — per node, the actual hardware (vendor, model, BIOS date, CPU,
   GPU, disks, NICs) beside its live host utilisation: CPU, memory, disk and
   network throughput, temperatures. Read by a short-lived **unprivileged,
@@ -102,6 +103,19 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   on the whole stack instead of on its first container, and calls a partial
   failure a failure — the console is told the outcome by the server now, rather
   than inferring it from the wording of a log line.
+  **Files only** puts back a deleted stack folder — compose file, `.env`, project
+  files and missing secret files — while every container keeps running, and names
+  the data folders only a full restore can bring back. An in-place restore writes
+  single-file binds and missing folders back with their recorded owner and mode,
+  writes into `:ro` mounts without making them writable, proves a database's
+  backup before clearing it, and if it fails rolls back to its safety snapshot or
+  starts the container again. A stack restore follows `depends_on`, keeps going
+  past a failed service, and reports each one. A recreate runs the **exact image
+  the backup ran**, never a newer tag that would migrate old data forward, unless
+  you allow it. Restoring onto another machine stops for a device or shared
+  network the target lacks, checks the image there (CPU architecture included),
+  and ends with a checklist of what outside Docker may still point at the old
+  host. A whole stack downloads as **one zip**.
 - **3-2-1-1-0 ready** — local + multiple offsite destinations (SMB/Synology,
   Nextcloud/WebDAV, S3/Backblaze B2, and any **SSH box via SFTP** with pinned
   host keys), with **S3/B2 Object-Lock (WORM)** immutable copies, a one-click
@@ -114,6 +128,12 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   targets that aren't being actively backed up. The sweep never deletes a **full
   backup an incremental still builds on** — keeping a chain that restores, rather
   than a count of files that happens to look right.
+  **Protected means backed up recently**: a container counts only while its newest
+  backup is younger than twice its schedule's interval, with stale and never
+  backed up listed apart, notified, and named in the daily digest — as is a new
+  stack that no schedule covers. A fresh install starts with a weekly backup of
+  its machine, scrubs, drills and pruning retention; an existing one is never
+  changed.
 - **App-native exports** — for supported apps (Paperless, Gitea/Forgejo) DockBack
   can capture the application's own first-party dump for a portable,
   version-independent restore — recognized automatically, no setup.
@@ -126,7 +146,9 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   drill gives back any image it had to pull — by ID, so nothing is left untagged
   and unreclaimable — and while a large transfer is running the dashboard says
   **"stats paused"** for that node instead of polling a saturated socket and
-  reporting a working machine as down.
+  reporting a working machine as down. **Freeze evidence** downloads how every container on
+  a node is put together — inspect records, environment names only — in one file,
+  before anything is touched after a disaster.
 - **It tells you what's wrong with the stack, not just that the backup worked** —
   every capture audits the container it is copying and reports what a restore
   would faithfully reproduce: a database with **no healthcheck** (so everything
@@ -150,6 +172,11 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   banner** warns when a container changed since its last backup.
 - **Proactive alerting** — severity-routed notifications (Gotify, email, webhook)
   and an outbound heartbeat / dead-man's-switch so *silence* can't hide a failure.
+- **It backs itself up** — DockBack's own catalog, nodes and settings are backed
+  up weekly by default, again after any configuration change, and pushed off the
+  machine when a destination is set. It warns when that backup is stale or fails,
+  and when every copy of every backup sits on one machine. Only one DockBack runs
+  against a data directory at a time; a second start exits instead of interfering.
 - **Hardened, single-admin web UI** — argon2id auth with optional TOTP 2FA,
   absolute + idle **auto-logout**, escalating login lockout, CSRF, **step-up
   re-authentication ("sudo mode")** for key-material actions, expiring API

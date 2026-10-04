@@ -26,8 +26,11 @@ import (
 const drillTickInterval = 1 * time.Hour // heavier than a scrub, so a slower cadence
 
 // drillIntervalDays is the configured drill cadence (0 = disabled).
+// drillIntervalKey holds how many days apart restore drills run; 0 is off.
+const drillIntervalKey = "drill.interval_days"
+
 func (s *Server) drillIntervalDays() int {
-	v, _ := s.store.GetSetting("drill.interval_days", "0")
+	v, _ := s.store.GetSetting(drillIntervalKey, "0")
 	n, _ := strconv.Atoi(v)
 	if n < 0 {
 		n = 0

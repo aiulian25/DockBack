@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -923,13 +924,17 @@ func OverlaySQLiteRestore(ctx context.Context, c *client.Client, targetID string
 		`printf 'DBCHK\t%s\t%s\t%s\t%s\t%s\n' "$s" "$ic" "$tb" "$rw" "$sha"; ` +
 		sqliteTableRowsScript + `done`)
 
+	hostConfig, err := restoreHostConfig(ctx, c, targetID)
+	if err != nil {
+		return nil, err
+	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{
 			Image: sidecarRef(), Cmd: []string{"sh", "-c", rm.String()},
 			OpenStdin: true, StdinOnce: true, AttachStdin: true, AttachStdout: true, AttachStderr: true,
 			Labels: sidecarLabels(),
 		},
-		&container.HostConfig{VolumesFrom: []string{targetID}}, nil, nil, "")
+		hostConfig, nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("sqlite overlay sidecar create: %w", err)
 	}
@@ -1233,10 +1238,15 @@ func tarFailureDetail(stderr string) string {
 }
 
 // UntarToVolumes extracts a tar stream back into the target container's volumes
-// via a temporary Alpine sidecar attached with --volumes-from target (rw). Used
-// by restore (PLAN §4.8). The sidecar is always removed.
+// via a temporary Alpine sidecar given the target's own mounts, all writable
+// (restoreHostConfig) — so a file the container mounts read-only is restored
+// too. Used by restore (PLAN §4.8). The sidecar is always removed.
 func UntarToVolumes(ctx context.Context, c *client.Client, targetID string, tarStream io.Reader) error {
 	if err := ensureSidecar(ctx, c); err != nil {
+		return err
+	}
+	hostConfig, err := restoreHostConfig(ctx, c, targetID)
+	if err != nil {
 		return err
 	}
 	created, err := c.ContainerCreate(ctx,
@@ -1251,7 +1261,7 @@ func UntarToVolumes(ctx context.Context, c *client.Client, targetID string, tarS
 			AttachStdin: true, AttachStdout: true, AttachStderr: true,
 			Labels: sidecarLabels(),
 		},
-		&container.HostConfig{VolumesFrom: []string{targetID}},
+		hostConfig,
 		nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("restore sidecar create: %w", err)
@@ -1396,13 +1406,48 @@ func ImagePullable(ctx context.Context, c *client.Client, refs ...string) (bool,
 		if r == "" {
 			continue
 		}
-		if _, err := c.DistributionInspect(ctx, r, ""); err == nil {
-			return true, "Image is available from its registry (" + r + ") and will be pulled on restore."
-		} else {
+		dist, err := c.DistributionInspect(ctx, r, "")
+		if err != nil {
 			lastErr = err.Error()
+			continue
 		}
+		// Step 27: an image with no build for this machine fails late, or pulls
+		// the wrong one. Checked against the node it will run on.
+		if info, ierr := c.Info(ctx); ierr == nil {
+			var offered []string
+			for _, p := range dist.Platforms {
+				offered = append(offered, p.Architecture)
+			}
+			if arch := dockerArch(info.Architecture); !platformOffered(offered, arch) {
+				return false, fmt.Sprintf("Image %s has no build for this machine's architecture (%s); it offers %s.", r, arch, strings.Join(offered, ", "))
+			}
+		}
+		return true, "Image is available from its registry (" + r + ") and will be pulled on restore."
 	}
 	return false, imageUnavailableDetail(tried, lastErr)
+}
+
+// dockerArch names a machine architecture the way image platforms do: the
+// daemon reports `uname -m` (x86_64, aarch64), registries say amd64, arm64. Pure.
+func dockerArch(machine string) string {
+	switch machine {
+	case "x86_64":
+		return "amd64"
+	case "aarch64":
+		return "arm64"
+	case "armv7l", "armv6l":
+		return "arm"
+	case "i386", "i686":
+		return "386"
+	}
+	return machine
+}
+
+// platformOffered reports whether an image offers a build for arch. A registry
+// that lists no platforms (a single-platform manifest) is not taken as a
+// refusal: there is nothing to compare. Pure.
+func platformOffered(offered []string, arch string) bool {
+	return len(offered) == 0 || slices.Contains(offered, arch)
 }
 
 // imageUnavailableDetail builds the human explanation when no reference is present

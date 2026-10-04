@@ -266,13 +266,17 @@ func DeleteVolumePaths(ctx context.Context, c *client.Client, targetID string, r
 	if err := ensureSidecar(ctx, c); err != nil {
 		return err
 	}
+	hostConfig, err := restoreHostConfig(ctx, c, targetID)
+	if err != nil {
+		return err
+	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{
 			Image: sidecarRef(), Cmd: []string{"/bin/sh", "-c", "cd / && xargs -0 rm -f"},
 			OpenStdin: true, StdinOnce: true, AttachStdin: true, AttachStdout: true, AttachStderr: true,
 			Labels: sidecarLabels(),
 		},
-		&container.HostConfig{VolumesFrom: []string{targetID}, AutoRemove: false},
+		hostConfig,
 		nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("delete sidecar create: %w", err)

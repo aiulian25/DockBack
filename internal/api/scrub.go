@@ -25,8 +25,11 @@ const (
 )
 
 // scrubIntervalDays is the configured re-verify cadence (0 = scrub disabled).
+// scrubIntervalKey holds how many days apart scrubs run; 0 is off.
+const scrubIntervalKey = "scrub.interval_days"
+
 func (s *Server) scrubIntervalDays() int {
-	v, _ := s.store.GetSetting("scrub.interval_days", "0")
+	v, _ := s.store.GetSetting(scrubIntervalKey, "0")
 	n, _ := strconv.Atoi(v)
 	if n < 0 {
 		n = 0

@@ -16,10 +16,13 @@ import StepUpPrompt from "./StepUpPrompt";
 import { Button } from "./ui";
 
 export default function ExportDownloadButton({
-  backupId, purpose, path, label, title, variant = "secondary", icon, iconOnly = false, className,
+  backupId = "", purpose = "download", request, path, label, title, variant = "secondary", icon, iconOnly = false, className,
 }: {
-  backupId: string;
-  purpose: "download" | "extract";
+  backupId?: string;
+  purpose?: "download" | "extract";
+  // Any other guarded export (a whole stack, a node's evidence): obtain the
+  // one-shot ticket with these credentials and return the URL to open.
+  request?: (password?: string, code?: string) => Promise<string>;
   path?: string; // required for purpose="extract"
   label?: string;
   title?: string;
@@ -35,13 +38,11 @@ export default function ExportDownloadButton({
   const go = async (password?: string, code?: string) => {
     setBusy(true); setErr("");
     try {
-      const { ticket } = await api.exportGrant(backupId, purpose, password, code);
+      const url = request ? await request(password, code) : await backupExportURL(backupId, purpose, path || "", password, code);
       setStepUp(null);
       // Navigate rather than fetch: the browser's own download manager handles a
       // multi-gigabyte archive without holding it in memory.
-      window.location.href = purpose === "extract"
-        ? api.backupExtractURL(backupId, path || "", ticket)
-        : api.downloadURL(backupId, ticket);
+      window.location.href = url;
     } catch (e) {
       if (e instanceof StepUpError) {
         // First click with no password is the EXPECTED path, not an error — only
@@ -85,4 +86,10 @@ export default function ExportDownloadButton({
       {err && <p className="mt-1 text-xs text-error">{err}</p>}
     </>
   );
+}
+
+// backupExportURL is the one-shot URL for a backup's archive, or one file of it.
+async function backupExportURL(backupId: string, purpose: "download" | "extract", path: string, password?: string, code?: string): Promise<string> {
+  const { ticket } = await api.exportGrant(backupId, purpose, password, code);
+  return purpose === "extract" ? api.backupExtractURL(backupId, path, ticket) : api.downloadURL(backupId, ticket);
 }

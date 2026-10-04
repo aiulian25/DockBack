@@ -68,21 +68,21 @@ func TestAsideName(t *testing.T) {
 		{"2-docker-compose.yml", "2-docker-compose.yml.original-from-backup"}, // archiveComposeName's prefixed duplicate
 	}
 	for _, tc := range ok {
-		if got := asideName(tc.in); got != tc.want {
-			t.Errorf("asideName(%q) = %q; want %q", tc.in, got, tc.want)
+		if got := AsideName(tc.in); got != tc.want {
+			t.Errorf("AsideName(%q) = %q; want %q", tc.in, got, tc.want)
 		}
 	}
 	// Anything outside the safe-component grammar is refused outright.
 	for _, bad := range []string{"", " ", ".", "..", "weird name.yml", "evil;rm -rf.yml", "../../etc/passwd", "a/b.yml", ".hidden"} {
-		if got := asideName(bad); got != "" {
-			t.Errorf("asideName(%q) = %q; want \"\" (refused)", bad, got)
+		if got := AsideName(bad); got != "" {
+			t.Errorf("AsideName(%q) = %q; want \"\" (refused)", bad, got)
 		}
 	}
 	// The suffix is never a name compose reads, so the aside file can never be
 	// picked up by a bare `docker compose up`.
 	for _, n := range standardComposeNames {
-		if asideName(n) == n {
-			t.Errorf("asideName(%q) must not return a canonical compose name", n)
+		if AsideName(n) == n {
+			t.Errorf("AsideName(%q) must not return a canonical compose name", n)
 		}
 	}
 }

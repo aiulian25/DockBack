@@ -23,22 +23,26 @@ import (
 
 // Event kinds (PLAN §4.10/§9.15).
 const (
-	KindBackupSuccess    = "backup.success"
-	KindBackupFailed     = "backup.failed"
-	KindVerifyFailed     = "verify.failed"
-	KindScrubFailed      = "scrub.failed"            // stored backup no longer verifies (bit-rot / dest gone bad)
-	KindNoOffsite        = "offsite.missing"         // a backup didn't reach one/more offsite destinations (3-2-1 broken)
-	KindDestFull         = "destination.full"        // a destination is >90% full
-	KindDestForecast     = "destination.forecast"    // a destination is trending to fill up soon
-	KindMissedSchedule   = "schedule.missed"         // a scheduled window was missed (app was down)
-	KindTargetMissing    = "schedule.target_missing" // a scheduled container target no longer exists
-	KindLowRPOPaused     = "critical.rpo_paused"     // low-RPO auto-backups paused after repeated verification failures
-	KindKeyUnescrowed    = "key.unescrowed"          // the master key isn't confirmed backed up, yet backups exist
-	KindBackupAnomaly    = "backup.anomaly"          // a backup's duration/size deviated sharply from the container's norm (F28)
-	KindContainerCrashed = "container.crashed"       // a watched container died with a non-zero exit code (F24)
-	KindContainerOOM     = "container.oom"           // a watched container was killed for running out of memory (F24)
-	KindHostKeyChanged   = "node.hostkey_changed"    // an SSH host key no longer matches its pin — possible reinstall or MITM (F67)
-	KindSidecarChanged   = "node.sidecar_changed"    // the volume sidecar image no longer matches its pin — possible supply-chain tamper (F88)
+	KindBackupSuccess      = "backup.success"
+	KindBackupFailed       = "backup.failed"
+	KindVerifyFailed       = "verify.failed"
+	KindScrubFailed        = "scrub.failed"            // stored backup no longer verifies (bit-rot / dest gone bad)
+	KindNoOffsite          = "offsite.missing"         // a backup didn't reach one/more offsite destinations (3-2-1 broken)
+	KindDestFull           = "destination.full"        // a destination is >90% full
+	KindDestForecast       = "destination.forecast"    // a destination is trending to fill up soon
+	KindMissedSchedule     = "schedule.missed"         // a scheduled window was missed (app was down)
+	KindTargetMissing      = "schedule.target_missing" // a scheduled container target no longer exists
+	KindLowRPOPaused       = "critical.rpo_paused"     // low-RPO auto-backups paused after repeated verification failures
+	KindKeyUnescrowed      = "key.unescrowed"          // the master key isn't confirmed backed up, yet backups exist
+	KindBackupAnomaly      = "backup.anomaly"          // a backup's duration/size deviated sharply from the container's norm (F28)
+	KindContainerCrashed   = "container.crashed"       // a watched container died with a non-zero exit code (F24)
+	KindContainerOOM       = "container.oom"           // a watched container was killed for running out of memory (F24)
+	KindHostKeyChanged     = "node.hostkey_changed"    // an SSH host key no longer matches its pin — possible reinstall or MITM (F67)
+	KindSidecarChanged     = "node.sidecar_changed"    // the volume sidecar image no longer matches its pin — possible supply-chain tamper (F88)
+	KindCoverageStale      = "coverage.stale"          // a container's newest backup is older than its schedule allows
+	KindProjectUnscheduled = "coverage.new_project"    // a new compose project appeared that no schedule covers
+	KindAppBackupStale     = "appbackup.stale"         // DockBack's own newest backup is too old, or there is none
+	KindAppBackupFailed    = "appbackup.failed"        // DockBack's own scheduled backup, or its push off the machine, failed
 
 	// Authentication-surface events (F198).
 	//

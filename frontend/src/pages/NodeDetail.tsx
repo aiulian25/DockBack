@@ -8,7 +8,8 @@ import {
   CloudUpload, MoreVertical, Wifi, WifiOff, TrendingUp, CheckCircle2, XCircle,
   History, Loader2, Copy, DatabaseBackup, Search,
 } from "lucide-react";
-import { Layers, RotateCcw, SlidersHorizontal, HardDrive, ShieldAlert, ShieldCheck, KeyRound } from "lucide-react";
+import { Layers, RotateCcw, SlidersHorizontal, HardDrive, ShieldAlert, ShieldCheck, KeyRound, FileJson } from "lucide-react";
+import ExportDownloadButton from "../components/ExportDownloadButton";
 import { followRun } from "../lib/logStream";
 import { api, Container, ContainerPage, Backup, StackInfo, Destination, CoverageContainer, NodePolicy, PolicyOverride, NodeDetail as NodeDetailT, OrphanVolume, NodeHealthResp, Node as NodeT, fmtBytes, fmtAgo } from "../api";
 import { Button, Card, Chip, Modal, Select } from "../components/ui";
@@ -63,11 +64,13 @@ export default function NodeDetail() {
   const [onlyUnprotected, setOnlyUnprotected] = useState(false); // "unprotected" filter chip (B2)
   const [unprot, setUnprot] = useState<CoverageContainer[]>([]);  // this node's unprotected running containers
   const [stoppedAtRisk, setStoppedAtRisk] = useState<CoverageContainer[]>([]); // stopped w/ data + no backup (F13)
+  const [stale, setStale] = useState<CoverageContainer[]>([]); // running, newest backup too old
   const loadCoverage = useCallback(() => {
     api.coverage().then((cov) => {
       const node = cov.nodes.find((x) => x.node_id === id);
       setUnprot(node?.unprotected || []);
       setStoppedAtRisk(node?.stopped_at_risk || []);
+      setStale(node?.stale || []);
     }).catch(() => {});
   }, [id]);
   // One-click protect (B5) from the unprotected banner: smart defaults + first backup.
@@ -517,6 +520,11 @@ export default function NodeDetail() {
               lands here too; without this the page would be unreachable from the
               node itself. */}
           <Button onClick={() => navigate(`/servers/${id}/machine`)} title="Hardware and live host utilisation"><Cpu size={16} /> Machine</Button>
+          {/* Step 28: before touching anything after a disaster, keep a record of
+              how every container here is put together. */}
+          <ExportDownloadButton icon={<FileJson size={16} />} label="Freeze evidence"
+            title="Download how every container here is put together — inspect records with environment names only, networks and volumes — as one file. Confirms your password first."
+            request={async (password, code) => api.evidenceURL(id, (await api.evidenceGrant(id, password, code)).ticket)} />
           <Button onClick={refresh}><RefreshCw size={16} /> Refresh</Button>
           <Button variant="primary" onClick={openServerBackup} disabled={busyAll}>
             <BackupCloudIcon size={16} active={busyAll} /> Full Server Backup
@@ -568,6 +576,7 @@ export default function NodeDetail() {
       <UnprotectedBanner
         nodeName={nodeName}
         unprotected={unprot}
+        stale={stale}
         stoppedAtRisk={stoppedAtRisk}
         onProtect={protectContainer}
         onProtectAll={protectAll}

@@ -22,9 +22,13 @@ export interface NodeSummary {
 export interface FleetStats { backup_success_rate: number; backups_30d: number; backups_verified: number; }
 // Backup coverage / "unprotected containers" (B2): running containers with no
 // successful backup and not covered by the schedule.
-export interface CoverageContainer { container_id: string; name: string; stack?: string; image?: string; }
-export interface CoverageNode { node_id: string; node_name: string; cluster: string; reachable: boolean; running: number; protected: number; last_backup_at: number; unprotected: CoverageContainer[]; stopped_at_risk: CoverageContainer[]; }
-export interface Coverage { unprotected_total: number; running_total: number; stopped_at_risk_total: number; nodes: CoverageNode[]; }
+export interface CoverageContainer { container_id: string; name: string; stack?: string; image?: string; last_backup_at?: number; scheduled?: boolean; }
+// unprotected: running, never backed up. stale: running, newest backup older
+// than twice its schedule's interval (8 days with no schedule).
+export interface CoverageNode { node_id: string; node_name: string; cluster: string; reachable: boolean; running: number; protected: number; last_backup_at: number; unprotected: CoverageContainer[]; stale: CoverageContainer[]; stopped_at_risk: CoverageContainer[]; }
+// off_machine_destinations: enabled destinations that leave this machine (a
+// "local" destination is a folder on it). Zero means every copy is here.
+export interface Coverage { off_machine_destinations: number; app_off_machine_destinations: number; unprotected_total: number; stale_total: number; running_total: number; stopped_at_risk_total: number; nodes: CoverageNode[]; }
 // One-click "Protect this container" (B5): what the smart-default flow decided.
 export interface ProtectResult {
   container: string; is_database: boolean; engine?: string; pause_mode: string;
@@ -479,6 +483,9 @@ export interface StackPlanEntry {
   // F94: what the TARGET host cannot honor for this service on a cross-host
   // restore. Advisory — the plan is a preview, never a block.
   portability?: string[];
+  // Step 27: devices the target verifiably lacks. These DO stop the restore
+  // until the operator confirms them.
+  missing_devices?: string[];
   // F174: a problem in the service's OWN configuration that would stop its
   // restore — a database whose environment cannot initialize an empty data
   // directory. Said here because by the time the restore hits it, the services
@@ -759,6 +766,20 @@ export interface TestClone {
 // intact. The caller shows the refusal and, if the user accepts the risk,
 // retries with confirm_unverified. Distinct from RestoreCompatError because the
 // two say different things and only one of them is about the archive itself.
+// Step 27: a cross-host restore stopped because the target lacks devices or
+// shared networks the containers need. The operator may know better; the
+// caller confirms and retries with the matching confirm_missing_* flags.
+export class RestoreNeedsConfirmError extends Error {
+  devices: string[];
+  networks: string[];
+  constructor(message: string, devices: string[], networks: string[]) {
+    super(message);
+    this.name = "RestoreNeedsConfirmError";
+    this.devices = devices;
+    this.networks = networks;
+  }
+}
+
 export class RestoreVerifyFailedError extends Error {
   verify_failed = true as const;
   constructor(message: string) {
@@ -831,7 +852,11 @@ function parseBody(text: string): ResponseBody | null {
  * which is precisely where a non-JSON error body comes from.
  */
 function httpError(res: Response, data: ResponseBody | null): Error {
-  return new Error(data?.error || res.statusText || `HTTP ${res.status}`);
+  const message = data?.error || res.statusText || `HTTP ${res.status}`;
+  const devices = Array.isArray(data?.missing_devices) ? (data.missing_devices as string[]) : [];
+  const networks = Array.isArray(data?.missing_networks) ? (data.missing_networks as string[]) : [];
+  if (res.status === 409 && (devices.length > 0 || networks.length > 0)) return new RestoreNeedsConfirmError(message, devices, networks);
+  return new Error(message);
 }
 
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -997,7 +1022,7 @@ export const api = {
   // `id` is the SOURCE node (where the stack's backups are cataloged). Pass
   // opts.target_node to restore onto a DIFFERENT node (cross-host DR); omit it for
   // an in-place restore.
-  restoreStack: (id: string, project: string, opts?: { recreate?: boolean; snapshot?: boolean; promote_restart_policy?: boolean; inject_healthchecks?: boolean; reconstruct_host?: boolean; host_base_dir?: string; target_node?: string; remap_ip?: boolean; remap_from_ip?: string; remap_to_ip?: string; remap_domain?: boolean; remap_from_domain?: string; remap_to_domain?: string; remap_path?: boolean; remap_from_path?: string; remap_to_path?: string; group?: string; new_site_address?: string; new_upstream_address?: string; private_key?: string; password?: string; code?: string; services?: string[]; source?: string }) => {
+  restoreStack: (id: string, project: string, opts?: { recreate?: boolean; snapshot?: boolean; promote_restart_policy?: boolean; inject_healthchecks?: boolean; reconstruct_host?: boolean; host_base_dir?: string; target_node?: string; remap_ip?: boolean; remap_from_ip?: string; remap_to_ip?: string; remap_domain?: boolean; remap_from_domain?: string; remap_to_domain?: string; remap_path?: boolean; remap_from_path?: string; remap_to_path?: string; group?: string; new_site_address?: string; new_upstream_address?: string; private_key?: string; password?: string; code?: string; services?: string[]; source?: string; confirm_missing?: boolean; confirm_missing_devices?: boolean; confirm_missing_networks?: boolean; allow_different_image?: boolean; files_only?: boolean }) => {
     const qs = new URLSearchParams();
     // F173: the two optional address changes, same as the single-service restore.
     if (opts?.new_site_address) qs.set("new_site_address", opts.new_site_address);
@@ -1006,7 +1031,9 @@ export const api = {
     // #8: opt-in — the default reproduces whatever the source had.
     if (opts?.promote_restart_policy) qs.set("promote_restart_policy", "true");
     if (opts?.inject_healthchecks) qs.set("inject_healthchecks", "true");
-    if (opts?.recreate && opts?.snapshot === false) qs.set("snapshot", "false");
+    // The server snapshots unless told not to, so an unticked box must say so
+    // whether or not this is a revert.
+    if (opts?.snapshot === false) qs.set("snapshot", "false");
     if (opts?.reconstruct_host) { qs.set("reconstruct_host", "true"); if (opts?.host_base_dir) qs.set("host_base_dir", opts.host_base_dir); }
     if (opts?.target_node && opts.target_node !== id) qs.set("target_node", opts.target_node);
     if (opts?.remap_ip) { qs.set("remap_ip", "true"); if (opts?.remap_from_ip) qs.set("remap_from_ip", opts.remap_from_ip); if (opts?.remap_to_ip) qs.set("remap_to_ip", opts.remap_to_ip); }
@@ -1020,6 +1047,15 @@ export const api = {
     for (const svc of opts?.services || []) qs.append("service", svc);
     // F214: which copy every member is read from. "" = auto.
     if (opts?.source) qs.set("source", opts.source);
+    // F216: the operator saw and accepted that members with no backup stay out.
+    if (opts?.confirm_missing) qs.set("confirm_missing", "true");
+    // Step 22: only when the operator chose to run a newer image if the backed-up one is gone.
+    if (opts?.allow_different_image) qs.set("allow_different_image", "true");
+    // Step 23: put back the stack's files only — no service stopped or changed.
+    if (opts?.files_only) qs.set("files_only", "true");
+    // Step 27: the operator saw which devices the target lacks and went ahead.
+    if (opts?.confirm_missing_devices) qs.set("confirm_missing_devices", "true");
+    if (opts?.confirm_missing_networks) qs.set("confirm_missing_networks", "true");
     const q = qs.toString();
     // F209: the offline private key goes in the BODY and never the query string —
     // a URL lands in proxy access logs, browser history and Referer headers, and
@@ -1197,7 +1233,7 @@ export const api = {
   // F100: which restores are in flight, so a page reloaded mid-restore can
   // re-attach to the run and offer Cancel again.
   runningRestores: () => req<{ running: RunningRestore[] }>("GET", "/api/restores"),
-  restore: async (id: string, body: { node_id: string; target_id: string; volumes: boolean; database: boolean; confirm: boolean; snapshot?: boolean; recreate?: boolean; promote_restart_policy?: boolean; inject_healthchecks?: boolean; source?: string; confirm_incompatible?: boolean; confirm_unverified?: boolean; test_clone?: boolean; as_name?: string; isolated?: boolean; reconstruct_host?: boolean; host_base_dir?: string; remap_ip?: boolean; remap_from_ip?: string; remap_to_ip?: string; remap_domain?: boolean; remap_from_domain?: string; remap_to_domain?: string; remap_path?: boolean; remap_from_path?: string; remap_to_path?: string; new_site_address?: string; new_upstream_address?: string; private_key?: string; password?: string; code?: string }): Promise<{ status: string }> => {
+  restore: async (id: string, body: { node_id: string; target_id: string; volumes: boolean; database: boolean; confirm: boolean; snapshot?: boolean; recreate?: boolean; promote_restart_policy?: boolean; inject_healthchecks?: boolean; source?: string; confirm_incompatible?: boolean; confirm_unverified?: boolean; confirm_missing_devices?: boolean; confirm_missing_networks?: boolean; allow_different_image?: boolean; files_only?: boolean; test_clone?: boolean; as_name?: string; isolated?: boolean; reconstruct_host?: boolean; host_base_dir?: string; remap_ip?: boolean; remap_from_ip?: string; remap_to_ip?: string; remap_domain?: boolean; remap_from_domain?: string; remap_to_domain?: string; remap_path?: boolean; remap_from_path?: string; remap_to_path?: string; new_site_address?: string; new_upstream_address?: string; private_key?: string; password?: string; code?: string }): Promise<{ status: string }> => {
     const res = await fetch(`/api/backups/${id}/restore`, {
       method: "POST", credentials: "same-origin",
       headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf() },
@@ -1236,6 +1272,15 @@ export const api = {
   downloadURL: (id: string, ticket: string) => `/api/backups/${id}/download?ticket=${encodeURIComponent(ticket)}`,
   exportGrant: (id: string, purpose: "download" | "extract", password?: string, code?: string) =>
     req<{ ticket: string; expires_in: number }>("POST", `/api/backups/${id}/export-grant`, { purpose, password, code }),
+  // Step 25: one download for a whole stack — every service's newest backup, decrypted, in one zip.
+  stackExportGrant: (node: string, project: string, password?: string, code?: string) =>
+    req<{ ticket: string; expires_in: number }>("POST", `/api/nodes/${encodeURIComponent(node)}/stacks/${encodeURIComponent(project)}/export-grant`, { password, code }),
+  stackDownloadURL: (node: string, project: string, ticket: string) =>
+    `/api/nodes/${encodeURIComponent(node)}/stacks/${encodeURIComponent(project)}/download?ticket=${encodeURIComponent(ticket)}`,
+  // Step 28: a node's frozen evidence — every container's inspect (environment names only), networks, volumes.
+  evidenceGrant: (node: string, password?: string, code?: string) =>
+    req<{ ticket: string; expires_in: number }>("POST", `/api/nodes/${encodeURIComponent(node)}/evidence-grant`, { password, code }),
+  evidenceURL: (node: string, ticket: string) => `/api/nodes/${encodeURIComponent(node)}/evidence?ticket=${encodeURIComponent(ticket)}`,
   appBackupExportGrant: (password?: string, code?: string) =>
     req<{ ticket: string; expires_in: number }>("POST", `/api/app-backup/export-grant`, { password, code }),
   // F21: browse a backup's files, and a per-file download URL.

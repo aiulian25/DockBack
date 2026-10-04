@@ -55,9 +55,12 @@ func WipeDir(ctx context.Context, c *client.Client, targetID, dir string) error 
 	if dir == "" {
 		return nil
 	}
-	cmd := fmt.Sprintf("rm -rf %q/* %q/.[!.]* 2>/dev/null || true", dir, dir)
+	// The removal itself tolerates globs that match nothing; the final test is
+	// what reports success — the directory must really be empty. It used to end
+	// in `|| true`, so a wipe that failed half-way looked like one that worked.
+	cmd := fmt.Sprintf(`rm -rf %[1]q/* %[1]q/.[!.]* %[1]q/..?* 2>/dev/null; [ -z "$(ls -A %[1]q 2>/dev/null)" ]`, dir)
 	if err := runSidecar(ctx, c, targetID, cmd, 5*time.Minute); err != nil {
-		return fmt.Errorf("wipe: %w", err)
+		return fmt.Errorf("wipe of %s did not leave it empty: %w", dir, err)
 	}
 	return nil
 }
@@ -274,9 +277,13 @@ func WriteFileToVolume(ctx context.Context, c *client.Client, targetID, destPath
 	if err := ensureSidecar(ctx, c); err != nil {
 		return err
 	}
+	hostConfig, err := restoreHostConfig(ctx, c, targetID)
+	if err != nil {
+		return err
+	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", "300"}, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID}},
+		hostConfig,
 		nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("write sidecar create: %w", err)

@@ -12,7 +12,7 @@ import {
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { baseDirProblem } from "../lib/absoluteBase";
 import { followRun, subscribeLines } from "../lib/logStream";
-import { api, StepUpError, AppPreconditions, ArchiveEntry, Backup, BackupPage, BackupDiffResp, CertRef, DrillStatus, Destination, FileSearchResp, Finding, Node, RestoreCompatError, RestoreReadiness, RestoreVerifyFailedError, RunningRestore, TestClone, fmtAgo, fmtBytes } from "../api";
+import { api, StepUpError, AppPreconditions, ArchiveEntry, Backup, BackupPage, BackupDiffResp, CertRef, DrillStatus, Destination, FileSearchResp, Finding, Node, RestoreCompatError, RestoreNeedsConfirmError, RestoreReadiness, RestoreVerifyFailedError, RunningRestore, TestClone, fmtAgo, fmtBytes } from "../api";
 import { isRestoreProgressLine } from "../lib/restoreLogFilter";
 import { Button, Card, Chip, Label, Select } from "../components/ui";
 import BackupCloudIcon from "../components/BackupCloudIcon";
@@ -710,7 +710,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
   // destructive confirm is deliberately not repeated there either.) Remembering
   // the answer is what makes the two consistent. Reset when the drawer moves to
   // another backup — an acknowledgement is about one archive, not a session.
-  const [acks, setAcks] = useState({ incompatible: false, unverified: false });
+  const [acks, setAcks] = useState({ incompatible: false, unverified: false, devices: false, networks: false });
   // F218: the verify leg of "Verify & restore" — its own state, because it is
   // not a restore yet and must not light up the restore progress panel.
   const [vrState, setVrState] = useState<"idle" | "verifying">("idle");
@@ -845,7 +845,9 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
   const [newUpstreamAddress, setNewUpstreamAddress] = useState("");
   const [snapshot, setSnapshot] = useState(true); // safety snapshot before overwrite (PLAN §3.7), on by default
   const [recreate, setRecreate] = useState(false); // "Revert update": recreate from this backup's image digest, rolling back a bad upgrade
+  const [allowDifferentImage, setAllowDifferentImage] = useState(false); // step 22: run the tag's current image only when the recorded one is gone
   const [asCopy, setAsCopy] = useState(false); // "Restore as a copy": isolated clone under a new name (F10)
+  const [filesOnly, setFilesOnly] = useState(false); // step 23: put back the stack's files only, change no container
   const [asName, setAsName] = useState(""); // the clone's container name
   // "Reconstruct stack on host": on a DR recreate, rebuild the on-host stack
   // folder + compose file so a restore onto a fresh machine reproduces the
@@ -1139,7 +1141,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
   useEffect(() => { setSource(""); }, [b.id]);
   // F218: a verdict belongs to the backup it was about — switching rows in the
   // drawer must not leave the previous one's refusal on screen.
-  useEffect(() => { setVrErr(""); setVrLines([]); setAcks({ incompatible: false, unverified: false }); }, [b.id]);
+  useEffect(() => { setVrErr(""); setVrLines([]); setAcks({ incompatible: false, unverified: false, devices: false, networks: false }); }, [b.id]);
 
   // Stop the running restore. The run id is what the engine logs under: the
   // backup id for a single restore, "stack:<project>" for a stack restore.
@@ -1174,7 +1176,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
   // runRestore performs the restore, streaming live progress. On a 409 from the
   // extension/engine compatibility gate (F10) it stops, surfaces the specific
   // warning, and — only if the user accepts — retries once with the override.
-  const runRestore = async (confirmIncompatible: boolean, stepUp?: { password: string; code: string }, confirmUnverified?: boolean) => {
+  const runRestore = async (confirmIncompatible: boolean, stepUp?: { password: string; code: string }, confirmUnverified?: boolean, confirmed?: { devices?: boolean; networks?: boolean }) => {
     const targetId = man?.container_id || "";
     setRMode("one"); setRState("running"); setRLines([]); setRErr("");
 
@@ -1211,7 +1213,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
       // own address, this points the copy at something it only reads from, and a
       // dry run that cannot reach its data source proves nothing.
       const upAddr = newUpstreamAddress.trim() ? { new_upstream_address: newUpstreamAddress.trim() } : {};
-      await api.restore(b.id, { node_id: restoreNode, target_id: targetId, volumes: true, database: true, confirm: true, snapshot, recreate, source, ...(confirmIncompatible || acks.incompatible ? { confirm_incompatible: true } : {}), ...(confirmUnverified || acks.unverified ? { confirm_unverified: true } : {}), ...clone, ...hostRebuild, ...restartPromotion, ...probeInjection, ...ipRemap, ...domainRemap, ...pathRemap, ...siteAddr, ...upAddr, ...(privKey.trim() ? { private_key: privKey.trim() } : {}), ...(stepUp ? { password: stepUp.password, code: stepUp.code } : {}) });
+      await api.restore(b.id, { node_id: restoreNode, target_id: targetId, volumes: true, database: true, confirm: true, snapshot, recreate, source, ...(confirmIncompatible || acks.incompatible ? { confirm_incompatible: true } : {}), ...(confirmUnverified || acks.unverified ? { confirm_unverified: true } : {}), ...(allowDifferentImage ? { allow_different_image: true } : {}), ...(confirmed?.devices || acks.devices ? { confirm_missing_devices: true } : {}), ...(confirmed?.networks || acks.networks ? { confirm_missing_networks: true } : {}), ...(filesOnly ? { files_only: true } : {}), ...clone, ...hostRebuild, ...restartPromotion, ...probeInjection, ...ipRemap, ...domainRemap, ...pathRemap, ...siteAddr, ...upAddr, ...(privKey.trim() ? { private_key: privKey.trim() } : {}), ...(stepUp ? { password: stepUp.password, code: stepUp.code } : {}) });
       setRestoreStepUp(null); // F206: satisfied — clear the prompt
       onRestoresChanged(); // F100: the run is now registered — reachable after a reload
     } catch (e) {
@@ -1232,6 +1234,17 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
         if (confirm(`This backup's last verification FAILED\n\n${e.message}\n\nRestoring it can put CORRUPT data back. Restore anyway?`)) {
           setAcks((a) => ({ ...a, unverified: true }));
           return runRestore(confirmIncompatible, stepUp, true);
+        }
+        return;
+      }
+      // Step 27: the target lacks a device the container needs. The operator may
+      // know it will be attached; the confirm says what they are agreeing to.
+      if (e instanceof RestoreNeedsConfirmError) {
+        setRState("idle"); setRLines([]);
+        if (confirm(`The target machine lacks: ${[...e.devices, ...e.networks].join(", ")}\n\n${e.message}\n\nRestore anyway?`)) {
+          const now = { devices: confirmed?.devices || e.devices.length > 0, networks: confirmed?.networks || e.networks.length > 0 };
+          setAcks((a) => ({ ...a, ...now }));
+          return runRestore(confirmIncompatible, stepUp, confirmUnverified, now);
         }
         return;
       }
@@ -1335,6 +1348,12 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
     const verifyNote = verifyFirst
       ? "\n\nIt will be verified first. If verification fails, NOTHING is restored."
       : "";
+    // Step 23: files only changes no container and overwrites nothing, so its
+    // confirmation says so and no snapshot is involved.
+    if (filesOnly) {
+      if (!confirm(`RESTORE FILES ONLY — put back ${b.target_name}'s compose file, .env, project files and any missing single-file binds on node ${targetNodeName}. No container is stopped or changed, and nothing that exists is overwritten.${verifyNote} Continue?`)) return;
+      return verifyFirst ? verifyThenRestore() : runRestore(false);
+    }
     // Restore as a copy (F10): creates a new, isolated container; the original is
     // untouched, so the confirm text is non-destructive and there's no snapshot.
     if (asCopy) {
@@ -1444,7 +1463,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
           <button onClick={onClose} className="text-on-surface-variant hover:text-on-surface"><X size={20} /></button>
         </div>
 
-        <div className="mb-4 flex flex-wrap gap-2">{statusChip(b.status)}{verifyChip(b.verified)}<Chip kind="muted">{fmtBytes(b.size_bytes)}</Chip>{uncoveredSkips.length > 0 && <Chip kind="warn">Partial · {uncoveredSkips.length} not captured</Chip>}{coveredSkips.length > 0 && <span title="Shared folder(s) captured once via another container's backups — not data loss."><Chip kind="ok">{coveredSkips.length} captured via {coveredSkips[0].covered_by}</Chip></span>}{(b.chain_dependents || 0) > 0 && <span title={`${b.chain_dependents} newer incremental backup(s) build on this one — deleting it offers a whole-chain delete instead of orphaning them.`}><Chip kind="muted"><Layers size={12} /> baseline of {b.chain_dependents} delta{b.chain_dependents === 1 ? "" : "s"}</Chip></span>}{pinned && <Chip kind="ok"><Pin size={12} /> Pinned</Chip>}{man?.has_original_compose && <span title="The genuine host compose file(s) were captured from the source host — find them under config/original-compose/ when browsing this backup's files, alongside the stack's .env, and prefer them over the reconstruction."><Chip kind="ok"><FileText size={12} /> original compose included</Chip></span>}</div>
+        <div className="mb-4 flex flex-wrap gap-2">{statusChip(b.status)}{verifyChip(b.verified)}<Chip kind="muted">{fmtBytes(b.size_bytes)}</Chip>{uncoveredSkips.length > 0 && <Chip kind="warn">Partial · {uncoveredSkips.length} not captured</Chip>}{coveredSkips.length > 0 && <span title="Shared folder(s) captured once via another container's backups — not data loss."><Chip kind="ok">{coveredSkips.length} captured via {coveredSkips[0].covered_by}</Chip></span>}{(b.chain_dependents || 0) > 0 && <span title={`${b.chain_dependents} newer incremental backup(s) build on this one — deleting it offers a whole-chain delete instead of orphaning them.`}><Chip kind="muted"><Layers size={12} /> baseline of {b.chain_dependents} delta{b.chain_dependents === 1 ? "" : "s"}</Chip></span>}{pinned && <Chip kind="ok"><Pin size={12} /> Pinned</Chip>}{man?.has_original_compose && <span title="The genuine host compose file(s) were captured from the source host, with the stack's .env — a restore that rebuilds the stack folder writes them back as the files Compose runs. Browse them under config/original-compose/."><Chip kind="ok"><FileText size={12} /> original compose included</Chip></span>}</div>
         {b.error && <div className="mb-4 rounded bg-error/10 px-3 py-2 text-sm text-error">{b.error}</div>}
 
         {/* F50: restore-confidence grade + what would raise it. */}
@@ -2130,6 +2149,17 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
                 while this control promised the opposite. It now refuses the
                 request; offering it here would only produce that error. */}
             {!isVolume && (<>
+            {/* Step 23: the 2026-10-04 recovery's need — the folders were gone, every container
+                was still running, and a full restore was the only way to get the
+                files back. */}
+            <label className="flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
+              <input type="checkbox" className="mt-0.5" checked={filesOnly} onChange={(e) => { setFilesOnly(e.target.checked); if (e.target.checked) { setAsCopy(false); setRecreate(false); } }} disabled={optsLocked} />
+              <span>
+                <span className="font-medium text-on-surface">Files only</span> — put back the compose file, .env, project files and any missing single-file binds. No container is stopped or changed, and nothing that exists is overwritten.
+                <span className="text-on-surface-variant/80"> For a deleted stack folder while the containers still run.</span>
+              </span>
+            </label>
+            {!filesOnly && (<>
             <label className="flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
               <input type="checkbox" className="mt-0.5" checked={asCopy} onChange={(e) => { setAsCopy(e.target.checked); if (e.target.checked && !asName.trim()) setAsName(`${b.target_name}-restored`); }} disabled={optsLocked} />
               <span>
@@ -2145,7 +2175,8 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
               </div>
             )}
             </>)}
-            {!asCopy && (<>
+            </>)}
+            {!asCopy && !filesOnly && (<>
             {/* F208: "Revert update" recreates a container from the backup's saved
                 image. A standalone volume has neither — the server ignores the
                 flag entirely, so showing it only invites a click that does
@@ -2156,6 +2187,15 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
               <span>
                 <span className="font-medium text-on-surface">Revert update</span> — recreate {b.stack && stackServices > 1 ? "the service(s)" : b.target_name} from {revertTarget.pin === "tag" ? "this backup's saved image" : "this backup's exact image"}, rolling a broken upgrade back to this version.
                 <span className="text-on-surface-variant/80"> Leave off to restore data into the current container without changing its image.</span>
+              </span>
+            </label>
+            )}
+            {!isVolume && (
+            <label className="flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
+              <input type="checkbox" className="mt-0.5" checked={allowDifferentImage} onChange={(e) => setAllowDifferentImage(e.target.checked)} disabled={optsLocked} />
+              <span>
+                <span className="font-medium text-on-surface">Allow a newer image</span> — if the image this backup ran is gone from this host and its registry, recreate from the tag&apos;s current image instead of stopping.
+                <span className="text-on-surface-variant/80"> Leave off unless you mean it: a newer version can migrate older data beyond going back.</span>
               </span>
             </label>
             )}
@@ -2213,7 +2253,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
             <label className="flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
               <input type="checkbox" className="mt-0.5" checked={reconstructHost} onChange={(e) => setReconstructHost(e.target.checked)} disabled={optsLocked} />
               <span>
-                <span className="font-medium text-on-surface">Reconstruct stack folder on host</span> — when the container is recreated, also rebuild its on-host project directory and drop the reconstructed <span className="font-mono">docker-compose.yml</span> back into it, so a restore onto a fresh machine reproduces your organized layout.
+                <span className="font-medium text-on-surface">Reconstruct stack folder on host</span> — when the container is recreated, also rebuild its on-host project directory and write your own compose file and .env from the backup back into it (a reconstructed <span className="font-mono">docker-compose.yml</span> when the backup has none), so a restore onto a fresh machine reproduces your organized layout.
                 <span className="text-on-surface-variant/80"> Never overwrites an existing compose file (writes a clearly-named copy alongside).</span>
               </span>
             </label>

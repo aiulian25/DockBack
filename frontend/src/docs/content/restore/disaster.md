@@ -32,7 +32,7 @@ Every **mint**, first **view**, and **revoke** is written to the *Audit trail*.
 
 Every backup stores the container's full configuration in `config/inspect.json`. When you restore and the target container is missing, DockBack:
 
-1. **Re-pulls the image by digest** (the exact image that was running, from the manifest).
+1. **Provides the exact image that was running**: from this host when it is still here (or was just loaded from the bundled `image.tar`), otherwise pulled by its recorded digest.
 2. **Recreates the container** with its saved configuration — env, ports, mounts/volumes, networks, restart policy, healthcheck.
 3. **Restores the data** (volumes and/or the consistent database dump) into the recreated container.
 4. **Starts it.**
@@ -41,7 +41,7 @@ The result is the container running again with its original configuration and da
 
 ## Is the image still available?
 
-A recreate re-pulls the container image by its recorded digest (or tag). If that image was deleted locally and its tag or registry is **gone** — and you didn't bundle the image — the recreate fails partway. DockBack surfaces this **before** you rely on the backup:
+A recreate uses the exact image the backup ran: the one still on this host, or the one pulled by its recorded digest. It falls back to the tag only when the tag still names that same image. When the recorded image is gone and the tag now names a **different** one, the recreate **stops before removing anything** and says so. An application can migrate older data to a newer version beyond going back; Uptime Kuma 2 did exactly that to a backed-up version 1. To go ahead anyway, tick **Allow a newer image** in the restore drawer. Otherwise, load the image (or re-back up with the image bundled) and restore the recorded version, then upgrade later. DockBack surfaces all of this **before** you rely on the backup:
 
 - **On a backup** (Backups → open a backup → Manifest), **Check restore readiness** verifies the image is obtainable right now — present locally, still pullable by digest/tag, or bundled — without pulling anything. A green *Image ready* or an amber warning tells you where you stand.
 - **In the runbook** (Recovery), any service whose image is **only referenced by a tag and isn't bundled** is flagged *image not bundled*, because a restore then depends on that tag still existing in its registry.
@@ -52,23 +52,52 @@ The fix is the existing **Also save the container image** option: re-back up wit
 
 Just restore the backup as usual (*Restore by version & source location*). If the target doesn't exist, DockBack detects that and recreates it automatically — the live log shows "recreating from backup (disaster recovery)".
 
+## First: freeze the evidence
+
+Before restoring anything after a disaster, press **Freeze evidence** on the node's page. It downloads one JSON file describing how every container there is put together: the full `docker inspect` record for each, with environment variables reduced to their **names** and logging-option values removed, plus the node's networks and volumes. It asks for your password like an export, because commands and labels can still carry secrets.
+
+It's the record you'd otherwise rebuild by hand. On the night that prompted it, DockBack's own compose file was gone with everything else, and DockBack was rebuilt from `docker inspect` while its container still ran.
+
+## Files only: the folder is gone, the containers still run
+
+The common disaster isn't a dead machine. It's a deleted folder: a stack manager or a stray `rm -rf` removes `~/docker/<stack>`, and every container keeps running on files that no longer have a path. Tick **Files only** in the restore drawer, for one container or a whole stack, to put back exactly what the folder held:
+
+- your **compose file** and **`.env`**, with the reconstruction beside them (see below);
+- the project's **other files**: scripts, READMEs, extra env files (see *What a backup holds* below);
+- every **single-file bind** that is missing, such as a key or a licence, with its recorded owner and mode.
+
+No container is stopped, restarted or changed, and **nothing that exists is overwritten**. A file still there is kept as it is, and the log says so.
+
+Files only brings back **no data**. A bind-mounted data folder that was deleted is still held open by its running container, so it looks fine until that container restarts onto an empty folder. The restore names every such folder in its log. Run a full restore for those before the container restarts.
+
+### What a backup holds of the project folder
+
+Besides your compose file(s) and `.env`, every backup of a compose container carries the rest of its project folder (`config/project-folder.tar`). It leaves out what doesn't belong:
+
+- every **bind-mounted path** inside it, because the volume data has its own capture (or was deliberately left out);
+- `.git`, `node_modules`, `__pycache__` and `.cache`, at any depth;
+- anything listed in a **`.dockbackignore`** in the project folder. It works like `.gitignore`: `*.log` matches at any depth, and `/build` or `cache/data` match from the folder's root.
+
+The capture is capped at 64 MB; a bigger folder is skipped, and the backup log says so. A restore that rebuilds the stack folder (full or files only) writes back only the files that are missing.
+
 ## Rebuild the on-host stack folder (compose file + directory)
 
 If you keep each stack in its own directory — e.g. `/opt/docker/<stack>/` holding a `docker-compose.yml` and the app's config folders — a plain recreate brings the **container** back but doesn't reproduce that tidy on-host layout: Docker only makes the exact bind-mount folders it needs, and the compose file stays inside the backup.
 
 Tick **Reconstruct stack folder on host** in the restore panel to fix that. When DockBack recreates the container, it also:
 
-- **creates the stack directory** on the target host, and
-- **writes the reconstructed `docker-compose.yml`** into it (the same functional compose DockBack rebuilds from the container's configuration),
-- owning both to **match the parent directory**, so they sit alongside your other stacks.
+- **creates the stack directory** on the target host,
+- **writes your own compose file and `.env` from the backup** into it — or, when the backup holds no original compose file, the one DockBack rebuilds from the container's configuration — and
+- owns them to **match the parent directory**, so they sit alongside your other stacks.
 
 **When the parent is brand new, it doesn't match root.** On a fresh host there is no `/opt/stacks` yet, so Docker creates it a moment before DockBack writes — as root, because that is what Docker does. Matching that parent would hand you a stack folder you need `sudo` to edit, on the one machine where you are most likely to be editing it. So when the parent reads as root, DockBack instead uses **the ids this restore is running the container as** — your pinned `uid:gid` if you set one, otherwise the ids the image declares. The parent Docker made is left exactly as it is; only what DockBack itself writes is owned this way. If neither is known, it falls back to matching the parent as before.
 
 It's **opt-in** and deliberately safe:
 
 - It writes **the filename `docker compose` will actually read** — the name this stack was deployed from, or the one already in the folder if that differs. A file whose name has to be passed with `-f` every time is a file that quietly stops being the one anybody edits.
-- It **never destroys** an existing compose file. If one is already there, it is **renamed aside** to `<name>.pre-dockback-restore-<timestamp>.yml` before the reconstruction takes the canonical name, and the log names both paths. If the file already matches, nothing is written or renamed at all — running a restore twice converges instead of leaving a backup behind each time.
-- **Read the reconstruction before relying on it.** It is built from the container's runtime configuration, so its environment values are *resolved*: a password your own file referenced as `${VAR}` from a `.env` is written out in full, and `env_file`, profiles and comments are not carried over. The displaced file is right beside it to compare against.
+- **Your own file is the one Compose runs.** When the backup holds your original compose file, it's written under that name, and DockBack's reconstruction goes beside it as `docker-compose.dockback.yml`, which Compose ignores unless you pass it with `-f`. Only when the backup has no original does the reconstruction take the name. Then read it before relying on it: it's built from the container's runtime configuration, so `env_file`, profiles and comments aren't in it, and its secrets are moved to the `.env` as `${VAR}`.
+- It **never destroys** an existing file. If a different one is already there, it is **renamed aside** to `<name>.pre-dockback-restore-<timestamp>` first, and the log names both paths. If the file already matches, nothing is written or renamed at all — running a restore twice converges instead of leaving a backup behind each time.
+- Every file it writes is **readable by its owner only** (mode 600) from the moment it's created, because a compose file or `.env` can hold passwords.
 - The target directory comes from the container's own compose metadata (the project's working directory), so it lands exactly where it lived. For a container started **without** compose (a plain `docker run`, so there's no recorded directory), give a **base directory** in the panel and DockBack uses `‹base›/‹container-name›/`. The base is remembered for next time.
 - Writes are strictly validated — DockBack refuses system paths (`/etc`, `/usr`, `/var/lib`, …) and anything too shallow to be a real stack directory.
 
@@ -114,7 +143,7 @@ With the toggle off, restores behave exactly as before.
 
 ## The stack's `.env` moves with it
 
-A compose file that reads `${DOMAIN}` holds no domain — the value is in the `.env` beside it. DockBack captures that file too (over SSH, alongside the compose file, into the encrypted archive) and writes it back on a restore **through the same remaps**: the IP, the domain and the path rewrites all apply to it.
+A compose file that reads `${DOMAIN}` holds no domain — the value is in the `.env` beside it. DockBack captures that file too (on every kind of node, alongside the compose file, into the encrypted archive) and writes it back on a restore **through the same remaps**: the IP, the domain and the path rewrites all apply to it.
 
 This matters more than it sounds. Without it, a cross-host restore recreated the containers with a correctly remapped environment — and then the first `docker compose up` re-read the old `.env` and put the previous address straight back. The pair you run has to agree with the containers, or the containers lose.
 
@@ -199,49 +228,39 @@ unaffected and nothing else changed.
 
 Install the driver on the new host and recreate the container if its logs need to keep going to the same place. The restore plan also flags a non-default logging driver **before** you start, under the service that uses it.
 
-### Why it is reconstructed and not copied
+### Your compose file, and the reconstruction beside it
 
-The compose file DockBack writes is **synthesized from `docker inspect`**, not copied from the one you wrote. It is worth being plain about why, because the difference shows.
+At backup time DockBack reads the compose file(s) the stack was deployed from, and the `.env` beside them, straight from the host, on every kind of node. Both go into the encrypted archive. When the restore rebuilds the stack folder:
 
-DockBack talks to the Docker API — and, in the recommended deployment, only through a socket proxy. Your compose file lives on the **host filesystem**, outside Docker entirely. Nothing DockBack sees at backup time includes it: what the API can describe is the container that compose produced, not the document that produced it.
+- **`docker-compose.yml`** (or whatever name the stack was deployed from) is **your own file**, byte for byte, with only the remaps you asked for applied. It's the file `docker compose` runs.
+- **`.env`**, mode `600`, is **your own `.env`**, your lines first and unchanged. DockBack appends only values the reconstruction needs that you don't define, under a labelled comment. Usually that's nothing.
+- **`docker-compose.dockback.yml`** is DockBack's reconstruction from the containers **as restored**, for comparison. Compose ignores it unless you pass it with `-f`.
 
-So the reconstruction is a faithful record of what is *running*, which differs from what you wrote in ways that matter when you read it:
+Every file follows the same rules. An identical file is left untouched, so re-running a restore converges. A different one is renamed aside with a timestamp, never deleted. Every file is created mode `600`.
 
-- **Values are resolved.** A `${PAPERLESS_DBPASS}` that came from your `.env` appears in full. The reconstruction carries real secrets and should be treated as such.
-- **The image is pinned to what actually ran** — `:3.0.0`, not `:latest`.
-- **Everything the image contributed is present**: its `PATH`, its build labels, its entrypoint. Compose never mentioned those; the container has them.
-- **Comments, anchors, `env_file:`, profiles and `depends_on` conditions are gone.** They are instructions to compose, and compose consumed them.
+Every compose file the restore writes is then **checked with Docker Compose** itself, in a short-lived helper container on that machine, with the folder exactly as it now is. The log gives one of three answers:
 
-It is a working file — `docker compose up` with it reproduces the container — but it is a *description of the result*, not your source document. Keep your own compose file in version control; treat this one as the record of what was running when the backup was taken.
+- **valid, and `docker compose up -d` will change nothing.** Every service's configuration matches what its running container was created from.
+- **valid, but `up -d` would recreate** the named services (their configuration differs), or create ones with no container yet.
+- **not valid**, in Compose's own words, such as a missing `env_file`. Your own file is still written as it was backed up, so you can fix it.
 
-### What lands at the stack's root
+Anything Compose warns about, such as a variable that isn't set and would become blank, is quoted in the same line. The helper is the official Docker CLI image (a 67 MB download), pinned to one version for every machine. DockBack fetches it when it's needed and removes it again afterwards, unless the machine already had it. If it can't be fetched, the log says the files went unchecked, and the restore carries on.
 
-The reconstruction writes the layout you would keep by hand — everything at the stack directory's root, beside the data folders:
+When the backup holds **no** original compose file (it couldn't be read at backup time), the reconstruction takes the compose file's name instead, but only if Docker Compose accepts it. One that Compose rejects goes beside the folder as `docker-compose.dockback.yml` for you to fix, and the compose file already there (if any) is left alone. A restore that covers only part of a project, because services were left out or have no backup, writes your own files and never a reconstruction of the part.
 
-- **`docker-compose.yml`** (or the flavour of the name the folder already uses), built from the containers **as restored** — so the address you typed in the dialog, the remapped IP and paths, and the rewritten user-mapping ids are all in it. It carries **no secrets**.
-- **`.env`**, mode `600`, holding the secret values the compose file references as `${VAR}` — the shape you would keep in version control (the compose) beside the file you would not (the `.env`). Which values count as secret is decided by name: passwords, keys, tokens, salts. A value the dotenv format could misread stays inline rather than round-trip broken.
+### What the reconstruction is
 
-Both follow the same rules: an existing different file is renamed aside with a timestamp, never deleted; an identical one is left untouched, so re-running a restore converges instead of accumulating backups.
+The reconstruction is synthesized from `docker inspect`: a faithful record of what was **running**, not of what you wrote.
 
-### Living with it, or replacing it with yours
+- **Values are resolved.** Secrets are moved to the `.env` as `${VAR}`. Every other `$` is written as `$$`, so Compose reads it literally rather than blanking it.
+- **The image is pinned to what actually ran.** Image defaults (`PATH` and the like) are left out unless the container overrode them.
+- **The stack's own networks** are declared under the names Compose gave them, with their recorded subnets. **Networks it only joins** (a proxy network another stack owns) are `external: true`, so Compose joins them instead of creating copies.
+- **Named volumes** are declared `external: true` by their real names. After a restore the data is already in them.
+- **Not reproducible from a running container:** `pull_policy`, `env_file`, profiles, `build` and comments. Anything else the container runs with that Compose can't express, such as a non-default logging driver, is listed on its service under `x-dockback-not-written`.
 
-Both are fine, and the difference matters most at the next **image upgrade**.
+It's a valid Compose file for the cases DockBack's own end-to-end drill checks. Still, read it before relying on it, especially on another host.
 
-**If you keep the reconstruction and edit it**, changing an address, a port or a bind path is safe — those are your values in the first place. The one to watch is the image's own environment, which the reconstruction pins because the container had it: `PATH`, `PYTHON_VERSION`, `GPG_KEY` and friends came from `paperless-ngx:3.0.0`, not from you. Change the tag to `3.1.0` and compose will hand the new image the **old image's** `PATH`. Usually harmless; occasionally the reason a working upgrade breaks for no visible reason. Before bumping a tag, delete the variables you did not set yourself — anything you would not have typed belongs to the image.
-
-**If you put your original compose back**, that is the better long-term answer and it costs nothing structural. Drop it in, run `docker compose up -d`, and compose reconciles: containers whose configuration now differs are recreated, the rest are left alone. Your named volumes and bind mounts are matched by name and path, so **the restored data stays where it is** — a recreate replaces the container, never its volumes. Check three things first, because these are what the restore may have changed underneath it:
-
-- the **image tag**, if you pinned `:latest` and the restore brought back a digest;
-- **`USERMAP_UID` / `PUID`** and the like, if you changed the ids for this machine;
-- the **address** variables, if you supplied a new one during the restore.
-
-Restoring again afterwards will displace your file a second time — DockBack renames it aside rather than deleting it, so nothing is lost, but expect to put it back. A restore is not a routine operation; a compose file you maintain is.
-
-**Updating a side container** — tika, gotenberg, a database — is the ordinary compose workflow either way. Change the tag, `docker compose up -d`, and only that service is recreated.
-
-### Reconstructed compose files
-
-The compose file DockBack reconstructs now declares real network definitions — subnet, `internal`, driver — instead of marking every network `external: true`. So `docker compose up` on a fresh host reproduces the topology rather than inventing a default bridge. Backups taken before this feature still emit `external: true`, which remains the only safe assumption when nothing about the network was recorded.
+**Updating a side container** (tika, gotenberg, a database) is the ordinary compose workflow either way: change the tag, run `docker compose up -d`, and only that service is recreated.
 
 ## NFS- and CIFS-backed volumes keep their backing store
 

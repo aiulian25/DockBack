@@ -2,8 +2,11 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"dockback/internal/dockercli"
+	"dockback/internal/storage"
+	"dockback/internal/store"
 )
 
 // Backup coverage / "unprotected containers" (Fable-UI-UX B2). This joins the
@@ -11,10 +14,13 @@ import (
 // schedule to answer the single most valuable question a backup tool can: which
 // RUNNING containers have no protection at all.
 //
-// A running container is PROTECTED when it has a successful backup on record OR
-// is covered by the enabled schedule (a whole-node target, or a specific target
-// matched by name). Everything is computed from data already in memory + SQLite
-// (no Docker calls), so it's cheap enough to poll.
+// A running container is PROTECTED when its newest successful backup is recent:
+// younger than twice the interval of the schedule that covers it, or than
+// defaultStaleAfter when no schedule does. Older than that it is STALE, and
+// with no backup at all it is UNPROTECTED, scheduled or not. The 2026-10-04 recovery
+// found stacks counted as protected on the strength of backups weeks old, or of
+// a schedule alone. Everything is computed from data already in memory +
+// SQLite (no Docker calls), so it's cheap enough to poll.
 //
 // F13 adds a second, quieter bucket: STOPPED containers that still hold a named
 // data volume yet have no backup and aren't schedule-covered. A stopped container
@@ -23,10 +29,57 @@ import (
 // lose, so it's surfaced separately.
 
 type coverageContainer struct {
-	ContainerID string `json:"container_id"`
-	Name        string `json:"name"`
-	Stack       string `json:"stack,omitempty"`
-	Image       string `json:"image,omitempty"`
+	ContainerID  string `json:"container_id"`
+	Name         string `json:"name"`
+	Stack        string `json:"stack,omitempty"`
+	Image        string `json:"image,omitempty"`
+	LastBackupAt int64  `json:"last_backup_at,omitempty"`
+	Scheduled    bool   `json:"scheduled,omitempty"`
+}
+
+// defaultStaleAfter is how old a container's newest backup may grow, with no
+// schedule covering it, before it no longer counts as protection.
+const defaultStaleAfter = 8 * 24 * time.Hour
+
+// staleIntervals is how many of its schedule's intervals a backup may age: one
+// missed run is tolerated, a second is not.
+const staleIntervals = 2
+
+// offMachineDestinations counts the enabled destinations that leave this
+// machine. A "local" destination is a folder on it, so it does not count. Pure.
+func offMachineDestinations(dests []*store.Destination) int {
+	n := 0
+	for _, d := range dests {
+		if d.Enabled && d.Type != storage.TypeLocal {
+			n++
+		}
+	}
+	return n
+}
+
+// backupRecency is where a container's newest backup stands.
+type backupRecency int
+
+const (
+	backupNever backupRecency = iota
+	backupStale
+	backupRecent
+)
+
+// recencyOf judges a newest successful backup (unix seconds, 0 for none)
+// against the age its schedule allows. Pure.
+func recencyOf(lastBackup int64, now time.Time, interval time.Duration, scheduled bool) backupRecency {
+	if lastBackup <= 0 {
+		return backupNever
+	}
+	allowed := defaultStaleAfter
+	if scheduled && interval > 0 {
+		allowed = staleIntervals * interval
+	}
+	if now.Sub(time.Unix(lastBackup, 0)) > allowed {
+		return backupStale
+	}
+	return backupRecent
 }
 
 type coverageNode struct {
@@ -40,15 +93,22 @@ type coverageNode struct {
 	// from the ProtectedTargets map already fetched below, so the per-cluster
 	// "oldest backup" rollup costs no extra query (F104).
 	LastBackupAt  int64               `json:"last_backup_at"`
-	Unprotected   []coverageContainer `json:"unprotected"`
+	Unprotected   []coverageContainer `json:"unprotected"`     // running, never backed up
+	Stale         []coverageContainer `json:"stale"`           // running, newest backup too old
 	StoppedAtRisk []coverageContainer `json:"stopped_at_risk"` // stopped + named data volume + no backup (F13)
 }
 
 type coverageResp struct {
-	UnprotectedTotal   int            `json:"unprotected_total"`
-	RunningTotal       int            `json:"running_total"`
-	StoppedAtRiskTotal int            `json:"stopped_at_risk_total"`
-	Nodes              []coverageNode `json:"nodes"`
+	// OffMachineDestinations counts the enabled container-backup destinations
+	// that are not a folder on this machine. Zero means every copy of every
+	// backup is on the one machine a disk failure would take with it.
+	OffMachineDestinations    int            `json:"off_machine_destinations"`
+	AppOffMachineDestinations int            `json:"app_off_machine_destinations"`
+	UnprotectedTotal          int            `json:"unprotected_total"`
+	StaleTotal                int            `json:"stale_total"`
+	RunningTotal              int            `json:"running_total"`
+	StoppedAtRiskTotal        int            `json:"stopped_at_risk_total"`
+	Nodes                     []coverageNode `json:"nodes"`
 }
 
 // hasNamedDataVolume reports whether any mount is a NAMED docker volume — real,
@@ -78,23 +138,34 @@ func isAnonymousVolumeName(name string) bool {
 	return true
 }
 
-// handleCoverage computes the fleet's backup coverage (B2).
+// handleCoverage reports the fleet's backup coverage (B2).
 func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
-	nodes, err := s.store.ListNodes()
+	resp, err := s.computeCoverage(time.Now())
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, resp)
+}
 
-	// Schedule coverage: the union of targets across all enabled named schedules
-	// (F6). Legacy id-only targets can't be name-matched here; they fall back to
-	// the backup-history check, so a scheduled-by-id container reads as protected
-	// once it has run at least once.
-	wholeNode, specific, schedOn := s.scheduleCoverage()
+// computeCoverage is the fleet's backup coverage, shared by the page, the
+// hourly alert check and the daily digest so all three agree.
+func (s *Server) computeCoverage(now time.Time) (coverageResp, error) {
+	nodes, err := s.store.ListNodes()
+	if err != nil {
+		return coverageResp{}, err
+	}
+	cover := s.scheduleCoverage(now)
 
 	resp := coverageResp{Nodes: []coverageNode{}}
+	if dests, err := s.store.ListDestinations(); err == nil {
+		resp.OffMachineDestinations = offMachineDestinations(dests)
+	}
+	if dests, err := s.store.ListAppDestinations(); err == nil {
+		resp.AppOffMachineDestinations = offMachineDestinations(dests)
+	}
 	for _, n := range nodes {
-		cn := coverageNode{NodeID: n.ID, NodeName: n.Name, Cluster: n.Cluster, Unprotected: []coverageContainer{}, StoppedAtRisk: []coverageContainer{}}
+		cn := coverageNode{NodeID: n.ID, NodeName: n.Name, Cluster: n.Cluster, Unprotected: []coverageContainer{}, Stale: []coverageContainer{}, StoppedAtRisk: []coverageContainer{}}
 		st := s.getStat(n.ID)
 		if st != nil {
 			cn.Reachable = st.Reachable
@@ -119,33 +190,34 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 			if isTestClone(c) {
 				continue
 			}
-			_, hasBackup := backedUp[c.Name]
-			scheduled := schedOn && (wholeNode[n.ID] || specific[n.ID+"\x00"+c.Name])
+			interval, scheduled := cover.interval(n.ID, c)
+			lastBackup := backedUp[c.Name]
+			item := coverageContainer{ContainerID: c.ID, Name: c.Name, Stack: c.Stack, Image: c.Image, LastBackupAt: lastBackup, Scheduled: scheduled}
 			if c.State != "running" {
 				// A stopped container is usually intentionally off, so it never counts
 				// toward the running-unprotected number. But if it still holds a NAMED
 				// data volume and has neither a backup nor schedule coverage, its data
 				// is genuinely at risk — surface it in the separate, quieter bucket (F13).
-				if !hasBackup && !scheduled && hasNamedDataVolume(c.Mounts) {
-					cn.StoppedAtRisk = append(cn.StoppedAtRisk, coverageContainer{
-						ContainerID: c.ID, Name: c.Name, Stack: c.Stack, Image: c.Image,
-					})
+				if lastBackup == 0 && !scheduled && hasNamedDataVolume(c.Mounts) {
+					cn.StoppedAtRisk = append(cn.StoppedAtRisk, item)
 				}
 				continue
 			}
 			cn.Running++
-			if hasBackup || scheduled {
+			switch recencyOf(lastBackup, now, interval, scheduled) {
+			case backupRecent:
 				cn.Protected++
-				continue
+			case backupStale:
+				cn.Stale = append(cn.Stale, item)
+			default:
+				cn.Unprotected = append(cn.Unprotected, item)
 			}
-			cn.Unprotected = append(cn.Unprotected, coverageContainer{
-				ContainerID: c.ID, Name: c.Name, Stack: c.Stack, Image: c.Image,
-			})
 		}
 		resp.RunningTotal += cn.Running
 		resp.UnprotectedTotal += len(cn.Unprotected)
+		resp.StaleTotal += len(cn.Stale)
 		resp.StoppedAtRiskTotal += len(cn.StoppedAtRisk)
 		resp.Nodes = append(resp.Nodes, cn)
 	}
-	writeJSON(w, http.StatusOK, resp)
+	return resp, nil
 }

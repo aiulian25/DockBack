@@ -8,9 +8,25 @@
 # project, a localhost-only port, and throwaway volumes/containers, all removed
 # on exit. It only ever backs up the one throwaway container it creates.
 #
-# Two cases, selected with E2E_CASE:
+# Five cases, selected with E2E_CASE:
 #
 #   sentinel (default) — the drill above: volume data lost and brought back.
+#   deleted-binds      — the recovery of 2026-10-04: a RUNNING container whose
+#                        folder and secret-file binds are read-only has its whole
+#                        host folder deleted, then is restored IN PLACE. Both must
+#                        come back — the secret as a real file, mode 600, not the
+#                        empty directory Docker invents for a missing file bind.
+#   stack-folder       — the rest of that night: a Compose project's folder is
+#                        deleted while it runs, then the stack is restored with
+#                        "rebuild stack folder" on. Your own compose file and .env
+#                        must come back as the files Compose runs, the .env with
+#                        no duplicated key, and `docker compose up -d` from the
+#                        restored folder must find nothing to change.
+#   files-only         — the restore that night needed: a running stack's folder
+#                        is deleted, and a files-only stack restore puts back the
+#                        compose file, .env, project files and the secret-file
+#                        bind without stopping or restarting anything, and names
+#                        the data folder only a full restore can bring back.
 #   pg-hash            — #18's content baseline: a PostgreSQL database with a
 #                        timestamptz column is backed up, restored into another
 #                        container, and the restored cluster is then put in a
@@ -20,6 +36,9 @@
 #
 #   ./scripts/e2e.sh
 #   E2E_CASE=pg-hash ./scripts/e2e.sh
+#   E2E_CASE=deleted-binds ./scripts/e2e.sh
+#   E2E_CASE=stack-folder ./scripts/e2e.sh
+#   E2E_CASE=files-only ./scripts/e2e.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -42,8 +61,11 @@ export E2E_PORT="$PORT"
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 fail() { printf '\n\033[1;31mE2E FAILED: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Containers a case creates register here so cleanup sweeps them all.
+# Containers, Compose projects and networks a case creates register here so
+# cleanup sweeps them all.
 EXTRA_CONTAINERS=()
+EXTRA_PROJECTS=()
+EXTRA_NETWORKS=()
 
 # #36: the image set as it stands BEFORE the run, so the teardown can prove
 # DockBack put back whatever it borrowed.
@@ -81,7 +103,16 @@ cleanup() {
   step "Cleanup"
   docker rm -f "$TARGET" >/dev/null 2>&1 || true
   for c in ${EXTRA_CONTAINERS+"${EXTRA_CONTAINERS[@]}"}; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  for p in ${EXTRA_PROJECTS+"${EXTRA_PROJECTS[@]}"}; do
+    docker ps -aq --filter "label=com.docker.compose.project=$p" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    docker volume ls -q --filter "label=com.docker.compose.project=$p" | xargs -r docker volume rm >/dev/null 2>&1 || true
+    docker network ls -q --filter "label=com.docker.compose.project=$p" | xargs -r docker network rm >/dev/null 2>&1 || true
+  done
+  for n in ${EXTRA_NETWORKS+"${EXTRA_NETWORKS[@]}"}; do docker network rm "$n" >/dev/null 2>&1 || true; done
   docker volume rm "$VOL" >/dev/null 2>&1 || true
+  if [ -n "${HOSTDIR:-}" ]; then
+    docker run --rm -v "$(dirname "$HOSTDIR")":/p alpine rm -rf "/p/$(basename "$HOSTDIR")" >/dev/null 2>&1 || true
+  fi
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   # #36: last, after every container this run made is gone — an image is not
   # removable while something built on it still exists.
@@ -262,6 +293,286 @@ case_sentinel() {
   printf '\n\033[1;32mE2E PASSED (sentinel): backup -> verify -> restore round-tripped the data.\033[0m\n'
 }
 
+# ── case: deleted-binds ──────────────────────────────────────────────────────
+
+case_deleted_binds() {
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-binds-XXXXXX)"
+  local APP="$HOSTDIR/app" KEY_CONTENT="vapid-$SUFFIX" CONF_CONTENT="setting=$SUFFIX"
+  mkdir -p "$APP/config"
+  printf '%s\n' "$CONF_CONTENT" > "$APP/config/settings.ini"
+  printf '%s' "$KEY_CONTENT" > "$APP/secret.key"
+  chmod 600 "$APP/secret.key"
+
+  step "Create a running container with READ-ONLY folder and secret-file binds"
+  docker run -d --name "$TARGET" \
+    -v "$APP/config":/config:ro -v "$APP/secret.key":/run/secrets/app.key:ro \
+    alpine sleep 600 >/dev/null
+
+  step "Find it and back it up"
+  local CID BID
+  CID="$(find_container "$TARGET")"
+  BID="$(backup_and_verify "$CID" "$TARGET")"
+  echo "  backup id: $BID"
+
+  step "The disaster: delete the whole host folder while the container keeps running"
+  rm -rf "$APP"
+  [ ! -e "$APP" ] || fail "could not delete the host folder"
+  docker inspect -f '{{.State.Running}}' "$TARGET" | grep -q true || fail "the container should still be running"
+
+  step "Restore IN PLACE (container exists, not recreated), with the safety snapshot"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$BID/restore" \
+    -d "{\"node_id\":\"local\",\"target_id\":\"$CID\",\"volumes\":true,\"database\":false,\"snapshot\":true,\"confirm\":true}" >/dev/null
+
+  step "Wait for the restore to finish"
+  local RLOG="" i finished=""
+  for i in $(seq 1 100); do
+    RLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID/log" || true)"
+    case "$RLOG" in
+      *"Restored container is healthy"*) finished=1; break ;;
+      *"Restore failed"*|*"Restore refused"*|*"rolling back"*|*"did not become healthy"*)
+        printf '%s\n' "$RLOG" | python3 -c "import sys,json;print(chr(10).join('    '+l['level']+' '+l['msg'] for l in json.load(sys.stdin).get('lines',[])[-25:]))" >&2
+        fail "the in-place restore did not succeed" ;;
+    esac
+    echo "  [$i] restoring"
+    sleep 3
+  done
+  [ -n "$finished" ] || fail "the restore did not finish in time"
+
+  step "Assert both binds came back as they were"
+  [ ! -d "$APP/secret.key" ] || fail "secret.key came back as an empty DIRECTORY — the 2026-10-04 failure"
+  [ -f "$APP/secret.key" ] || fail "secret.key did not come back"
+  [ -f "$APP/config/settings.ini" ] || fail "the config folder did not come back"
+  [ "$(stat -c %u:%g "$APP/secret.key")" = "$(id -u):$(id -g)" ] || fail "secret.key came back owned by $(stat -c %u:%g "$APP/secret.key"), not $(id -u):$(id -g)"
+  [ "$(cat "$APP/secret.key")" = "$KEY_CONTENT" ] || fail "secret.key came back with the wrong content"
+  [ "$(stat -c %a "$APP/secret.key")" = "600" ] || fail "secret.key came back as mode $(stat -c %a "$APP/secret.key"), not 600"
+  [ "$(tr -d '\n' < "$APP/config/settings.ini")" = "$CONF_CONTENT" ] || fail "the config folder came back with the wrong content"
+  docker inspect -f '{{range .Mounts}}{{.RW}} {{end}}' "$TARGET" | grep -q true && fail "a read-only mount became writable"
+  printf '\033[1;32mE2E PASSED (deleted-binds): a deleted host folder came back in place — folder and secret file, owner and mode intact.\033[0m\n'
+}
+
+# ── case: stack-folder ───────────────────────────────────────────────────────
+
+case_stack_folder() {
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-stack-XXXXXX)"
+  local PROJ="dback-e2e-stack-$SUFFIX" NET="dback-e2e-shared-$SUFFIX"
+  local DIR="$HOSTDIR/$PROJ"
+  EXTRA_PROJECTS+=("$PROJ")
+  EXTRA_NETWORKS+=("$NET")
+  local compose_in_dir=(docker compose -p "$PROJ" --project-directory "$DIR" -f "$DIR/docker-compose.yml")
+
+  step "Stand up a Compose project: shared network, named volume, a literal \$, an exported .env"
+  mkdir -p "$DIR/config"
+  printf 'setting=%s\n' "$SUFFIX" > "$DIR/config/app.ini"
+  cat > "$DIR/docker-compose.yml" <<EOF
+# Only the operator's own file has this comment.
+services:
+  app:
+    image: alpine
+    command: ["sleep", "600"]
+    environment:
+      TOKEN: \${TOKEN}
+      HASH: "\$\$apr1\$\$e2e"
+    volumes:
+      - data:/data
+      - ./config:/config
+    networks: [shared, default]
+volumes:
+  data:
+networks:
+  shared:
+    external: true
+    name: $NET
+EOF
+  printf 'export TOKEN=token-%s\n' "$SUFFIX" > "$DIR/.env"
+  mkdir -p "$DIR/scripts" "$DIR/node_modules/pkg"
+  printf '#!/bin/sh\necho nightly %s\n' "$SUFFIX" > "$DIR/scripts/nightly.sh"
+  chmod 755 "$DIR/scripts/nightly.sh"
+  printf 'How this stack is run.\n' > "$DIR/README.md"
+  printf 'rebuilt by npm\n' > "$DIR/node_modules/pkg/index.js"
+  printf 'noise\n' > "$DIR/debug.log"
+  printf '*.log\n' > "$DIR/.dockbackignore"
+  cp "$DIR/docker-compose.yml" "$HOSTDIR/original-compose.yml"
+  cp "$DIR/.env" "$HOSTDIR/original.env"
+  docker network create "$NET" >/dev/null
+  "${compose_in_dir[@]}" up -d --quiet-pull >/dev/null 2>&1 || fail "the test stack did not come up"
+
+  step "Back it up"
+  local CID BID BEFORE
+  CID="$(find_container "$PROJ-app-1")"
+  BID="$(backup_and_verify "$CID" "$PROJ-app-1")"
+  echo "  backup id: $BID"
+  BEFORE="$(docker ps -q --no-trunc --filter "label=com.docker.compose.project=$PROJ")"
+
+  step "Download the whole stack in one file (step 25)"
+  local TICKET ZIP="$HOSTDIR/stack.zip"
+  TICKET="$(curl -fsS "${auth[@]}" -X POST "$BASE/api/nodes/local/stacks/$PROJ/export-grant" \
+    -d "{\"password\":\"$DOCKBACK_ADMIN_PASSWORD\"}" | jget 'd["ticket"]')"
+  [ -n "$TICKET" ] || fail "no download ticket for the stack"
+  curl -fsS -b "$JAR" -o "$ZIP" "$BASE/api/nodes/local/stacks/$PROJ/download?ticket=$TICKET" || fail "the stack download failed"
+  python3 -c '
+import io, sys, tarfile, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+names = z.namelist()
+assert len(names) == 1 and names[0].startswith("app-") and names[0].endswith(".tar"), names
+inner = tarfile.open(fileobj=io.BytesIO(z.read(names[0])))
+members = inner.getnames()
+assert "config/inspect.json" in members, members
+assert "config/project-folder.tar" in members, members
+print("  one zip: %s, holding the decrypted backup with its project folder" % names[0])
+' "$ZIP" || fail "the stack download is not one zip of the decrypted backups"
+  curl -fsS -b "$JAR" -o /dev/null "$BASE/api/nodes/local/stacks/$PROJ/download?ticket=$TICKET" && fail "a download ticket must work once"
+
+  step "The disaster: delete the stack folder while the stack keeps running"
+  rm -rf "$DIR"
+  [ ! -e "$DIR" ] || fail "could not delete the stack folder"
+
+  step "Restore the stack with the stack folder rebuilt"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/nodes/local/stacks/$PROJ/restore?reconstruct_host=true" >/dev/null
+
+  step "Wait for the stack restore to finish"
+  local SLOG="" i finished=""
+  for i in $(seq 1 100); do
+    SLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/stack:$PROJ/log" || true)"
+    case "$SLOG" in
+      *"restored — all"*) finished=1; break ;;
+      *'"level":"ERR"'*|*"Stack restore CANCELED"*|*"What happened to each service"*)
+        printf '%s\n' "$SLOG" | python3 -c "import sys,json;print(chr(10).join('    '+l['level']+' '+l['msg'] for l in json.load(sys.stdin).get('lines',[])[-30:]))" >&2
+        fail "the stack restore did not succeed" ;;
+    esac
+    echo "  [$i] restoring"
+    sleep 3
+  done
+  [ -n "$finished" ] || fail "the stack restore did not finish in time"
+  printf '%s\n' "$SLOG" | python3 -c "import sys,json;print(chr(10).join('    '+l['msg'] for l in json.load(sys.stdin).get('lines',[]) if 'compose' in l['msg'] or '.env' in l['msg']))"
+
+  step "Assert your own compose file and .env are the files Compose runs"
+  cmp -s "$HOSTDIR/original-compose.yml" "$DIR/docker-compose.yml" || fail "docker-compose.yml is not the operator's own file"
+  [ -f "$DIR/docker-compose.dockback.yml" ] || fail "the reconstruction is not beside it as docker-compose.dockback.yml"
+  head -n 1 "$DIR/.env" | cmp -s - "$HOSTDIR/original.env" || fail "the .env does not start with the operator's own lines"
+  [ "$(grep -c 'TOKEN=' "$DIR/.env")" = "1" ] || fail "the .env defines TOKEN more than once (the cloudflare duplicate)"
+  [ "$(stat -c %a "$DIR/.env")" = "600" ] || fail "the .env is mode $(stat -c %a "$DIR/.env"), not 600"
+  [ "$(tr -d '\n' < "$DIR/config/app.ini")" = "setting=$SUFFIX" ] || fail "the stack's config folder did not come back"
+
+  step "Assert the project folder's other files came back, without its noise"
+  [ -x "$DIR/scripts/nightly.sh" ] || fail "scripts/nightly.sh did not come back executable (the forgejo case)"
+  grep -q "nightly $SUFFIX" "$DIR/scripts/nightly.sh" || fail "scripts/nightly.sh came back with the wrong content"
+  [ -f "$DIR/README.md" ] || fail "README.md did not come back"
+  [ ! -e "$DIR/node_modules" ] || fail "node_modules was captured, though it is rebuilt by a tool"
+  [ ! -e "$DIR/debug.log" ] || fail "debug.log came back, though .dockbackignore leaves *.log out"
+
+  step "Assert the reconstruction beside it is valid, joins what it shares, and keeps \$ literal"
+  local RECON_JSON RECON_ERR
+  RECON_ERR="$(mktemp)"
+  RECON_JSON="$(docker compose -p "$PROJ" --project-directory "$DIR" -f "$DIR/docker-compose.dockback.yml" config --format json 2>"$RECON_ERR")" \
+    || { cat "$RECON_ERR" >&2; rm -f "$RECON_ERR"; fail "the reconstruction is not a valid Compose file"; }
+  if grep -q 'variable is not set' "$RECON_ERR"; then
+    cat "$RECON_ERR" >&2; rm -f "$RECON_ERR"; fail "Compose interpolated a literal \$ in the reconstruction"
+  fi
+  rm -f "$RECON_ERR"
+  python3 -c '
+import json, sys
+net, vol = sys.argv[1], sys.argv[2]
+d = json.load(sys.stdin)
+n = d.get("networks", {}).get(net, {})
+assert n.get("external") is True and n.get("name") == net, "the shared network is re-declared: %s" % n
+v = d.get("volumes", {}).get(vol, {})
+assert v.get("external") is True and v.get("name") == vol, "the named volume is not declared: %s" % v
+h = d["services"]["app"]["environment"]["HASH"]
+assert h == "$$apr1$$e2e", "HASH reads %r" % h
+print("  shared network external, named volume declared, $ kept literal")
+' "$NET" "${PROJ}_data" <<<"$RECON_JSON" || fail "the reconstruction breaks a shared network, a volume or a \$ value"
+
+  step "Assert \`docker compose up -d\` from the restored folder changes nothing"
+  "${compose_in_dir[@]}" config -q || fail "the restored compose file is not valid"
+  "${compose_in_dir[@]}" up -d >/dev/null 2>&1 || fail "docker compose up -d failed in the restored folder"
+  [ "$(docker ps -q --no-trunc --filter "label=com.docker.compose.project=$PROJ")" = "$BEFORE" ] \
+    || fail "docker compose up -d recreated the restored containers"
+  case "$SLOG" in
+    *"Checked with Docker Compose"*"docker-compose.yml is valid, and"*"will change nothing"*)
+      echo "  the restore's own Compose check (step 15) agrees: nothing would change" ;;
+    *) fail "the restore did not check the written compose file with Docker Compose (step 15)" ;;
+  esac
+
+  printf '\033[1;32mE2E PASSED (stack-folder): the deleted folder came back with your own compose file and .env, and Compose found nothing to change.\033[0m\n'
+}
+
+# ── case: files-only ─────────────────────────────────────────────────────────
+
+case_files_only() {
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-files-XXXXXX)"
+  local PROJ="dback-e2e-files-$SUFFIX"
+  local DIR="$HOSTDIR/$PROJ"
+  EXTRA_PROJECTS+=("$PROJ")
+  local compose_in_dir=(docker compose -p "$PROJ" --project-directory "$DIR" -f "$DIR/docker-compose.yml")
+
+  step "Stand up a Compose project with a secret-file bind, a data folder and project files"
+  mkdir -p "$DIR/data" "$DIR/scripts"
+  printf 'records-%s\n' "$SUFFIX" > "$DIR/data/records.db"
+  printf 'key-%s' "$SUFFIX" > "$DIR/app.key"
+  chmod 600 "$DIR/app.key"
+  printf '#!/bin/sh\necho maintenance\n' > "$DIR/scripts/maintenance.sh"
+  chmod 755 "$DIR/scripts/maintenance.sh"
+  cat > "$DIR/docker-compose.yml" <<EOF
+services:
+  app:
+    image: alpine
+    command: ["sleep", "600"]
+    volumes:
+      - ./data:/data
+      - ./app.key:/run/secrets/app.key:ro
+EOF
+  printf 'APP_MODE=production\n' > "$DIR/.env"
+  "${compose_in_dir[@]}" up -d --quiet-pull >/dev/null 2>&1 || fail "the test stack did not come up"
+
+  step "Back it up"
+  local CID BID STARTED
+  CID="$(find_container "$PROJ-app-1")"
+  BID="$(backup_and_verify "$CID" "$PROJ-app-1")"
+  echo "  backup id: $BID"
+  STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$PROJ-app-1")"
+
+  step "The disaster: delete the stack folder while the stack keeps running"
+  rm -rf "$DIR"
+
+  step "Restore the stack's files only"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/nodes/local/stacks/$PROJ/restore?files_only=true" >/dev/null
+
+  step "Wait for the files-only restore to finish"
+  local SLOG="" i finished=""
+  for i in $(seq 1 60); do
+    SLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/stack:$PROJ/log" || true)"
+    case "$SLOG" in
+      *"files restored — no service was stopped or changed"*) finished=1; break ;;
+      *'"level":"ERR"'*)
+        printf '%s\n' "$SLOG" | python3 -c "import sys,json;print(chr(10).join('    '+l['level']+' '+l['msg'] for l in json.load(sys.stdin).get('lines',[])[-30:]))" >&2
+        fail "the files-only restore did not succeed" ;;
+    esac
+    echo "  [$i] restoring"
+    sleep 3
+  done
+  [ -n "$finished" ] || fail "the files-only restore did not finish in time"
+
+  step "Assert the files came back and nothing was touched"
+  [ -f "$DIR/docker-compose.yml" ] || fail "the compose file did not come back"
+  grep -q 'APP_MODE=production' "$DIR/.env" || fail "the .env did not come back"
+  [ -x "$DIR/scripts/maintenance.sh" ] || fail "the project's script did not come back"
+  [ -f "$DIR/app.key" ] || fail "the secret-file bind did not come back"
+  [ "$(cat "$DIR/app.key")" = "key-$SUFFIX" ] || fail "the secret-file bind came back with the wrong content"
+  [ "$(stat -c %a "$DIR/app.key")" = "600" ] || fail "the secret-file bind came back as mode $(stat -c %a "$DIR/app.key")"
+  [ ! -e "$DIR/data/records.db" ] || fail "files-only restored data, which only a full restore may do"
+  [ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJ-app-1")" = "$STARTED" ] || fail "files-only restarted the container"
+  case "$SLOG" in
+    *"data folders are gone from the host"*) echo "  the missing data folder was named for a full restore" ;;
+    *) fail "the missing data folder was not reported" ;;
+  esac
+  case "$SLOG" in
+    *"Checked with Docker Compose"*"is valid, and"*"will change nothing"*) echo "  the restored compose file was checked with Docker Compose" ;;
+    *) fail "the files-only restore did not check the compose file with Docker Compose" ;;
+  esac
+
+  printf '\033[1;32mE2E PASSED (files-only): the files came back with the container never stopped, and the missing data was named.\033[0m\n'
+}
+
 # ── case: pg-hash ────────────────────────────────────────────────────────────
 #
 # #18's content baseline, and R4 §31's rule for computing it.
@@ -284,8 +595,12 @@ insert into docs(title,added,modified,due,price) values
 create table keyless(a text, b int);
 insert into keyless values ('x',1),('y',2);"
 
-  step "Stand up a source PostgreSQL (no TZ) and seed it"
-  docker run -d --name "$SRC" -e POSTGRES_PASSWORD=e2e postgres:16-alpine >/dev/null
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-pg-XXXXXX)"
+  mkdir -p "$HOSTDIR/src-init" "$HOSTDIR/dst-init"
+  printf 'select 1;\n' > "$HOSTDIR/src-init/01-init.sql"
+
+  step "Stand up a source PostgreSQL (no TZ), with an init-scripts mount, and seed it"
+  docker run -d --name "$SRC" -e POSTGRES_PASSWORD=e2e -v "$HOSTDIR/src-init":/docker-entrypoint-initdb.d:ro postgres:16-alpine >/dev/null
   for i in $(seq 1 60); do docker exec "$SRC" pg_isready -q 2>/dev/null && break; [ "$i" = 60 ] && fail "source postgres never became ready"; sleep 1; done
   docker exec -i "$SRC" psql -U postgres -q -v ON_ERROR_STOP=1 -c "$seed" >/dev/null || fail "seeding the source failed"
   echo "  source TimeZone: $(docker exec "$SRC" psql -U postgres -Atqc 'show TimeZone')"
@@ -318,11 +633,11 @@ insert into keyless values ('x',1),('y',2);"
   [ "$SRCPROBE" = "null" ] || fail "the capture must never write a healthcheck into the source (now '$SRCPROBE')"
 
   step "Stand up a target PostgreSQL and restore into it"
-  docker run -d --name "$DST" -e POSTGRES_PASSWORD=e2e postgres:16-alpine >/dev/null
+  docker run -d --name "$DST" -e POSTGRES_PASSWORD=e2e -v "$HOSTDIR/dst-init":/docker-entrypoint-initdb.d postgres:16-alpine >/dev/null
   for i in $(seq 1 60); do docker exec "$DST" pg_isready -q 2>/dev/null && break; [ "$i" = 60 ] && fail "target postgres never became ready"; sleep 1; done
   DST_CID="$(find_container "$DST")"
   curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$SRC_BID/restore" \
-    -d "{\"node_id\":\"local\",\"target_id\":\"$DST_CID\",\"volumes\":false,\"database\":true,\"confirm\":true,\"confirm_incompatible\":true}" >/dev/null
+    -d "{\"node_id\":\"local\",\"target_id\":\"$DST_CID\",\"volumes\":true,\"database\":true,\"confirm\":true,\"confirm_incompatible\":true}" >/dev/null
 
   step "Wait for the restored rows to appear"
   for i in $(seq 1 60); do
@@ -352,6 +667,13 @@ insert into keyless values ('x',1),('y',2);"
     *"Content verified before"*) echo "  verdict is labelled pre-start" ;;
     *) fail "the verdict is not the pre-start one" ;;
   esac
+
+  step "Assert the database container's other mount came back (step 24)"
+  # A restore from the dump used to bring back the data and nothing else: the
+  # init-scripts and configuration mounts stayed empty.
+  for i in $(seq 1 20); do [ -f "$HOSTDIR/dst-init/01-init.sql" ] && break; sleep 3; done
+  [ -f "$HOSTDIR/dst-init/01-init.sql" ] || fail "the init-scripts mount was not restored alongside the dump"
+  echo "  init-scripts mount restored"
 
   step "Put the RESTORED cluster in Europe/London — R4 §31's exact configuration"
   docker exec "$DST" psql -U postgres -q -c "ALTER SYSTEM SET TimeZone = 'Europe/London'" >/dev/null
@@ -384,5 +706,8 @@ snapshot_images
 case "$E2E_CASE" in
   sentinel) case_sentinel ;;
   pg-hash)  case_pg_hash ;;
-  *) fail "unknown E2E_CASE '$E2E_CASE' (known: sentinel, pg-hash)" ;;
+  deleted-binds) case_deleted_binds ;;
+  stack-folder) case_stack_folder ;;
+  files-only) case_files_only ;;
+  *) fail "unknown E2E_CASE '$E2E_CASE' (known: sentinel, pg-hash, deleted-binds, stack-folder, files-only)" ;;
 esac

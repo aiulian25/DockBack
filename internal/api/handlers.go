@@ -1696,8 +1696,10 @@ func (s *Server) handleRestoreReadiness(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	// Otherwise verify the image can still be obtained on the node it lives on.
-	cli, err := s.reg.Get(b.NodeID)
+	// Otherwise verify the image can still be obtained on the node the restore
+	// lands on (step 27): a target that cannot reach the registry, through its
+	// egress rules for instance, is the one that matters, not the origin.
+	cli, err := s.reg.Get(sharedNode)
 	if err != nil {
 		resp.Detail = "Node is unreachable, so image availability can't be verified now: " + err.Error()
 		writeJSON(w, http.StatusOK, resp)
@@ -1989,6 +1991,20 @@ type restoreReq struct {
 	// user acknowledges that this backup's LAST VERIFICATION FAILED. Never set by
 	// default, and never inferred — the whole point is that it is a decision.
 	ConfirmUnverified bool `json:"confirm_unverified"`
+	// AllowDifferentImage lets a recreate run the tag's current image when the
+	// image the backup ran is gone (step 22). Set only after the operator chose
+	// it: a newer version on older data can migrate it beyond going back.
+	AllowDifferentImage bool `json:"allow_different_image"`
+	// ConfirmMissingNetworks lets a cross-host restore create, as plain
+	// bridges, shared networks the target does not have (step 27).
+	ConfirmMissingNetworks bool `json:"confirm_missing_networks"`
+	// ConfirmMissingDevices lets a cross-host restore proceed although the
+	// target lacks a device the container needs (step 27).
+	ConfirmMissingDevices bool `json:"confirm_missing_devices"`
+	// FilesOnly puts back only the files a stack keeps on the host — compose,
+	// .env, project files, missing single-file binds — with no container
+	// stopped or changed and nothing that exists overwritten (step 23).
+	FilesOnly bool `json:"files_only"`
 	// PrivateKey is the offline X25519 key for a WRITE-ONLY backup (F86). It is
 	// SECRET: used for this one restore, held in memory, never persisted and never
 	// written to the audit trail or a log line — the audit records only that a key
@@ -2097,6 +2113,17 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 			"verify_failed": true,
 		})
 		return
+	}
+	// Step 23: files-only puts files on the host and changes nothing else, so
+	// it has no copy, no revert and no standalone-volume form. It restores no
+	// volume and no database, which keeps it clear of the gates that guard them.
+	if req.FilesOnly {
+		if req.AsName != "" || req.TestClone || req.Recreate || strings.HasPrefix(b.TargetName, "volume:") {
+			errJSON(w, http.StatusBadRequest, "a files-only restore puts back the stack's files and changes no container, so it cannot be a copy, a revert, or a standalone volume")
+			return
+		}
+		req.Volumes, req.Database = false, false
+		req.ReconstructHost = true // the stack folder is the point; its remembered base directory applies
 	}
 	// F23: a standalone-volume backup restores by recreating the named volume — no
 	// container target, so skip the container-specific validation and gates below.
@@ -2344,7 +2371,31 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	// whether the ORIGINAL stack is at risk, so the two can never disagree about
 	// what is destructive. A request that sets isolated without a name still
 	// overwrites the original, and is treated as in-place accordingly.
-	if !clone && s.restoreStepUpRequired(req.NodeID, b.TargetName) {
+	// Step 27: a device the target verifiably lacks stops the restore before
+	// anything is written, unless the operator says it will be there.
+	if !req.FilesOnly && !req.ConfirmMissingDevices {
+		if missing := s.missingDevicesOn(r.Context(), manifestOf(b), b.NodeID, req.NodeID); len(missing) > 0 {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           fmt.Sprintf("the target machine has no %s, which this container needs; it would be created and then fail to start. Attach the device, or confirm that it will be there.", strings.Join(missing, ", ")),
+				"missing_devices": missing,
+			})
+			return
+		}
+	}
+	// Step 27: a shared network the target lacks would be invented as a plain
+	// bridge and leave the container unreachable. Stop until it exists there, or
+	// the operator accepts the bridge.
+	if !req.FilesOnly && !req.ConfirmMissingNetworks {
+		if missing := s.sharedNetworksMissingOn(r.Context(), manifestOf(b), b.Stack, b.NodeID, req.NodeID); len(missing) > 0 {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":            fmt.Sprintf("the target machine has no %s network, which this container joins but its stack does not own (a proxy network, say). DockBack would create it as a plain bridge, cutting the container off from what it reaches through it. Create it on the target as it should be, or confirm the plain bridge.", strings.Join(missing, ", ")),
+				"missing_networks": missing,
+			})
+			return
+		}
+	}
+	// Files-only overwrites nothing, so it needs no fresh proof of the password.
+	if !clone && !req.FilesOnly && s.restoreStepUpRequired(req.NodeID, b.TargetName) {
 		if !s.requireFreshAuth(w, r, req.stepUpBody) {
 			return
 		}
@@ -2517,8 +2568,10 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 			BackupID: id, NodeID: req.NodeID, TargetID: req.TargetID,
 			Volumes: req.Volumes, Database: req.Database, Source: req.Source,
 			Snapshot: req.Snapshot, Recreate: req.Recreate, PromoteRestartPolicy: req.PromoteRestartPolicy,
-			InjectHealthchecks: req.InjectHealthchecks,
-			AsName:             req.AsName, Isolated: req.Isolated,
+			AllowDifferentImage: req.AllowDifferentImage,
+			FilesOnly:           req.FilesOnly,
+			InjectHealthchecks:  req.InjectHealthchecks,
+			AsName:              req.AsName, Isolated: req.Isolated,
 			TestCloneTTL:    time.Duration(testCloneTTL) * time.Hour,
 			ReconstructHost: req.ReconstructHost, HostBaseDir: baseDir,
 			RemapFromIP: remapFrom, RemapToIP: remapTo,

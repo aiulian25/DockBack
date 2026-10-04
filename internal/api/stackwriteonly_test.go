@@ -518,3 +518,38 @@ func TestStackRestorePlanMissingMembersIsNeverNull(t *testing.T) {
 		t.Errorf(`want "missing_members":[] on a covered stack, got: %s`, body)
 	}
 }
+
+// commafeed was restored without its database: the dialog warned, the server
+// went ahead. A member with no backup now stops the restore until the caller
+// confirms it, so no client can leave one out silently.
+func TestStackRestoreRefusesMissingMembersUnlessConfirmed(t *testing.T) {
+	s := stackKeyServer(t)
+	mkStackMember(t, s, "b-app", "n1", "commafeed", "app", "commafeed-app")
+	seedInventory(t, s, "n1", []*dockercli.Container{
+		{ID: "c1", Name: "commafeed-app", Stack: "commafeed", Service: "app"},
+		{ID: "c2", Name: "commafeed-postgresql", Stack: "commafeed", Service: "postgresql"},
+	})
+	r := httptest.NewRequest("POST", "/api/nodes/n1/stacks/commafeed/restore", nil)
+	r.SetPathValue("id", "n1")
+	r.SetPathValue("project", "commafeed")
+	rec := httptest.NewRecorder()
+	s.handleRestoreStack(rec, r)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "postgresql") {
+		t.Fatalf("an unconfirmed restore missing a member must be refused, naming it: %d %s", rec.Code, rec.Body.String())
+	}
+	if !s.locks.acquireRestore(stackKey("n1", "commafeed", "")) {
+		t.Fatal("a refusal must not leave the stack locked")
+	}
+}
+
+func TestMissingMembersRefusal(t *testing.T) {
+	if missingMembersRefusal(nil, false) != "" {
+		t.Error("a complete stack needs no confirmation")
+	}
+	if missingMembersRefusal([]string{"postgresql"}, true) != "" {
+		t.Error("a confirmed gap may proceed")
+	}
+	if got := missingMembersRefusal([]string{"postgresql", "redis"}, false); !strings.Contains(got, "postgresql, redis") {
+		t.Errorf("the refusal must name every missing member: %q", got)
+	}
+}

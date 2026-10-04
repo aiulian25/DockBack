@@ -3,7 +3,10 @@ package backup
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"path"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,12 +60,22 @@ func stackEnvSourcePath(configFiles, workingDir string) string {
 
 // composeHeader explains, in the file itself, that this is a reconstruction.
 const composeHeader = `# docker-compose.yml — reconstructed by DockBack from the container's runtime
-# configuration (docker inspect) at backup time. The original compose file lives
-# on the host and is not reachable through the socket-proxy, so this is a
-# best-effort, FUNCTIONAL equivalent meant for restore-by-hand (see manifest.json).
-# Review before use: image tags, secrets in 'environment', bind-mount paths and
-# 'external' networks may need adjusting for the target host.
+# configuration (docker inspect). When the backup holds your own compose file, a
+# restore writes that as the file Compose runs, and this one beside it.
+# A running container does not record pull_policy, env_file, profiles, build or
+# comments, so none of those are here. Anything else it runs with that this file
+# cannot express is listed under x-dockback-not-written on its service.
+# Review before use: image tags, bind-mount paths and external networks may need
+# adjusting for the target host.
 `
+
+// notWrittenKey lists, on a service, what its container runs with that the
+// reconstruction cannot express. An extension field, so Compose ignores it and
+// it survives the stack merge as data.
+const notWrittenKey = "x-dockback-not-written"
+
+// defaultLogDriver is the driver a daemon uses unless configured otherwise.
+const defaultLogDriver = "json-file"
 
 // composeFromInspect synthesizes a single-service Compose file from a container
 // inspect, satisfying PLAN §0.3 ("Always: Compose files") and §9.3 (open,
@@ -194,6 +207,9 @@ func composeFromInspect(insp types.ContainerJSON, imageRef string, netDefs []Net
 		}
 	}
 	composeHostConfig(service, insp)
+	if notes := notWrittenSettings(insp); len(notes) > 0 {
+		service[notWrittenKey] = notes
+	}
 
 	// Hoisted above the networks emission: the alias filter needs to know this
 	// service's own name, because compose re-registers it and repeating it as an
@@ -223,49 +239,55 @@ func composeFromInspect(insp types.ContainerJSON, imageRef string, netDefs []Net
 	// offline. Those services keep today's behaviour — nothing emitted — and the
 	// API restore reproduces the mode from HostConfig verbatim.
 	nets := networkList(insp)
+	project := cfg.Labels[composeProjectLabel]
+	byName := map[string]NetworkRef{}
+	for _, n := range netDefs {
+		byName[n.Name] = n
+	}
+	keys := make(map[string]string, len(nets))
+	for _, n := range nets {
+		def, recorded := byName[n]
+		keys[n], _ = composeNetworkKey(n, project, def, recorded)
+	}
 	switch {
 	case netMode == "host" || netMode == "none":
 		service["network_mode"] = netMode
 	case len(nets) > 0:
-		service["networks"] = composeServiceNetworks(nets, insp, netDefs, svcName, name, cfg.Hostname)
+		service["networks"] = composeServiceNetworks(nets, keys, insp, netDefs, svcName, name, cfg.Hostname)
 	}
 
 	doc := map[string]any{
-		"services": map[string]any{svcName: service},
+		"services": map[string]any{svcName: escapeDollars(service)},
 	}
-	// Declare each attached network. With a recorded definition (F89) the real
-	// subnet and flags are emitted, so `docker compose up` on a fresh host
-	// reproduces the topology rather than inventing a default bridge. Without one
-	// (a legacy backup) they stay `external: true` — referenced, not recreated —
-	// which is the only safe assumption when nothing about them is known.
+	// Declare each attached network: the stack's own with its recorded subnet and
+	// flags (F89), so `docker compose up` on a fresh host reproduces the
+	// topology; one it joins as external, by name; and one a legacy backup
+	// recorded nothing about as bare external, the only safe assumption.
 	if len(nets) > 0 && netMode != "host" && netMode != "none" {
-		byName := map[string]NetworkRef{}
-		for _, n := range netDefs {
-			byName[n.Name] = n
-		}
 		decl := map[string]any{}
 		for _, n := range nets {
-			def, ok := byName[n]
-			if !ok || (def.Subnet == "" && !def.Internal && def.Driver == "") {
-				decl[n] = map[string]any{"external": true}
-				continue
+			def, recorded := byName[n]
+			switch key, owned := composeNetworkKey(n, project, def, recorded); {
+			case owned:
+				decl[key] = ownedNetworkDecl(n, project, key, def)
+			case recorded:
+				decl[key] = map[string]any{"external": true, "name": n}
+			default:
+				decl[key] = map[string]any{"external": true}
 			}
-			d := map[string]any{}
-			if def.Driver != "" {
-				d["driver"] = def.Driver
-			}
-			if def.Internal {
-				d["internal"] = true
-			}
-			if def.Attachable {
-				d["attachable"] = true
-			}
-			if pools := composePools(def); len(pools) > 0 {
-				d["ipam"] = map[string]any{"config": pools}
-			}
-			decl[n] = d
 		}
 		doc["networks"] = decl
+	}
+	// Every named volume is declared, or Compose refuses the file with "refers to
+	// undefined volume". External, by its real name: after a restore the data is
+	// already in it, and a project-scoped declaration would make Compose look for
+	// "<project>_<name>" instead.
+	if vols := namedVolumes(insp); len(vols) > 0 {
+		decl := make(map[string]any, len(vols))
+		for _, v := range vols {
+			decl[v] = map[string]any{"external": true, "name": v}
+		}
+		doc["volumes"] = decl
 	}
 
 	body, err := yaml.Marshal(doc)
@@ -393,6 +415,18 @@ func composeHostConfig(service map[string]any, insp types.ContainerJSON) {
 	if hc.NanoCPUs > 0 {
 		set("cpus", strconv.FormatFloat(float64(hc.NanoCPUs)/1e9, 'f', -1, 64))
 	}
+	if hc.CPUQuota > 0 {
+		set("cpu_quota", hc.CPUQuota)
+	}
+	if hc.CPUPeriod > 0 {
+		set("cpu_period", hc.CPUPeriod)
+	}
+	if hc.PidsLimit != nil && *hc.PidsLimit > 0 {
+		set("pids_limit", *hc.PidsLimit)
+	}
+	if devices := composeDeviceRequests(hc.DeviceRequests); len(devices) > 0 {
+		set("deploy", map[string]any{"resources": map[string]any{"reservations": map[string]any{"devices": devices}}})
+	}
 	if hc.CPUShares > 0 {
 		set("cpu_shares", hc.CPUShares)
 	}
@@ -468,6 +502,65 @@ func composeHostConfig(service map[string]any, insp types.ContainerJSON) {
 			set("stop_grace_period", fmt.Sprintf("%ds", *insp.Config.StopTimeout))
 		}
 	}
+}
+
+// composeDeviceRequests renders GPU and other device requests the way Compose
+// takes them. Docker's capabilities are alternatives (any one set satisfies the
+// request) and Compose takes a single set, so only the first is written; the
+// rest are listed by notWrittenSettings.
+func composeDeviceRequests(requests []container.DeviceRequest) []map[string]any {
+	out := make([]map[string]any, 0, len(requests))
+	for _, r := range requests {
+		d := map[string]any{}
+		if r.Driver != "" {
+			d["driver"] = r.Driver
+		}
+		switch {
+		case r.Count < 0:
+			d["count"] = "all"
+		case r.Count > 0:
+			d["count"] = r.Count
+		}
+		if len(r.DeviceIDs) > 0 {
+			d["device_ids"] = append([]string(nil), r.DeviceIDs...)
+		}
+		if len(r.Capabilities) > 0 {
+			d["capabilities"] = append([]string(nil), r.Capabilities[0]...)
+		}
+		if len(r.Options) > 0 {
+			d["options"] = copyStringMap(r.Options)
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// notWrittenSettings names what the container runs with that the
+// reconstruction does not write, so whoever uses the file can add it back.
+//
+// Logging is listed rather than written: the daemon stamps its own default
+// driver into every inspect, so a written driver could pin a non-choice. Only a
+// driver that is not the usual default, or one with options, is worth a line,
+// and the options are named without their values, which can be tokens.
+func notWrittenSettings(insp types.ContainerJSON) []string {
+	hc := insp.HostConfig
+	if hc == nil {
+		return nil
+	}
+	var out []string
+	if lc := hc.LogConfig; lc.Type != "" && (lc.Type != defaultLogDriver || len(lc.Config) > 0) {
+		note := "logging: driver " + lc.Type
+		if len(lc.Config) > 0 {
+			note += " with options " + strings.Join(slices.Sorted(maps.Keys(lc.Config)), ", ")
+		}
+		out = append(out, note)
+	}
+	for _, r := range hc.DeviceRequests {
+		if len(r.Capabilities) > 1 {
+			out = append(out, fmt.Sprintf("device request: %d alternative capability sets, only the first (%s) is written", len(r.Capabilities), strings.Join(r.Capabilities[0], ", ")))
+		}
+	}
+	return out
 }
 
 // derivedSwapDefault reports whether a swap limit is the one Docker computes on
@@ -593,7 +686,7 @@ func copyStringMap(m map[string]string) map[string]string {
 // one with an address but no recorded subnet can produce a file compose rejects.
 // That is visible and self-describing rather than silent, and the header already
 // says to review before use.
-func composeServiceNetworks(names []string, insp types.ContainerJSON, netDefs []NetworkRef, serviceName, containerName, hostname string) any {
+func composeServiceNetworks(names []string, keys map[string]string, insp types.ContainerJSON, netDefs []NetworkRef, serviceName, containerName, hostname string) any {
 	byName := map[string]NetworkRef{}
 	for _, n := range netDefs {
 		byName[n.Name] = n
@@ -633,12 +726,121 @@ func composeServiceNetworks(names []string, insp types.ContainerJSON, netDefs []
 		if len(entry) > 0 {
 			anyConfig = true
 		}
-		mapped[name] = entry
+		mapped[keys[name]] = entry
 	}
 	if !anyConfig {
-		return names
+		listed := make([]string, 0, len(names))
+		for _, name := range names {
+			listed = append(listed, keys[name])
+		}
+		return listed
 	}
 	return mapped
+}
+
+// Labels Compose writes on what it creates.
+const (
+	composeProjectLabel = "com.docker.compose.project"
+	composeNetworkLabel = "com.docker.compose.network"
+)
+
+// composeNetworkKey is the key a network is declared under in the
+// reconstruction, and whether the stack owns it.
+//
+// Only a network carrying this project's Compose label is the stack's own, and
+// it is declared under the key Compose labelled it with — any other key fails
+// Compose's own check ("incorrect label com.docker.compose.network"). Every
+// other network is one the project joins, so it stays external by its real name.
+// Declaring a joined network as the stack's made Compose create a prefixed copy,
+// `<project>_npm`, on the real one's subnet: the 2026-10-04 recovery's shared networks.
+func composeNetworkKey(name, project string, def NetworkRef, recorded bool) (key string, owned bool) {
+	composeKey := def.Labels[composeNetworkLabel]
+	if !recorded || project == "" || def.Labels[composeProjectLabel] != project || composeKey == "" {
+		return name, false
+	}
+	return composeKey, true
+}
+
+// ownedNetworkDecl declares one of the stack's own networks as recorded. The
+// name is written only when it is not the "<project>_<key>" Compose derives,
+// as when the source compose gave the network an explicit `name:`.
+func ownedNetworkDecl(name, project, key string, def NetworkRef) map[string]any {
+	d := map[string]any{}
+	if name != project+"_"+key {
+		d["name"] = name
+	}
+	if def.Driver != "" {
+		d["driver"] = def.Driver
+	}
+	if def.Internal {
+		d["internal"] = true
+	}
+	if def.Attachable {
+		d["attachable"] = true
+	}
+	if pools := composePools(def); len(pools) > 0 {
+		d["ipam"] = map[string]any{"config": pools}
+	}
+	return d
+}
+
+// namedVolumes lists the volumes the container mounts by name, sorted.
+func namedVolumes(insp types.ContainerJSON) []string {
+	var out []string
+	for _, m := range insp.Mounts {
+		if string(m.Type) == "volume" && m.Name != "" && m.Destination != "" {
+			out = append(out, m.Name)
+		}
+	}
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
+// escapeDollars doubles every `$` in a reconstructed value, so Compose reads it
+// as the literal it was in the running container.
+//
+// Every value here is already resolved. Written verbatim, Compose interpolated
+// them again: hawser's healthcheck lost `$TLS_CERT` and `${PORT}` to blanks, and
+// an `$apr1$` password hash came back mangled. Only DockBack's own `${VAR}`
+// references to the .env are meant to interpolate, and those are added after
+// this. Strings, lists and maps of any depth; keys are left alone, because
+// Compose does not interpolate them.
+func escapeDollars(v any) any {
+	switch t := v.(type) {
+	case string:
+		return strings.ReplaceAll(t, "$", "$$")
+	case []string:
+		out := make([]string, len(t))
+		for i, s := range t {
+			out[i] = strings.ReplaceAll(s, "$", "$$")
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = escapeDollars(e)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(t))
+		for k, s := range t {
+			out[k] = strings.ReplaceAll(s, "$", "$$")
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, e := range t {
+			out[k] = escapeDollars(e)
+		}
+		return out
+	case []map[string]any:
+		out := make([]map[string]any, len(t))
+		for i, e := range t {
+			out[i] = escapeDollars(e).(map[string]any)
+		}
+		return out
+	}
+	return v
 }
 
 // composeAlias reports whether an alias is worth writing into a compose file.
@@ -683,6 +885,7 @@ func composeAlias(a, serviceName, containerName, hostname string) bool {
 func mergeComposeDocs(docs [][]byte) ([]byte, int, error) {
 	services := map[string]any{}
 	networks := map[string]any{}
+	volumes := map[string]any{}
 	for _, raw := range docs {
 		var doc map[string]any
 		if err := yaml.Unmarshal(raw, &doc); err != nil {
@@ -701,6 +904,9 @@ func mergeComposeDocs(docs [][]byte) ([]byte, int, error) {
 				networks[name] = def
 			}
 		}
+		if vols, ok := doc["volumes"].(map[string]any); ok {
+			maps.Copy(volumes, vols)
+		}
 	}
 	if len(services) == 0 {
 		return nil, 0, fmt.Errorf("no services could be read from the stack's recorded compose files")
@@ -709,6 +915,9 @@ func mergeComposeDocs(docs [][]byte) ([]byte, int, error) {
 	doc := map[string]any{"services": services}
 	if len(networks) > 0 {
 		doc["networks"] = networks
+	}
+	if len(volumes) > 0 {
+		doc["volumes"] = volumes
 	}
 	body, err := yaml.Marshal(doc)
 	if err != nil {
@@ -1189,19 +1398,75 @@ func RemapEnvFile(env []byte, fromIP, toIP, fromDomain, toDomain, fromPath, toPa
 	return out, ips, domains, paths
 }
 
-// envKeys lists the KEY names an env file defines, in order, skipping comments
-// and blanks. Pure.
+var (
+	dotenvExportPrefix = regexp.MustCompile(`^export\s+`)
+	dotenvKeyName      = regexp.MustCompile(`^[\p{L}\p{N}_.\-\[\]]+$`)
+)
+
+// dotenvKey is the variable a .env line defines, read the way Compose reads it:
+// an optional `export ` prefix, then a name ending at `=` or `:`. "" for
+// comments, blanks and anything that defines nothing.
+//
+// The merge once split on `=` only, so `export TUNNEL_TOKEN=…` read as a key
+// named "export TUNNEL_TOKEN" — and the generated TUNNEL_TOKEN was appended as
+// a second definition of a key the operator already had.
+//
+// ponytail: line by line, so a multi-line quoted value whose body looks like
+// `NAME=…` reads as a definition. Track quotes if that ever misfires.
+func dotenvKey(line string) string {
+	t := strings.TrimSpace(line)
+	if t == "" || strings.HasPrefix(t, "#") {
+		return ""
+	}
+	t = dotenvExportPrefix.ReplaceAllString(t, "")
+	end := strings.IndexAny(t, "=:")
+	if end < 0 {
+		return ""
+	}
+	key := strings.TrimSpace(t[:end])
+	if !dotenvKeyName.MatchString(key) {
+		return ""
+	}
+	return key
+}
+
+// envKeys lists the KEY names an env file defines, in order. Pure.
 func envKeys(env []byte) []string {
 	var out []string
 	for _, line := range strings.Split(string(env), "\n") {
-		t := strings.TrimSpace(line)
-		if t == "" || strings.HasPrefix(t, "#") {
+		if k := dotenvKey(line); k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// envDuplicate is a variable a .env defines more than once, with the 1-based
+// lines that define it. Compose keeps the last.
+type envDuplicate struct {
+	Key   string
+	Lines []int
+}
+
+// duplicateEnvKeys lists every variable defined more than once, in order of
+// first appearance. Pure.
+func duplicateEnvKeys(env []byte) []envDuplicate {
+	linesByKey := map[string][]int{}
+	var order []string
+	for i, line := range strings.Split(string(env), "\n") {
+		k := dotenvKey(line)
+		if k == "" {
 			continue
 		}
-		if k, _, ok := strings.Cut(t, "="); ok {
-			if k = strings.TrimSpace(k); k != "" {
-				out = append(out, k)
-			}
+		if _, seen := linesByKey[k]; !seen {
+			order = append(order, k)
+		}
+		linesByKey[k] = append(linesByKey[k], i+1)
+	}
+	var out []envDuplicate
+	for _, k := range order {
+		if len(linesByKey[k]) > 1 {
+			out = append(out, envDuplicate{Key: k, Lines: linesByKey[k]})
 		}
 	}
 	return out
@@ -1230,12 +1495,8 @@ func MergeEnvFiles(original, generated []byte) []byte {
 	}
 	var add []string
 	for _, line := range strings.Split(string(generated), "\n") {
-		t := strings.TrimSpace(line)
-		if t == "" || strings.HasPrefix(t, "#") {
-			continue
-		}
-		k, _, ok := strings.Cut(t, "=")
-		if !ok || have[strings.TrimSpace(k)] {
+		k := dotenvKey(line)
+		if k == "" || have[k] {
 			continue
 		}
 		add = append(add, line)

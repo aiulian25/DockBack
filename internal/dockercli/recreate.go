@@ -74,7 +74,11 @@ type CloneOptions struct {
 // nets carries the recorded network topology (F89). Empty for a legacy backup,
 // in which case missing networks are created as plain bridges exactly as before.
 // Returned warnings name anything that could not be honored, for the restore log.
-func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte, imageDigest string, clone *CloneOptions, nets []NetworkSpec) (string, string, []string, error) {
+//
+// allowDifferentImage lets the recreate run the tag's current image when the
+// recorded one cannot be provided; without it that is refused, before anything
+// is removed (see provideRecordedImage).
+func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte, imageDigest string, clone *CloneOptions, nets []NetworkSpec, allowDifferentImage bool) (string, string, []string, error) {
 	var warnings []string
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
@@ -95,6 +99,20 @@ func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte
 		isolate = clone.Isolate
 	}
 
+	// The image first: a recreate refused for want of the recorded image must
+	// leave the existing container where it is.
+	chosen, pulled, imageWarning, err := provideRecordedImage(ctx, c, insp.Image, imageDigest, insp.Config.Image, allowDifferentImage)
+	if err != nil {
+		return "", "", warnings, fmt.Errorf("providing image for %q: %w", name, err)
+	}
+	if imageWarning != "" {
+		warnings = append(warnings, imageWarning)
+	}
+	insp.Config.Image = chosen
+	// #36: only a clone can give an image back — a real restore's image belongs
+	// to the container it recreates and is never anybody's to reclaim.
+	hadImageAlready := isolate && !pulled
+
 	// Remove any existing container with this name (e.g. a corrupted or stale
 	// one from a prior deploy) so ContainerCreate doesn't fail with a name
 	// conflict ("name ... is already in use").
@@ -102,10 +120,6 @@ func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte
 		_ = c.ContainerRemove(ctx, existing, container.RemoveOptions{Force: true})
 	}
 
-	// Provision the image. Prefer one already present locally (e.g. an air-gapped
-	// `docker load` of the saved image.tar the caller did first — PLAN §8.4),
-	// else pull the recorded digest before the tag so a re-pushed tag can't drift
-	// the restored image (PLAN §0.3). Create from the exact reference chosen.
 	// F89: recorded network topology, keyed by name. Empty for a legacy backup —
 	// specFor then returns a bare spec and behaviour is exactly as it was.
 	specByName := map[string]NetworkSpec{}
@@ -118,17 +132,6 @@ func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte
 		}
 		return NetworkSpec{Name: name}
 	}
-
-	candidates := imageRefCandidates(imageDigest, insp.Config.Image)
-	// #36: asked BEFORE anything pulls, because afterwards the answer is gone.
-	// Only a clone can act on it — a real restore's image belongs to the
-	// container it just recreated and is never anybody's to reclaim.
-	hadImageAlready := isolate && anyImagePresent(ctx, c, candidates)
-	chosen, err := ensureImageAvailable(ctx, c, candidates...)
-	if err != nil {
-		return "", "", warnings, fmt.Errorf("providing image for %q: %w", name, err)
-	}
-	insp.Config.Image = chosen
 
 	// A hostname Docker derived from the OLD container's id is not a choice, and
 	// replaying it pins the new container to a name matching a container that no
@@ -409,23 +412,6 @@ func ClonePulledImage(labels map[string]string) string {
 	return strings.TrimSpace(labels[ClonePulledImageLabel])
 }
 
-// anyImagePresent reports whether ANY of the candidate references already
-// resolves locally.
-//
-// Any, not all: ensureImageAvailable takes the first one that is present, so a
-// single hit means nothing was fetched.
-func anyImagePresent(ctx context.Context, c *client.Client, refs []string) bool {
-	for _, ref := range refs {
-		if ref == "" {
-			continue
-		}
-		if _, _, err := c.ImageInspectWithRaw(ctx, ref); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
 // stampClonePulledImage records the resolved image ID on the clone.
 //
 // By ID, because that is the only thing safe to remove later — untagging leaves
@@ -437,21 +423,6 @@ func stampClonePulledImage(ctx context.Context, c *client.Client, insp *types.Co
 		return
 	}
 	applyCloneLabels(insp, map[string]string{ClonePulledImageLabel: img.ID})
-}
-
-// imageRefCandidates lists the image references to try, in priority order, so
-// restore reproduces the IDENTICAL image (PLAN §0.3): the digest-pinned ref
-// (repo@sha256:…) first when recorded, then the original tag for older backups
-// or for an air-gapped image loaded under its tag.
-func imageRefCandidates(digest, tag string) []string {
-	var out []string
-	if strings.Contains(digest, "@sha256:") {
-		out = append(out, digest)
-	}
-	if tag != "" {
-		out = append(out, tag)
-	}
-	return out
 }
 
 // ShortIDAlias reports whether an alias looks like a Docker container short id —

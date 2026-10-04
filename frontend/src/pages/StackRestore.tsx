@@ -15,11 +15,12 @@
 import { useEffect, useRef, useState } from "react";
 import { ipFromNodeAddr } from "../lib/nodeAddress";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ChevronRight, RotateCcw, Loader2, Database, Box, AlertTriangle, Info, Layers, ShieldCheck, Lock, HardDrive } from "lucide-react";
+import { ChevronRight, RotateCcw, Loader2, Database, Box, AlertTriangle, Info, Layers, ShieldCheck, Lock, HardDrive, Download } from "lucide-react";
 import { baseDirInvalid, baseDirProblem } from "../lib/absoluteBase";
-import { api, BindSourcePlan, CrossRestoreDefaults, Node, RestoreCapacity, StackRestorePlan, StepUpError, fmtAgo, fmtBytes } from "../api";
+import { api, RestoreNeedsConfirmError, BindSourcePlan, CrossRestoreDefaults, Node, RestoreCapacity, StackRestorePlan, StepUpError, fmtAgo, fmtBytes } from "../api";
 import { Button, Card, Chip, Select } from "../components/ui";
 import StepUpPrompt from "../components/StepUpPrompt";
+import ExportDownloadButton from "../components/ExportDownloadButton";
 import { readStackRestoreSeed, StackRestoreSeed } from "../lib/stackRestoreSeed";
 import { capacityTone } from "../lib/capacityTone";
 
@@ -35,6 +36,8 @@ export default function StackRestore() {
 
   const [targetNode, setTargetNode] = useState(initial?.targetNode || sourceNodeID);
   const [recreate, setRecreate] = useState(initial?.recreate ?? false);
+  const [allowDifferentImage, setAllowDifferentImage] = useState(false); // step 22
+  const [filesOnly, setFilesOnly] = useState(false); // step 23: the stack's files only, no service touched
   const [snapshot, setSnapshot] = useState(initial?.snapshot ?? true);
   const [group, setGroup] = useState(""); // "" = latest backup of each service
   const [groups, setGroups] = useState<{ id: string; at: number; services: string[]; complete: boolean }[]>([]);
@@ -178,7 +181,7 @@ export default function StackRestore() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceNodeID, project, group, deselected, reconstructHost, hostBaseDir, remapPath, pathFrom, pathTo, targetNode]);
 
-  const start = async (creds?: { password: string; code: string }) => {
+  const start = async (creds?: { password: string; code: string }, confirmed?: { devices?: boolean; networks?: boolean }) => {
     const targetName = nodes.find((n) => n.id === targetNode)?.name || targetNode;
     const n = keptServices.length;
     const total = plan?.services.length || 0;
@@ -188,13 +191,19 @@ export default function StackRestore() {
       : `RESTORE STACK "${project}" — recreate and restore ${scope} in the order shown on node ${targetName}${crossHost ? " (CROSS-HOST — recreating the stack there)" : ""}.`;
     // ALL-services guarantee: a member with no backup CANNOT be recreated —
     // force explicit acknowledgment instead of a quietly incomplete stack.
+    // Step 27: devices the target lacks stop the restore unless confirmed here.
+    const lacking = keptServices.flatMap((sv) => (sv.missing_devices || []).map((d) => `${sv.service}: ${d}`));
+    const devicesNote = lacking.length > 0
+      ? `\n\nThe target machine LACKS devices these services need: ${lacking.join(", ")}. They will be created and then fail to start unless the devices are attached.`
+      : "";
     const gap = skippedLive.length > 0
       ? `\n\nWARNING: ${skippedLive.length} stack member(s) have NO backup and will NOT exist after this restore: ${skippedLive.join(", ")}. Run a stack backup first to cover every service.`
       : "";
     // F210: the destructive confirm is asked ONCE. On a step-up retry the
     // operator has already agreed to it — re-asking would train them to click
     // through the very dialog that carries the warning.
-    if (!creds && !confirm(`${head}${snapshot ? " Current state is snapshotted first." : " No safety snapshot will be taken."}${gap} This is destructive. Continue?`)) return;
+    const filesHead = `RESTORE FILES ONLY for stack "${project}" on node ${targetName} — put back its compose file, .env, project files and any missing single-file binds. No service is stopped or changed, and nothing that exists is overwritten. Continue?`;
+    if (!creds && !confirmed && !confirm(filesOnly ? filesHead : `${head}${snapshot ? " Current state is snapshotted first." : " No safety snapshot will be taken."}${gap}${devicesNote} This is destructive. Continue?`)) return;
     setBusy(true); setErr("");
     try {
       await api.restoreStack(sourceNodeID, project, {
@@ -204,6 +213,11 @@ export default function StackRestore() {
         ...(newSiteAddress.trim() ? { new_site_address: newSiteAddress.trim() } : {}),
         ...(newUpstreamAddress.trim() ? { new_upstream_address: newUpstreamAddress.trim() } : {}),
         ...(group ? { group } : {}),
+        ...(skippedLive.length > 0 ? { confirm_missing: true } : {}),
+        ...(lacking.length > 0 || confirmed?.devices ? { confirm_missing_devices: true } : {}),
+        ...(confirmed?.networks ? { confirm_missing_networks: true } : {}),
+        ...(allowDifferentImage ? { allow_different_image: true } : {}),
+        ...(filesOnly ? { files_only: true } : {}),
         ...(reconstructHost ? { reconstruct_host: true, ...(hostBaseDir.trim() ? { host_base_dir: hostBaseDir.trim() } : {}) } : {}),
         ...(promoteRestart ? { promote_restart_policy: true } : {}),
         ...(injectHealthchecks ? { inject_healthchecks: true } : {}),
@@ -220,6 +234,15 @@ export default function StackRestore() {
       // prove who they are first.
       if (e instanceof StepUpError) {
         setStepUp({ totp: e.totp_required, err: creds ? e.message : "" });
+        return;
+      }
+      // Step 27: the target lacks a device or a shared network. The operator may
+      // know better; say what is missing and let them go ahead.
+      if (e instanceof RestoreNeedsConfirmError) {
+        setBusy(false);
+        if (confirm(`The target machine lacks: ${[...e.devices, ...e.networks].join(", ")}\n\n${e.message}\n\nRestore anyway?`)) {
+          return start(creds, { devices: confirmed?.devices || e.devices.length > 0, networks: confirmed?.networks || e.networks.length > 0 });
+        }
         return;
       }
       setErr((e as Error).message);
@@ -303,7 +326,19 @@ export default function StackRestore() {
           <span className="ml-auto text-sm text-on-surface-variant">
             source catalog: <b className="text-on-surface">{nodes.find((n) => n.id === sourceNodeID)?.name || sourceNodeID}</b>
           </span>
+          <ExportDownloadButton icon={<Download size={15} />} label="Download stack"
+            request={async (password, code) => api.stackDownloadURL(sourceNodeID, project, (await api.stackExportGrant(sourceNodeID, project, password, code)).ticket)}
+            title="Every service's newest backup, decrypted, in one zip. Confirms your password first." />
         </div>
+        {filesOnly ? (
+          <div className="mt-4 flex items-start gap-2.5 rounded border border-secondary/40 bg-secondary/10 px-3 py-2.5 text-sm text-secondary">
+            <Info size={16} className="mt-0.5 shrink-0" />
+            <p className="min-w-0 break-words">
+              <b>Files only.</b> The stack&apos;s files are put back on <b>{targetName}</b>; no service is stopped or changed,
+              and nothing that exists is overwritten. Nothing runs until you confirm at the bottom.
+            </p>
+          </div>
+        ) : (
         <div className="mt-4 flex items-start gap-2.5 rounded border border-error/40 bg-error/10 px-3 py-2.5 text-sm text-error">
           <AlertTriangle size={16} className="mt-0.5 shrink-0" />
           <p className="min-w-0 break-words">
@@ -311,6 +346,7 @@ export default function StackRestore() {
             databases are overwritten from the backup. Nothing runs until you confirm at the bottom.
           </p>
         </div>
+        )}
       </Card>
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
@@ -561,10 +597,20 @@ export default function StackRestore() {
               </div>
             )}
 
+            {/* Step 23: the folder is gone, the services still run. */}
+            <label className="mb-2 flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
+              <input type="checkbox" className="mt-0.5 shrink-0" checked={filesOnly} onChange={(e) => { setFilesOnly(e.target.checked); if (e.target.checked) setRecreate(false); }} />
+              <span className="min-w-0 break-words"><span className="font-medium text-on-surface">Files only</span> — put back the stack&apos;s compose file, .env, project files and any missing single-file binds. No service is stopped or changed, and nothing that exists is overwritten. For a deleted stack folder while the services still run.</span>
+            </label>
+
             {/* Revert + snapshot. */}
             <label className="mb-2 flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
-              <input type="checkbox" className="mt-0.5 shrink-0" checked={recreate} onChange={(e) => setRecreate(e.target.checked)} />
+              <input type="checkbox" className="mt-0.5 shrink-0" checked={recreate} disabled={filesOnly} onChange={(e) => setRecreate(e.target.checked)} />
               <span className="min-w-0 break-words"><span className="font-medium text-on-surface">Revert update</span> — recreate each service from its backup's saved image (digest-pinned when recorded), rolling a broken upgrade back to the backed-up version.</span>
+            </label>
+            <label className="mb-2 flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
+              <input type="checkbox" className="mt-0.5 shrink-0" checked={allowDifferentImage} onChange={(e) => setAllowDifferentImage(e.target.checked)} />
+              <span className="min-w-0 break-words"><span className="font-medium text-on-surface">Allow a newer image</span> — if a service&apos;s backed-up image is gone from this host and its registry, recreate it from the tag&apos;s current image instead of stopping. Leave off unless you mean it: a newer version can migrate older data beyond going back.</span>
             </label>
             <label className="mb-2 flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
               <input type="checkbox" className="mt-0.5 shrink-0" checked={snapshot} onChange={(e) => setSnapshot(e.target.checked)} />
@@ -574,7 +620,7 @@ export default function StackRestore() {
             {/* Host reconstruction + remaps (parity with the per-backup drawer). */}
             <label className="mb-2 flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
               <input type="checkbox" className="mt-0.5 shrink-0" checked={reconstructHost} onChange={(e) => setReconstructHost(e.target.checked)} />
-              <span className="min-w-0 break-words"><span className="font-medium text-on-surface">Reconstruct stack folder on host</span> — rebuild each service's on-host directory and write the reconstructed compose file back, so a fresh machine gets the organized layout, not just containers.</span>
+              <span className="min-w-0 break-words"><span className="font-medium text-on-surface">Reconstruct stack folder on host</span> — rebuild the stack's on-host directory and write your own compose file and .env from the backup back into it (a reconstruction when the backup has none), so a fresh machine gets the organized layout, not just containers.</span>
             </label>
             {reconstructHost && partial && (
               <p className="mb-2 break-words rounded bg-warning/10 px-3 py-2 text-xs text-warning">

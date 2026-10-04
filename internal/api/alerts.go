@@ -253,6 +253,8 @@ func (s *Server) alertMonitorTick() {
 	s.checkKeyEscrowAlert()
 	s.checkDestinationsFull()
 	s.checkProxyTrustAlert()
+	s.checkCoverageAlerts(time.Now())
+	s.checkAppBackupAlert(time.Now())
 }
 
 // checkProxyTrustAlert warns while X-Forwarded-* is trusted from EVERY peer —

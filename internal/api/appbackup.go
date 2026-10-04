@@ -172,6 +172,9 @@ func (s *Server) snapshotMeta(dst string) (appbackup.Entry, error) {
 // identical, verified snapshot. actor is the audit attribution (a username, or
 // "scheduler" for an automatic run).
 func (s *Server) createAppBackup(actor string) (appbackup.Entry, error) {
+	// Read before the snapshot: a change landing during it is newer than the
+	// mark, so it triggers the next backup instead of being assumed covered.
+	covered, _ := s.store.MaxAuditID()
 	snap := filepath.Join(s.cfg.TmpDir, fmt.Sprintf("cfgsnap-%d.db", time.Now().UnixNano()))
 	defer os.Remove(snap)
 	meta, err := s.snapshotMeta(snap)
@@ -183,6 +186,7 @@ func (s *Server) createAppBackup(actor string) (appbackup.Entry, error) {
 		return appbackup.Entry{}, fmt.Errorf("write backup: %w", err)
 	}
 	_ = s.store.Audit(actor, "app.backup.create", entry.File, "")
+	s.setAppBackupConfigMark(covered)
 	return entry, nil
 }
 
@@ -353,10 +357,13 @@ func (a appBackupSchedule) toSchedule() Schedule {
 	return Schedule{Enabled: a.Enabled, Kind: a.Kind, Time: a.Time, Weekday: a.Weekday, Monthday: a.Monthday}
 }
 
-// loadAppBackupSchedule reads the schedule (JSON blob), applying sane defaults so
-// a fresh install renders a sensible weekly default without firing until enabled.
+// loadAppBackupSchedule reads the schedule (JSON blob). With none stored, the
+// default is ON: weekly, keeping 7, pushed to an off-machine destination when
+// one is set. It used to be off, and in the 2026-10-04 recovery DockBack's own
+// newest backup was five weeks old while the folder holding its key was gone.
+// A schedule the operator saved, including one switched off, is kept as saved.
 func (s *Server) loadAppBackupSchedule() appBackupSchedule {
-	a := appBackupSchedule{Kind: "weekly", Time: "04:00", Weekday: 0, Monthday: 1, Keep: 7}
+	a := appBackupSchedule{Enabled: true, Kind: "weekly", Time: "04:00", Weekday: 0, Monthday: 1, Keep: 7, PushExternal: true}
 	if js, _ := s.store.GetSetting(appBackupScheduleKey, ""); js != "" {
 		_ = json.Unmarshal([]byte(js), &a)
 	}
@@ -378,13 +385,13 @@ func (s *Server) startAppBackupSchedule() {
 		t := time.NewTicker(appBackupTickInterval)
 		defer t.Stop()
 		for range t.C {
-			s.appBackupTick()
+			s.appBackupTick(time.Now())
 			s.appBackupDrillTick() // F58: periodic integrity drill of the newest app-backup
 		}
 	}()
 }
 
-func (s *Server) appBackupTick() {
+func (s *Server) appBackupTick(now time.Time) {
 	a := s.loadAppBackupSchedule()
 	if !a.Enabled {
 		return
@@ -392,14 +399,15 @@ func (s *Server) appBackupTick() {
 	lrStr, _ := s.store.GetSetting(appBackupLastRunKey, "0")
 	lastRun, _ := strconv.ParseInt(lrStr, 10, 64)
 	if lastRun == 0 {
-		// First enable: baseline now so we fire at the NEXT scheduled time, not
-		// immediately (matches the container scheduler).
-		_ = s.store.SetSetting(appBackupLastRunKey, strconv.FormatInt(time.Now().Unix(), 10))
+		// First activation: one backup now, so an install that has never had one
+		// is covered today rather than at the next weekly window.
+		_ = s.store.SetSetting(appBackupLastRunKey, strconv.FormatInt(now.Unix(), 10))
+		s.runAppBackup(a)
 		return
 	}
-	now := time.Now()
 	fire, _, _ := scheduleDue(a.toSchedule(), time.Unix(lastRun, 0), now, scheduleMissThreshold)
 	if !fire {
+		s.appBackupAfterConfigChange(a, now)
 		return
 	}
 	// Catch up at most one window (no stampede): advance last_run to now.
@@ -414,6 +422,8 @@ func (s *Server) runAppBackup(a appBackupSchedule) {
 	entry, err := s.createAppBackup("scheduler")
 	if err != nil {
 		s.logSink("app-backup", "ERR", "Scheduled application backup failed: "+err.Error())
+		s.notify(notify.KindAppBackupFailed, "DockBack could not back itself up",
+			"The scheduled application backup failed: "+err.Error()+". This is the backup that brings back DockBack's catalog, settings and nodes if its own data is lost.")
 		return
 	}
 	s.logSink("app-backup", "INFO", fmt.Sprintf("Scheduled application backup created: %s", entry.File))
@@ -430,9 +440,15 @@ func (s *Server) runAppBackup(a appBackupSchedule) {
 		fname, pushed, failed, perr := s.appExternalBackupCore(ctx)
 		switch {
 		case perr == errNoEnabledAppDest:
-			s.logSink("app-backup", "WARN", "Push to external requested but no enabled external destination — skipped")
+			s.logSink("app-backup", "INFO", "No off-machine destination is set for the application backup, so it stays on this machine — add one under Settings → Advanced → Application Backup & Restore → External destinations")
 		case perr != nil:
 			s.logSink("app-backup", "ERR", "Scheduled external push failed: "+perr.Error())
+			s.notify(notify.KindAppBackupFailed, "DockBack's own backup did not leave this machine",
+				"The application backup was made, but pushing it off this machine failed: "+perr.Error()+". Until a push succeeds, losing this machine loses DockBack's catalog with it.")
+		case len(failed) > 0:
+			s.logSink("app-backup", "WARN", fmt.Sprintf("Pushed %s to %d external destination(s), %d failed", fname, len(pushed), len(failed)))
+			s.notify(notify.KindAppBackupFailed, "DockBack's own backup missed a destination",
+				fmt.Sprintf("The application backup reached %d destination(s) but not %d: %s.", len(pushed), len(failed), failedDestinations(failed)))
 		default:
 			s.logSink("app-backup", "INFO", fmt.Sprintf("Pushed %s to %d external destination(s)%s", fname, len(pushed), func() string {
 				if len(failed) > 0 {

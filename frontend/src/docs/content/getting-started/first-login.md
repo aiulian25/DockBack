@@ -8,6 +8,17 @@ Open DockBack in your browser at the address and port you mapped in `docker-comp
 
 If you set `DOCKBACK_ADMIN_PASSWORD` for the first run, it has to meet the minimum password length (12 characters by default). A shorter one is refused and a strong password is generated in its place, printed in the container logs alongside the reason. That variable is only read when there is no account yet — changing it later does not change your password.
 
+## What a new install turns on
+
+The first time DockBack starts, with a database it has just created, it turns on protection instead of waiting to be asked:
+
+- a **weekly backup of this machine** (Sunday 03:00), when DockBack can see the local Docker;
+- a **weekly scrub**, which re-verifies stored backups, and a **monthly restore drill**;
+- **retention** of 7 daily, 4 weekly and 3 monthly backups, plus the newest 3, with **auto-prune** on;
+- the **weekly backup of DockBack itself** (Settings → Advanced → Application Backup & Restore).
+
+The container log lists what was turned on. Change any of it in Settings. An existing installation is never changed: these defaults apply only to a database DockBack creates.
+
 ## Sessions & automatic sign-out
 
 To limit the window an unattended or stolen session stays usable, sign-in is time-bounded two ways:

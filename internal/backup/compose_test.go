@@ -951,3 +951,171 @@ func TestContainerOwnEnv(t *testing.T) {
 		}
 	})
 }
+
+// The 2026-10-04 recovery: reconstructions re-declared shared networks as the stack's
+// own, so Compose made `<project>_npm` on the real network's subnet. Only a
+// network with this project's label belongs to the stack, under the key Compose
+// labelled it with; every other one is joined, as external.
+func TestReconstructionKeepsSharedNetworksShared(t *testing.T) {
+	insp := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{Name: "/myproj-web-1", HostConfig: &container.HostConfig{}},
+		Config: &container.Config{
+			Image:  "alpine",
+			Labels: map[string]string{"com.docker.compose.project": "myproj", "com.docker.compose.service": "web"},
+		},
+		NetworkSettings: &types.NetworkSettings{Networks: map[string]*network.EndpointSettings{
+			"myproj_default": {}, "cloudflare": {}, "npm": {}, "otherproj_shared": {},
+		}},
+	}
+	own := func(key string) map[string]string {
+		return map[string]string{"com.docker.compose.project": "myproj", "com.docker.compose.network": key}
+	}
+	netDefs := []NetworkRef{
+		{Name: "myproj_default", Driver: "bridge", Subnet: "172.29.0.0/16", Labels: own("default")},
+		{Name: "cloudflare", Driver: "bridge", Subnet: "172.30.0.0/16", Labels: own("cloudflare")},
+		{Name: "npm", Driver: "bridge", Subnet: "172.31.0.0/16"},
+		{Name: "otherproj_shared", Driver: "bridge", Subnet: "172.28.0.0/16",
+			Labels: map[string]string{"com.docker.compose.project": "otherproj", "com.docker.compose.network": "shared"}},
+	}
+	out, err := composeFromInspect(insp, "alpine", netDefs, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Services map[string]struct {
+			Networks []string `yaml:"networks"`
+		} `yaml:"services"`
+		Networks map[string]map[string]any `yaml:"networks"`
+	}
+	if err := yaml.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if got := fmt.Sprint(doc.Services["web"].Networks); got != "[cloudflare default npm otherproj_shared]" {
+		t.Errorf("the service must refer to each network by its declared key, got %s", got)
+	}
+	if def := doc.Networks["default"]; def["name"] != nil || def["external"] != nil || def["driver"] != "bridge" {
+		t.Errorf("the project's default network is its own, declared under `default`: %v", def)
+	}
+	if def := doc.Networks["cloudflare"]; def["name"] != "cloudflare" || def["external"] != nil {
+		t.Errorf("an owned network with an explicit name keeps it, or Compose prefixes it: %v", def)
+	}
+	for _, joined := range []string{"npm", "otherproj_shared"} {
+		def := doc.Networks[joined]
+		if def["external"] != true || def["name"] != joined || def["ipam"] != nil {
+			t.Errorf("%s is not the stack's, so it must be external by its real name: %v", joined, def)
+		}
+	}
+	if _, prefixed := doc.Networks["myproj_default"]; prefixed {
+		t.Errorf("declaring the real name makes Compose prefix it again: %v", doc.Networks)
+	}
+}
+
+// Without a top-level declaration Compose refuses the file: "refers to undefined
+// volume".
+func TestReconstructionDeclaresNamedVolumes(t *testing.T) {
+	insp := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{Name: "/app", HostConfig: &container.HostConfig{}},
+		Config:            &container.Config{Image: "alpine"},
+		Mounts: []types.MountPoint{
+			{Type: "volume", Name: "myproj_data", Destination: "/data", RW: true},
+			{Type: "volume", Name: "myproj_data", Destination: "/again", RW: true},
+			{Type: "bind", Source: "/srv/config", Destination: "/config", RW: true},
+		},
+	}
+	out, err := composeFromInspect(insp, "alpine", nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Volumes map[string]map[string]any `yaml:"volumes"`
+	}
+	if err := yaml.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Volumes) != 1 || doc.Volumes["myproj_data"]["external"] != true || doc.Volumes["myproj_data"]["name"] != "myproj_data" {
+		t.Errorf("each named volume once, external by its real name, binds not at all: %v", doc.Volumes)
+	}
+}
+
+// Every value is already resolved, so a `$` in it is literal. Written verbatim,
+// Compose interpolated it: hawser's healthcheck lost `$TLS_CERT` and `${PORT}`,
+// and an `$apr1$` hash came back mangled.
+func TestReconstructionEscapesDollars(t *testing.T) {
+	insp := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{Name: "/hawser", HostConfig: &container.HostConfig{}},
+		Config: &container.Config{
+			Image:  "alpine",
+			Env:    []string{"HASH=$apr1$abc$def", "DB_PASSWORD=plain"},
+			Cmd:    []string{"sh", "-c", "echo $HOME"},
+			Labels: map[string]string{"traefik.http.middlewares.auth.basicauth.users": "me:$apr1$x$y"},
+			Healthcheck: &container.HealthConfig{
+				Test: []string{"CMD-SHELL", "curl --cert $TLS_CERT https://localhost:${PORT}"},
+			},
+		},
+	}
+	out, err := composeFromInspect(insp, "alpine", nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`$$apr1$$abc$$def`, `echo $$HOME`, `me:$$apr1$$x$$y`, `--cert $$TLS_CERT https://localhost:$${PORT}`} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	// DockBack's own references to the .env are the only thing left to
+	// interpolate, and they are added after the escaping.
+	compose, env, moved := splitComposeSecrets(out)
+	if moved != 1 || !strings.Contains(string(compose), "${DB_PASSWORD}") || !strings.Contains(string(env), "DB_PASSWORD=plain") {
+		t.Errorf("the plain secret must move to the .env as ${DB_PASSWORD} (moved %d):\n%s\n%s", moved, compose, env)
+	}
+}
+
+// What Compose can express is written; what it cannot is named on the service,
+// so a reconstruction never quietly describes a lesser container.
+func TestReconstructionKeepsOrListsWhatItCannotDrop(t *testing.T) {
+	pids := int64(200)
+	insp := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{Name: "/gpu-app", HostConfig: &container.HostConfig{
+			Resources: container.Resources{
+				CPUQuota: 50000, CPUPeriod: 100000, PidsLimit: &pids,
+				DeviceRequests: []container.DeviceRequest{{Driver: "nvidia", Count: -1, Capabilities: [][]string{{"gpu"}}}},
+			},
+			LogConfig: container.LogConfig{Type: "splunk", Config: map[string]string{"splunk-token": "s3cret", "splunk-url": "https://x"}},
+		}},
+		Config: &container.Config{Image: "alpine"},
+	}
+	out, err := composeFromInspect(insp, "alpine", nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Services map[string]map[string]any `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	svc := doc.Services["gpu-app"]
+	if svc["cpu_quota"] != 50000 || svc["cpu_period"] != 100000 || svc["pids_limit"] != 200 {
+		t.Errorf("CPU quota, period and pids limit must be written: %v", svc)
+	}
+	devices := fmt.Sprint(svc["deploy"])
+	for _, want := range []string{"driver:nvidia", "count:all", "capabilities:[gpu]"} {
+		if !strings.Contains(devices, want) {
+			t.Errorf("the GPU request must be written (%s missing): %s", want, devices)
+		}
+	}
+	notes := fmt.Sprint(svc[notWrittenKey])
+	if !strings.Contains(notes, "logging: driver splunk with options splunk-token, splunk-url") {
+		t.Errorf("a non-default logging driver must be named: %s", notes)
+	}
+	if strings.Contains(string(out), "s3cret") {
+		t.Errorf("a logging option's value can be a token and must never be written:\n%s", out)
+	}
+
+	plain := insp
+	plain.HostConfig = &container.HostConfig{LogConfig: container.LogConfig{Type: "json-file"}}
+	out, _ = composeFromInspect(plain, "alpine", nil, nil, nil)
+	if strings.Contains(string(out), notWrittenKey+":") {
+		t.Errorf("the daemon's usual default driver is not worth a note:\n%s", out)
+	}
+}

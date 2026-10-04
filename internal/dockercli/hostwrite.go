@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,6 +29,12 @@ const hostReconstructMount = "/dockback-host"
 // produces a file nothing reads.
 var standardComposeNames = []string{
 	"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml",
+}
+
+// IsDefaultComposeName reports whether `docker compose` reads a file of this
+// name on its own, with no -f.
+func IsDefaultComposeName(name string) bool {
+	return slices.Contains(standardComposeNames, name)
 }
 
 // displacedSuffix marks the copy of an existing compose file that a
@@ -99,29 +106,26 @@ func ForbiddenHostRoot(p string) bool {
 	return false
 }
 
-// asideSuffix marks a file restored FROM the backup that is deliberately not the
-// canonical one (F57). The reconstruction keeps the name `docker compose` reads,
-// because it describes the containers as they were just restored; the captured
-// original describes the SOURCE machine and may reference env_file targets,
-// relative paths or profiles that do not exist here. Both are on disk; only one
-// of them is safe to run unread, and that is the one that keeps its name.
+// asideSuffix marks a captured original compose file that is deliberately NOT
+// the one `docker compose` reads (F57). That is only the case when the backup
+// holds no original under the stack's own compose name, so the reconstruction
+// has to take that name and the captured files can only sit beside it.
 const asideSuffix = ".original-from-backup"
 
-// NamedFile is one extra file to place beside the compose file — the genuine
-// host compose file(s) captured at backup time.
+// NamedFile is one file to place beside the compose file, under exactly Name.
 type NamedFile struct {
-	Name    string // archive basename, e.g. "docker-compose.yml"
+	Name    string
 	Content []byte
 }
 
-// asideName renders the non-canonical name a captured original is written under,
+// AsideName renders the non-canonical name a captured original is written under,
 // or "" when the basename is not one we are willing to put on a host.
 //
 // Reuses safeComposeName's grammar so a crafted archive entry can never reach
 // the shell or escape the directory: anything outside the safe-component
 // alphabet collapses to the default, and the suffix is appended after that.
 // Pure, so the rule is unit-testable.
-func asideName(base string) string {
+func AsideName(base string) string {
 	b := strings.TrimSpace(base)
 	if b == "" || b == "." || b == ".." || !safeHostComponent.MatchString(b) {
 		return ""
@@ -143,11 +147,11 @@ type HostReconstructResult struct {
 	// Displaced is the absolute path the previous compose file was renamed to,
 	// empty when there was nothing there or when it already matched (F176).
 	Displaced string
-	// Originals are the absolute paths of the genuine host compose file(s)
-	// restored from the backup alongside the reconstruction (F57), each under
-	// asideSuffix so neither `docker compose` nor a reader mistakes one for the
-	// canonical file. Empty when the backup carried none.
-	Originals []string
+	// Beside are the absolute paths of the files written next to the compose
+	// file under their own names, and BesideDisplaced where the different files
+	// that held those names were renamed to.
+	Beside          []string
+	BesideDisplaced []string
 	// Unchanged is true when a compose file was already present and byte-identical
 	// to the reconstruction, so nothing was written or renamed. Re-running a
 	// restore has to converge, not accumulate a .bak per attempt.
@@ -296,7 +300,14 @@ func WriteHostFile(ctx context.Context, c *client.Client, hostPath string, conte
 			return fmt.Errorf("setting mode %s on %s: %w", mode, hostPath, cerr)
 		}
 	}
-	if _, merr := ExecCapture(ctx, c, created.ID, []string{"mv", "-f", staging, target}); merr != nil {
+	// When the source of a file bind goes missing, Docker recreates it as an
+	// empty DIRECTORY the next time the container starts — and `mv` would then
+	// drop the file inside it instead of replacing it. An empty directory there is
+	// that artefact and nothing else, so it is removed; a directory with anything
+	// in it is someone's data and is refused instead.
+	place := "if [ -d " + shQuote(target) + " ]; then rmdir " + shQuote(target) +
+		" || { echo 'a non-empty directory is in the way' >&2; exit 3; }; fi; mv -f " + shQuote(staging) + " " + shQuote(target)
+	if _, merr := ExecCapture(ctx, c, created.ID, []string{"sh", "-c", place}); merr != nil {
 		_, _ = ExecCapture(ctx, c, created.ID, []string{"rm", "-f", staging})
 		return fmt.Errorf("putting %s into place: %w", hostPath, merr)
 	}
@@ -339,16 +350,17 @@ func ReconstructStackDir(ctx context.Context, c *client.Client, stackDir, compos
 // only when the parent reads as root — which is what a parent Docker created a
 // moment ago always reads as. Empty keeps the original behaviour exactly.
 //
-// originals (F57) are the genuine host compose file(s) captured at backup time,
-// written beside the reconstruction under asideSuffix — never canonical, never
-// clobbering. Variadic so the two existing callers are unchanged.
-func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir, composeName string, compose, envFile []byte, preferOwner string, originals ...NamedFile) (*HostReconstructResult, error) {
+// An empty compose writes no file under the canonical name: only the folder,
+// the .env and the beside files.
+//
+// beside are written next to the compose file under their own names, by the
+// same rules as the compose file: identical is left alone, different is renamed
+// aside first. The caller decides the names — an original compose file under
+// its own name, DockBack's reconstruction under one Compose does not read.
+func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir, composeName string, compose, envFile []byte, preferOwner string, beside ...NamedFile) (*HostReconstructResult, error) {
 	parent, base, err := validateHostStackDir(stackDir)
 	if err != nil {
 		return nil, err
-	}
-	if len(compose) == 0 {
-		return nil, fmt.Errorf("no reconstructed compose file to write")
 	}
 	cname := safeComposeName(composeName)
 
@@ -402,6 +414,19 @@ func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir,
 		return nil, fmt.Errorf("creating stack directory: %w", err)
 	}
 
+	// Step 15: no compose file to place under the canonical name — a
+	// reconstruction that failed the Compose check goes only beside it, under a
+	// name Compose does not read. The folder, the .env and those files still land.
+	if len(compose) == 0 {
+		if owner != "" {
+			_, _ = ExecCapture(ctx, c, created.ID, []string{"sh", "-c", "chown " + owner + " " + shQuote(dir) + " 2>/dev/null || true"})
+		}
+		res := &HostReconstructResult{Dir: path.Join(path.Dir(stackDir), base), Owner: owner}
+		err := writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, res)
+		writeFilesBeside(ctx, c, created.ID, dir, owner, beside, res)
+		return res, err
+	}
+
 	// F176: write the file `docker compose` will actually read.
 	//
 	// The recorded name is the one this stack was deployed from, so it wins. But
@@ -431,7 +456,7 @@ func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir,
 			Owner:     owner,
 		}
 		err := writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, res)
-		writeOriginalsBeside(ctx, c, created.ID, dir, owner, originals, res)
+		writeFilesBeside(ctx, c, created.ID, dir, owner, beside, res)
 		return res, err
 	}
 
@@ -453,7 +478,9 @@ func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir,
 		displaced = path.Join(path.Dir(stackDir), base, aside)
 	}
 
-	if err := ExecStdin(ctx, c, created.ID, []string{"sh", "-c", "cat > " + shQuote(dir+"/"+target)}, bytes.NewReader(compose)); err != nil {
+	// Under umask 077: when this is the operator's own file it can hold
+	// passwords written straight into `environment:`.
+	if err := ExecStdin(ctx, c, created.ID, []string{"sh", "-c", "umask 077; cat > " + shQuote(dir+"/"+target)}, bytes.NewReader(compose)); err != nil {
 		return nil, fmt.Errorf("writing compose file: %w", err)
 	}
 
@@ -471,7 +498,7 @@ func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir,
 	}
 
 	err = writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, res)
-	writeOriginalsBeside(ctx, c, created.ID, dir, owner, originals, res)
+	writeFilesBeside(ctx, c, created.ID, dir, owner, beside, res)
 	return res, err
 }
 
@@ -496,7 +523,9 @@ func writeEnvBeside(ctx context.Context, c *client.Client, sidecarID, dir, owner
 			}
 			res.EnvDisplaced = path.Join(res.Dir, aside)
 		}
-		if err := ExecStdin(ctx, c, sidecarID, []string{"sh", "-c", "cat > " + shQuote(dir+"/"+envTarget)}, bytes.NewReader(envFile)); err != nil {
+		// Born 0600: a chmod after the write leaves a moment where the secrets are
+		// readable under the sidecar's umask.
+		if err := ExecStdin(ctx, c, sidecarID, []string{"sh", "-c", "umask 077; cat > " + shQuote(dir+"/"+envTarget)}, bytes.NewReader(envFile)); err != nil {
 			return fmt.Errorf("writing .env: %w", err)
 		}
 		res.EnvPath = path.Join(res.Dir, envTarget)
@@ -511,43 +540,48 @@ func writeEnvBeside(ctx context.Context, c *client.Client, sidecarID, dir, owner
 	return nil
 }
 
-// writeOriginalsBeside places the genuine host compose file(s) from the backup
-// next to the reconstruction, each under asideSuffix (F57).
+// What the move-aside step reports; anything else means the name is still taken
+// and the file is skipped rather than overwritten.
+const (
+	besideMoved  = "moved"
+	besideAbsent = "absent"
+)
+
+// writeFilesBeside writes each file next to the compose file under its own
+// name, by the compose file's rules: identical is left alone (a re-run
+// converges), different is renamed aside first and never overwritten, and the
+// bytes are born 0600, because an original compose file can carry passwords.
 //
-// Never canonical, never clobbering: the name is one `docker compose` does not
-// read, and an existing file of that name is left exactly as it is (a re-run
-// converges instead of accumulating copies). A file that cannot be written is
-// skipped rather than failing the restore — the containers are already back, and
-// this is a convenience copy of something that also still lives in the archive.
-func writeOriginalsBeside(ctx context.Context, c *client.Client, sidecarID, dir, owner string, originals []NamedFile, res *HostReconstructResult) {
-	for _, f := range originals {
-		name := asideName(f.Name)
-		if name == "" || len(f.Content) == 0 {
+// A file that cannot be written is skipped rather than failing the restore: the
+// containers are already back, and the archive still holds every one of these.
+func writeFilesBeside(ctx context.Context, c *client.Client, sidecarID, dir, owner string, files []NamedFile, res *HostReconstructResult) {
+	for _, f := range files {
+		if f.Name == "." || f.Name == ".." || !safeHostComponent.MatchString(f.Name) || len(f.Content) == 0 {
 			continue
 		}
-		target := dir + "/" + name
-		// Identical already? Leave it: converging beats rewriting.
+		target := dir + "/" + f.Name
 		if sameContent(ctx, c, sidecarID, target, f.Content) {
-			res.Originals = append(res.Originals, path.Join(res.Dir, name))
+			res.Beside = append(res.Beside, path.Join(res.Dir, f.Name))
 			continue
 		}
-		if out, terr := ExecCapture(ctx, c, sidecarID, []string{"sh", "-c",
-			"[ -e " + shQuote(target) + " ] && echo yes || echo no"}); terr == nil && strings.TrimSpace(string(out)) == "yes" {
-			// Something else owns this name. Never overwrite; the archive still
-			// holds the file, so skipping costs nothing irreversible.
+		aside := f.Name + displacedSuffix + "-" + composeTimestamp(time.Now())
+		moveAside := "if [ -e " + shQuote(target) + " ]; then mv -n " + shQuote(target) + " " + shQuote(dir+"/"+aside) +
+			" && [ ! -e " + shQuote(target) + " ] && echo " + besideMoved + "; else echo " + besideAbsent + "; fi"
+		out, _ := ExecCapture(ctx, c, sidecarID, []string{"sh", "-c", moveAside})
+		switch strings.TrimSpace(string(out)) {
+		case besideMoved:
+			res.BesideDisplaced = append(res.BesideDisplaced, path.Join(res.Dir, aside))
+		case besideAbsent:
+		default:
 			continue
 		}
-		if err := ExecStdin(ctx, c, sidecarID, []string{"sh", "-c", "cat > " + shQuote(target)}, bytes.NewReader(f.Content)); err != nil {
+		if err := ExecStdin(ctx, c, sidecarID, []string{"sh", "-c", "umask 077; cat > " + shQuote(target)}, bytes.NewReader(f.Content)); err != nil {
 			continue
 		}
-		// A captured compose file can carry resolved secrets in `environment:`,
-		// exactly like the reconstruction it sits beside — same 0600 posture.
-		cmd := "chmod 600 " + shQuote(target)
 		if owner != "" {
-			cmd += " && chown " + owner + " " + shQuote(target)
+			_, _ = ExecCapture(ctx, c, sidecarID, []string{"sh", "-c", "chown " + owner + " " + shQuote(target) + " 2>/dev/null || true"})
 		}
-		_, _ = ExecCapture(ctx, c, sidecarID, []string{"sh", "-c", cmd + " 2>/dev/null || true"})
-		res.Originals = append(res.Originals, path.Join(res.Dir, name))
+		res.Beside = append(res.Beside, path.Join(res.Dir, f.Name))
 	}
 }
 

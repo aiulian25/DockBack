@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/robfig/cron/v3"
 
+	"dockback/internal/dockercli"
 	"dockback/internal/store"
 )
 
@@ -202,36 +204,86 @@ func (s *Server) handleRunScheduleNow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
 }
 
-// scheduleCoverage returns the union of whole-node and specific-by-name targets
-// across all ENABLED named schedules, plus whether any enabled schedule has
-// targets. Used by coverage/protect so "is this container scheduled?" reflects
-// every schedule, not just one (F6). Keys are nodeID for whole-node targets and
-// nodeID+"\x00"+name for specific ones.
-func (s *Server) scheduleCoverage() (wholeNode, specific map[string]bool, any bool) {
-	wholeNode = map[string]bool{}
-	specific = map[string]bool{}
+// scheduleCover is what the enabled schedules cover, each entry holding the
+// shortest interval of the schedules that cover it, so coverage can judge how
+// recent a backup has to be (F6). Keys are nodeID for whole-node targets,
+// nodeID+"\x00"+project for stacks and nodeID+"\x00"+name for one container.
+// Legacy id-only targets cannot be name-matched; such a container counts as
+// covered once it has a backup, like any other.
+type scheduleCover struct {
+	wholeNode        map[string]time.Duration // running containers
+	wholeNodeStopped map[string]time.Duration // stopped ones too: schedules with IncludeStopped
+	stacks           map[string]time.Duration // every member, running or not
+	named            map[string]time.Duration
+}
+
+// interval is the shortest interval of the schedules covering the container,
+// and whether any does.
+//
+// A stack target covers its own project and nothing else. It once read as a
+// whole-node target — its container fields are empty — so one scheduled stack
+// marked every container on the node as covered, and "Protect" added nothing.
+func (cover scheduleCover) interval(nodeID string, c *dockercli.Container) (time.Duration, bool) {
+	var intervals []time.Duration
+	if d, ok := cover.named[nodeID+"\x00"+c.Name]; ok {
+		intervals = append(intervals, d)
+	}
+	if d, ok := cover.stacks[nodeID+"\x00"+c.Stack]; ok && c.Stack != "" {
+		intervals = append(intervals, d)
+	}
+	wholeNode := cover.wholeNode
+	if c.State != "running" {
+		wholeNode = cover.wholeNodeStopped
+	}
+	if d, ok := wholeNode[nodeID]; ok {
+		intervals = append(intervals, d)
+	}
+	if len(intervals) == 0 {
+		return 0, false
+	}
+	return slices.Min(intervals), true
+}
+
+// scheduleCoverage collects what every ENABLED named schedule covers, so "is
+// this container scheduled?" reflects every schedule, not just one (F6).
+func (s *Server) scheduleCoverage(now time.Time) scheduleCover {
+	cover := scheduleCover{
+		wholeNode: map[string]time.Duration{}, wholeNodeStopped: map[string]time.Duration{},
+		stacks: map[string]time.Duration{}, named: map[string]time.Duration{},
+	}
 	rows, err := s.store.ListSchedules()
 	if err != nil {
-		return
+		return cover
 	}
 	for _, row := range rows {
 		if !row.Enabled {
 			continue
 		}
 		sc := scheduleFromRow(row)
-		if len(sc.Targets) == 0 {
-			continue
-		}
-		any = true
+		interval := sc.interval(now)
 		for _, t := range sc.Targets {
-			if t.ContainerName == "" && t.ContainerID == "" {
-				wholeNode[t.NodeID] = true
-			} else if t.ContainerName != "" {
-				specific[t.NodeID+"\x00"+t.ContainerName] = true
+			switch {
+			case t.Stack != "":
+				keepShortest(cover.stacks, t.NodeID+"\x00"+t.Stack, interval)
+			case t.ContainerName != "":
+				keepShortest(cover.named, t.NodeID+"\x00"+t.ContainerName, interval)
+			case t.ContainerID == "":
+				keepShortest(cover.wholeNode, t.NodeID, interval)
+				if sc.IncludeStopped {
+					keepShortest(cover.wholeNodeStopped, t.NodeID, interval)
+				}
 			}
 		}
 	}
-	return
+	return cover
+}
+
+// keepShortest records d under key unless a shorter interval is already there.
+func keepShortest(m map[string]time.Duration, key string, d time.Duration) {
+	if prev, ok := m[key]; ok && prev <= d {
+		return
+	}
+	m[key] = d
 }
 
 // scheduleProtect ensures a container is a target of some schedule (B5 "Protect").

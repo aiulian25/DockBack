@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/docker/docker/client"
@@ -52,6 +53,12 @@ func expectedNonEmptyDestinations(man *Manifest, idx VolIndex) []string {
 	if man == nil || len(idx.Entries) == 0 {
 		return nil
 	}
+	// Judge only what the archive actually carried. A dumped database's data
+	// directory is in the index but never in the archive, so after the files are
+	// restored it is empty BY DESIGN until the dump is imported — and treating
+	// that as "data that did not arrive" is what stopped a real recovery between
+	// clearing the directory and importing the dump.
+	idx = withoutArchiveExcluded(idx, archiveExcludedPaths(man))
 	var out []string
 	for _, v := range man.Volumes {
 		if v.Type != "bind" || v.Destination == "" {
@@ -69,6 +76,71 @@ func expectedNonEmptyDestinations(man *Manifest, idx VolIndex) []string {
 		}
 	}
 	return out
+}
+
+// archiveExcludedPaths is everything a backup deliberately kept out of its
+// volume archive. Backups that record it say so directly. Older ones are
+// reconstructed from what they do record: the bundled database whose dump
+// replaced its data directory (only when that dump exists — a failed dump means
+// the directory was captured raw), the regenerable folders, and the paths the
+// app's profile never backs up.
+func archiveExcludedPaths(man *Manifest) []string {
+	if len(man.ArchiveExcluded) > 0 {
+		return man.ArchiveExcluded
+	}
+	var out []string
+	if d := embeddedDumpFor(man); d != nil && d.DataDir != "" && len(man.Databases) > 0 {
+		out = append(out, d.DataDir)
+	}
+	for _, r := range man.ExcludedRegenerable {
+		if r.Path != "" {
+			out = append(out, r.Path)
+		}
+	}
+	if p := ProfileFor(man.Image); p != nil {
+		for _, nb := range p.NeverBackup {
+			out = append(out, nb.Path)
+		}
+	}
+	return out
+}
+
+// withoutArchiveExcluded drops the index entries the archive never held.
+func withoutArchiveExcluded(idx VolIndex, excluded []string) VolIndex {
+	if len(excluded) == 0 {
+		return idx
+	}
+	kept := VolIndex{}
+	for _, entry := range idx.Entries {
+		if !excludedByAny(entry.Path, excluded) {
+			kept.Entries = append(kept.Entries, entry)
+		}
+	}
+	return kept
+}
+
+// excludedByAny matches an index path against archive exclusions the way the
+// capture applied them: a path itself, everything beneath it, and globs — a
+// glob that matches a directory covers everything under it.
+func excludedByAny(rel string, patterns []string) bool {
+	for _, raw := range patterns {
+		pattern := strings.Trim(strings.TrimSpace(raw), "/")
+		if pattern == "" {
+			continue
+		}
+		if rel == pattern || strings.HasPrefix(rel, pattern+"/") {
+			return true
+		}
+		if !strings.ContainsAny(pattern, "*?[") {
+			continue
+		}
+		for candidate := rel; candidate != "." && candidate != ""; candidate = path.Dir(candidate) {
+			if matched, _ := path.Match(pattern, candidate); matched {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // indexHasEntriesUnder reports whether the index recorded any file under a

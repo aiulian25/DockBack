@@ -137,3 +137,37 @@ func TestPortabilityWarningsOrdinaryContainerIsSilent(t *testing.T) {
 		t.Fatalf("empty requirements must produce nothing: %v", got)
 	}
 }
+
+// Step 27: only a device the target VERIFIABLY lacks stops a restore; one that
+// could not be checked does not, because that is not a fact.
+func TestMissingDevicesIsOnlyWhatIsKnownMissing(t *testing.T) {
+	req := &backup.HostRequirements{Devices: []string{"/dev/net/tun", "/dev/dri/renderD128"}}
+	known := hostFacts{DevKnown: true, Devices: map[string]bool{"/dev/dri/renderD128": true}}
+	if got := missingDevices(req, known); len(got) != 1 || got[0] != "/dev/net/tun" {
+		t.Errorf("gluetun's tun device is missing, the GPU is there: %v", got)
+	}
+	if got := missingDevices(req, hostFacts{DevKnown: false}); got != nil {
+		t.Errorf("an unreadable device list blocks nothing: %v", got)
+	}
+	if got := missingDevices(nil, known); got != nil {
+		t.Errorf("no requirements, nothing missing: %v", got)
+	}
+}
+
+// Step 27: a network the stack owns is recreated as recorded; one it only joins
+// must already exist on the target, or the container is cut off.
+func TestSharedNetworksMissing(t *testing.T) {
+	man := &backup.Manifest{Networks: []backup.NetworkRef{
+		{Name: "arr_default", Labels: map[string]string{"com.docker.compose.project": "arr"}},
+		{Name: "npm"},
+		{Name: "newt"},
+		{Name: "other_shared", Labels: map[string]string{"com.docker.compose.project": "other"}},
+	}}
+	got := sharedNetworksMissing(man, "arr", map[string]bool{"newt": true})
+	if strings.Join(got, ",") != "npm,other_shared" {
+		t.Errorf("only joined networks missing on the target, never the stack's own: %v", got)
+	}
+	if got := sharedNetworksMissing(man, "arr", map[string]bool{"npm": true, "newt": true, "other_shared": true}); len(got) != 0 {
+		t.Errorf("everything joined exists, nothing to stop for: %v", got)
+	}
+}

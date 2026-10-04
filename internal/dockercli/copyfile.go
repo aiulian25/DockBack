@@ -132,9 +132,13 @@ func CopyFileAsideInContainer(ctx context.Context, c *client.Client, targetID, s
 	if err := ensureSidecar(ctx, c); err != nil {
 		return err
 	}
+	hostConfig, err := restoreHostConfig(ctx, c, targetID)
+	if err != nil {
+		return err
+	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", "120"}, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID}},
+		hostConfig,
 		nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("sidecar create: %w", err)

@@ -61,9 +61,13 @@ func ChownVolumePaths(ctx context.Context, c *client.Client, targetID string, pa
 		return 0, nil
 	}
 
+	hostConfig, err := restoreHostConfig(ctx, c, targetID)
+	if err != nil {
+		return 0, err
+	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: args, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID}}, nil, nil, "")
+		hostConfig, nil, nil, "")
 	if err != nil {
 		return 0, fmt.Errorf("chown sidecar create: %w", err)
 	}

@@ -847,6 +847,9 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 		man.HasOriginalCompose = hasCompose
 		man.Format.Layout += ", config/original-compose/*"
 	}
+	if man.ProjectFolder = e.captureProjectFolder(ctx, cli, id, insp, work); man.ProjectFolder != nil && man.ProjectFolder.Entries > 0 {
+		man.Format.Layout += ", " + layoutPath(projectFolderMember)
+	}
 
 	// 2c) Optional image tarball for air-gapped restore (PLAN §0.3 / §8.4). Saved
 	// by the image reference so `docker load` restores its repo:tag. Best-effort:
@@ -2177,6 +2180,7 @@ func (e *Engine) captureVolumes(ctx context.Context, cli *client.Client, opts Op
 			return err
 		}
 		man.VolumesSHA256 = sha
+		man.ArchiveExcluded = opts.excludeSubPaths()
 		// F70 universal file index: store the complete listing inside the archive
 		// so browsing lists every file from one small member (no 20k truncation),
 		// and cross-backup file search / generation diff become index-only reads.
@@ -2285,6 +2289,7 @@ func (e *Engine) captureFullBaseline(ctx context.Context, cli *client.Client, op
 	if err != nil {
 		return err
 	}
+	man.ArchiveExcluded = opts.excludeSubPaths()
 	if len(curIdx.Entries) == 0 {
 		if built, berr := e.buildVolIndex(ctx, cli, opts.ContainerID, volDests, man.Image); berr == nil {
 			e.stampIndexHashes(&built, fileHashes, id)
@@ -3471,6 +3476,9 @@ func layoutPath(rel string) string {
 		return "config/docker-compose.yml"
 	case strings.HasPrefix(rel, "original-compose/"):
 		// Genuine host compose file(s) captured from the source host (F57).
+		return "config/" + rel
+	case rel == projectFolderMember:
+		// The compose project's own folder, without its bind-mounted data (step 24).
 		return "config/" + rel
 	case strings.HasPrefix(rel, bindFileWorkDir+"/"):
 		// Contents of the binds whose root is a file (F81), which cannot ride in

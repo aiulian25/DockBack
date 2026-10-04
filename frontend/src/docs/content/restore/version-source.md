@@ -35,7 +35,7 @@ The **Source copy** dropdown controls *where the archive is read from*:
 
 When you manage more than one node, the drawer also shows **Restore to (node)** — defaulting to the backup's original machine. Pick a **different** node to restore onto **another machine**: DockBack recreates the container there, re-pulling the image **by digest** (or loading the bundled image tarball if the backup was saved air-gapped), and recreates the networks and volumes under their original names. This is how you rebuild a stack on a replacement host after a machine dies, or clone it to another server.
 
-> Restore is **in-place by name**: if the target node already runs that same-named container, it is overwritten **in place** (with a safety snapshot first, if enabled) rather than started as a parallel copy. Stack restore (recreating a whole compose project at once) runs on the backup's original node.
+> Restore is **in-place by name**: if the target node already runs that same-named container, it is overwritten **in place** (with a safety snapshot first, if enabled) rather than started as a parallel copy. A stack restore can target another node too: see *Moving a stack to another server*.
 
 ## Image drift — when the image moved on since the backup
 

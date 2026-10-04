@@ -10,31 +10,6 @@ import (
 	nat "github.com/docker/go-connections/nat"
 )
 
-func TestImageRefCandidates(t *testing.T) {
-	const tag = "ghcr.io/karakeep-app/karakeep:0.16.0"
-	const digest = "ghcr.io/karakeep-app/karakeep@sha256:1111111111111111111111111111111111111111111111111111111111111111"
-
-	cases := []struct {
-		name   string
-		digest string
-		tag    string
-		want   []string
-	}{
-		{"digest preferred then tag", digest, tag, []string{digest, tag}},
-		{"tag only when no digest", "", tag, []string{tag}},
-		{"ignores malformed digest", "not-a-digest", tag, []string{tag}},
-		{"ignores bare sha without ref", "sha256:abc", tag, []string{tag}},
-		{"empty when nothing usable", "", "", nil},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := imageRefCandidates(tc.digest, tc.tag); !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("imageRefCandidates(%q, %q) = %v, want %v", tc.digest, tc.tag, got, tc.want)
-			}
-		})
-	}
-}
-
 // F10: stripForClone must isolate a restore-as-copy so it can NEVER touch the
 // original's data or ports — fresh empty volumes at every mount destination, no
 // host-port bindings, no restart loop, no stack links.

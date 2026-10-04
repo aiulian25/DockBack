@@ -11,6 +11,22 @@ A DockBack application backup captures the app's entire state:
 
 > It does **not** copy the container backup *archives* themselves (those already live in `/app/backups` and your external destinations). It copies the **index and configuration** that ties everything together.
 
+## Automatic backups (on by default)
+
+DockBack backs itself up without being asked:
+
+- **Weekly**, Sunday 04:00 by default, keeping the newest 7. Change it, or switch it off, under **Settings → Advanced → Application Backup & Restore**. A schedule you have saved, including one you switched off, is never changed.
+- **Straight away** the first time the schedule is active, so a new install, or one that has never had an app backup, is covered today rather than next week.
+- **After a configuration change**: a new node, schedule, destination, policy, account or setting is backed up once the configuration has been unchanged for 10 minutes, so a burst of edits makes one backup.
+- **Off the machine**, when an external destination is set (see below). Without one, every copy stays on this host, and the log says so.
+
+You're told when this stops working:
+
+- **appbackup.stale**: the newest app backup is older than 8 days, or there isn't one, once there are container backups to lose.
+- **appbackup.failed**: a scheduled app backup failed, or it was made but didn't reach an external destination.
+
+> Keep DockBack's own folder, the one holding its compose file and the `.env` with `DOCKBACK_ENCRYPTION_KEY`, outside any directory a stack manager can delete, and keep the key in your password manager. On the night that prompted these defaults, DockBack's folder was deleted along with every stack. The key survived only because the container was still running.
+
 ## Create a backup
 
 **Settings → Application Backup & Restore → Create backup.**

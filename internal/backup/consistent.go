@@ -280,6 +280,9 @@ func (e *Engine) prepareServiceCapture(ctx context.Context, cli *client.Client, 
 		man.HasOriginalCompose = hasCompose
 		man.Format.Layout += ", config/original-compose/*"
 	}
+	if man.ProjectFolder = e.captureProjectFolder(ctx, cli, id, insp, work); man.ProjectFolder != nil && man.ProjectFolder.Entries > 0 {
+		man.Format.Layout += ", " + layoutPath(projectFolderMember)
+	}
 
 	// Volume selection (pre-pause). Exclude the dumped DB data dir only when a
 	// live dump will actually replace it (engineKind survived the no-tools check).

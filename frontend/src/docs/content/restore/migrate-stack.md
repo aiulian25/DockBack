@@ -39,9 +39,22 @@ Target host may not support this container
 
 In a stack restore the same warnings appear in the plan panel, under the specific service they belong to, so a twelve-service stack points at the one with the problem.
 
-### It informs, it never blocks
+### Two things stop the restore until you confirm
 
-You can always proceed. You may know something DockBack cannot — that the device is about to be attached, that the sysctl is applied at boot, that you intend to edit the container afterwards. The warning tells you what to expect; the decision stays yours.
+Most warnings only inform. Two stop the restore before anything is written, because each produces a container that's created and then broken:
+
+- **A device the target verifiably lacks**, such as gluetun's `/dev/net/tun` or Plex's GPU. The container would be created and fail to start.
+- **A shared network the target doesn't have**: one the stack joins but doesn't own, like a reverse proxy's `npm` network or a macvlan. DockBack would create it as a plain bridge, which silently cuts the service off from everything it reaches through that network. Networks the stack owns are recreated as recorded, as before.
+
+The restore names what's missing and asks. Confirm if you know better (the device is about to be attached, or a plain bridge is fine), or fix the target and restore again. "Could not verify" never stops anything, because it isn't a fact.
+
+### The image is checked on the target
+
+**Check restore readiness** asks the node the restore lands on, not the one the backup came from, whether the image can be obtained: a target behind stricter egress rules is the one that matters. It also checks the image offers a build for the target's CPU architecture, so an amd64-only image is caught before a Raspberry Pi pulls nothing useful.
+
+### After the move
+
+A cross-host restore ends its log with what Docker can't see that may still point at the old machine: reverse-proxy hosts, tunnel targets, DNS records, cron jobs, monitors and bookmarks. It also lists the container's environment variables that hold addresses.
 
 ### Three kinds of statement, deliberately distinct
 

@@ -455,6 +455,17 @@ func (s *Server) handleStackRestoreDefaults(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, m)
 }
 
+// missingMembersRefusal is the answer to a stack restore that would leave
+// members without a backup behind, when the caller has not confirmed that. ""
+// lets it proceed.
+func missingMembersRefusal(missing []string, confirmed bool) string {
+	if len(missing) == 0 || confirmed {
+		return ""
+	}
+	return fmt.Sprintf("%d member(s) of this stack have no backup and would not exist after this restore: %s. Back them up first, or confirm to restore the stack without them.",
+		len(missing), strings.Join(missing, ", "))
+}
+
 // stackMissingMembers names the stack's members that have NO backup, and so
 // cannot be recreated by a restore (F216).
 //
@@ -773,13 +784,21 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// "Revert update": recreate each service from its backed-up image digest,
-	// snapshotting current state first (default on, opt-out via snapshot=false).
+	// "Revert update": recreate each service from its backed-up image digest.
 	recreate := q.Get("recreate") == "true" || q.Get("recreate") == "1"
+	// Step 22: run a newer image when the one the backup ran is gone — only when
+	// asked, because the data may be migrated beyond going back.
+	allowDifferentImage := q.Get("allow_different_image") == "true" || q.Get("allow_different_image") == "1"
+	// Step 23: put back the stack's files only — no service stopped or changed.
+	filesOnly := q.Get("files_only") == "true" || q.Get("files_only") == "1"
+	if filesOnly && recreate {
+		errJSON(w, http.StatusBadRequest, "a files-only restore changes no service, so it cannot also revert one")
+		return
+	}
 	// #8: opt-in promotion of a restart policy that will not survive a reboot.
 	promoteRestart := q.Get("promote_restart_policy") == "true" || q.Get("promote_restart_policy") == "1"
 	injectHealthchecks := q.Get("inject_healthchecks") == "true" || q.Get("inject_healthchecks") == "1"
-	snapshot := recreate && q.Get("snapshot") != "false" && q.Get("snapshot") != "0"
+	snapshot := stackRestoreSnapshotWanted(q)
 	// Optional app-consistent snapshot group (F43): restore every service from one
 	// coherent point-in-time instead of newest-per-service. Empty = default.
 	groupID := strings.TrimSpace(q.Get("group"))
@@ -888,6 +907,19 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// F216: a member with no backup cannot come back, and the run still ends
+	// "restored" — commafeed came back without its database. The dialog asks;
+	// the server insists, so no caller can restore an incomplete stack without
+	// saying so. Before the step-up and the locks, so a refusal costs nothing.
+	missing := s.stackMissingMembers(sourceID, project)
+	// A files-only restore touches no service, so a member without a backup is
+	// not left behind by it.
+	confirmedMissing := filesOnly || q.Get("confirm_missing") == "true" || q.Get("confirm_missing") == "1"
+	if refusal := missingMembersRefusal(missing, confirmedMissing); refusal != "" {
+		errJSON(w, http.StatusConflict, refusal)
+		return
+	}
+
 	planned, _, perr := s.engine.PlanStack(sourceID, project, groupID)
 	if perr != nil {
 		// The same selection error the plan endpoint returns and the restore would
@@ -895,6 +927,47 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 		// whose member set cannot be determined must not proceed past this gate.
 		errJSON(w, http.StatusBadRequest, perr.Error())
 		return
+	}
+	// Step 27: the same for a shared network the target does not have.
+	if !filesOnly && q.Get("confirm_missing_networks") != "true" && q.Get("confirm_missing_networks") != "1" {
+		seen := map[string]bool{}
+		var lackingNets []string
+		for _, p := range planned {
+			if b, gerr := s.store.GetBackup(p.BackupID); gerr == nil {
+				for _, n := range s.sharedNetworksMissingOn(r.Context(), manifestOf(b), project, b.NodeID, targetID) {
+					if !seen[n] {
+						seen[n] = true
+						lackingNets = append(lackingNets, n)
+					}
+				}
+			}
+		}
+		if len(lackingNets) > 0 {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":            "the target machine has no " + strings.Join(lackingNets, ", ") + " network, which this stack joins but does not own. DockBack would create it as a plain bridge, cutting the services off from what they reach through it. Create it on the target as it should be, or confirm the plain bridge.",
+				"missing_networks": lackingNets,
+			})
+			return
+		}
+	}
+	// Step 27: a device the target verifiably lacks stops the restore before
+	// any service is touched, unless the operator says it will be there.
+	if !filesOnly && q.Get("confirm_missing_devices") != "true" && q.Get("confirm_missing_devices") != "1" {
+		var lacking []string
+		for _, p := range planned {
+			if b, gerr := s.store.GetBackup(p.BackupID); gerr == nil {
+				for _, d := range s.missingDevicesOn(r.Context(), manifestOf(b), b.NodeID, targetID) {
+					lacking = append(lacking, p.Service+": "+d)
+				}
+			}
+		}
+		if len(lacking) > 0 {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "the target machine lacks devices these services need — " + strings.Join(lacking, ", ") + ". They would be created and then fail to start. Attach the devices, or confirm that they will be there.",
+				"missing_devices": lacking,
+			})
+			return
+		}
 	}
 	// F213: the protected-member check follows the SELECTION. A service the
 	// operator deselected is not overwritten, so it must not be what makes them
@@ -911,7 +984,7 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 		memberNames = append(memberNames, p.TargetName)
 	}
 	protected := s.protectedRestoreMembers(targetID, memberNames)
-	if len(protected) > 0 && !s.requireFreshAuth(w, r, body.stepUpBody) {
+	if len(protected) > 0 && !filesOnly && !s.requireFreshAuth(w, r, body.stepUpBody) {
 		return
 	}
 
@@ -976,11 +1049,8 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 		// with NO backup, say so LOUDLY up front — never let a service be
 		// silently absent from the restored stack. Non-blocking: DR must still
 		// run when the source machine is gone.
-		{
-			missing := s.stackMissingMembers(sourceID, project)
-			if len(missing) > 0 {
-				s.logSink("stack:"+project, "WARN", fmt.Sprintf("%d stack member(s) have NO backup and will NOT be restored: %s — run a stack backup to cover every service", len(missing), strings.Join(missing, ", ")))
-			}
+		if len(missing) > 0 {
+			s.logSink("stack:"+project, "WARN", fmt.Sprintf("%d stack member(s) have NO backup and will NOT be restored: %s — confirmed by the operator. Run a stack backup to cover every service", len(missing), strings.Join(missing, ", ")))
 		}
 		// Cancelable under the stack's own run id (what the UI streams).
 		runID := "stack:" + project
@@ -993,9 +1063,12 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 		err := s.engine.RestoreStack(ctx, sourceID, targetID, project, backup.StackRestoreOptions{Recreate: recreate, Snapshot: snapshot, ReconstructHost: reconstructHost, HostBaseDir: hostBaseDir, PromoteRestartPolicy: promoteRestart, InjectHealthchecks: injectHealthchecks, RemapFromIP: remapFrom, RemapToIP: remapTo, RemapFromPath: remapFromPath, RemapToPath: remapToPath, GroupID: groupID,
 			RemapFromDomain: remapFromDomain, RemapToDomain: remapToDomain, // F195
 			NewSiteAddress: newSiteAddress, NewUpstreamAddress: newUpstreamAddress,
-			PrivateKey: privateKey, // F209 — in memory for this restore only
-			Services:   selectedServices,
-			Source:     source}) // F214 — read every member from the same copy
+			PrivateKey:          privateKey, // F209 — in memory for this restore only
+			Services:            selectedServices,
+			MissingMembers:      missing,
+			AllowDifferentImage: allowDifferentImage,
+			FilesOnly:           filesOnly,
+			Source:              source}) // F214 — read every member from the same copy
 		s.restoreOutcome(runID, err, "Stack restore completed")
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
@@ -1213,6 +1286,7 @@ func (s *Server) handleStackRestorePlan(w http.ResponseWriter, r *http.Request) 
 			facts = &f
 		}
 		entries[i].Portability = portabilityWarnings(m.Requires, *facts)
+		entries[i].MissingDevices = missingDevices(m.Requires, *facts)
 	}
 
 	// F81: what the target does not have yet, and what the restore will do about
@@ -1287,6 +1361,19 @@ func (s *Server) handleStackRestorePlan(w http.ResponseWriter, r *http.Request) 
 		out["app_preconditions"] = pre
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// stackRestoreSnapshotWanted reads the stack restore's "Safety snapshot first"
+// box, and honours it on EVERY stack restore.
+//
+// It used to be honoured only together with "Revert update", so a plain stack
+// restore took no snapshot at all while the dialog — ticked by default — said
+// "Current state is snapshotted first". That is how a failed restore during a
+// real recovery had nothing to roll back to. Absent means yes: the safe default
+// for a destructive call made by a script.
+func stackRestoreSnapshotWanted(q url.Values) bool {
+	v := q.Get("snapshot")
+	return v != "false" && v != "0"
 }
 
 // selectedEntries narrows a stack plan to the services the operator kept.
