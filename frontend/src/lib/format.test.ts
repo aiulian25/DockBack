@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fmtDuration } from "./format";
+import { fmtDuration, scheduleWhen } from "./format";
 
 // Three pages had their own copy of this and had already diverged: the compact
 // one rounded hours to a decimal, the others to whole hours. Both spellings are
@@ -46,5 +46,15 @@ describe("fmtDuration", () => {
 
   it("handles zero", () => {
     expect(fmtDuration(0)).toBe("0 sec");
+  });
+});
+
+describe("scheduleWhen", () => {
+  const base = { time: "03:00", weekday: 0, monthday: 1, cron: "0 3 * * 0" };
+  it("says when each kind of schedule fires", () => {
+    expect(scheduleWhen({ ...base, kind: "daily" })).toBe("Daily at 03:00");
+    expect(scheduleWhen({ ...base, kind: "weekly", weekday: 3 })).toBe("Weekly on Wednesday at 03:00");
+    expect(scheduleWhen({ ...base, kind: "monthly", monthday: 15 })).toBe("Monthly on day 15 at 03:00");
+    expect(scheduleWhen({ ...base, kind: "custom" })).toBe("Custom (cron 0 3 * * 0)");
   });
 });

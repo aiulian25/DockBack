@@ -187,6 +187,7 @@ func (s *Server) handleBackupStack(w http.ResponseWriter, r *http.Request) {
 			ordered = append(ordered, c)
 		}
 	}
+	queuedAt := time.Now().Unix()
 	count := 0
 	for _, c := range ordered {
 		// F79: same per-service merge as a scheduled run — remembered
@@ -200,8 +201,57 @@ func (s *Server) handleBackupStack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logSink("stack:"+project, "INFO", "Backing up stack with "+itoa(count)+" service(s)")
+	go s.reportStackBackup(id, project, ordered, queuedAt)
 	_ = s.store.Audit(userFrom(r), "stack.backup", project, node.Name)
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "started", "count": count})
+}
+
+// stackBackupWatchInterval is how often a stack backup looks whether its
+// services' backups have all finished.
+const stackBackupWatchInterval = 2 * time.Second
+
+// reportStackBackup waits until no backup of the stack's services is queued or
+// running, then says under the stack's own log id how the stack did. Each
+// service logs under its own backup id, so without this line the stack's
+// console never learned the run was over. It waits on the containers rather
+// than the queued ids so an automatic retry finishes before the verdict.
+func (s *Server) reportStackBackup(nodeID, project string, services []*dockercli.Container, queuedAt int64) {
+	containers := map[string]bool{}
+	for _, c := range services {
+		containers[c.ID] = true
+	}
+	// ponytail: polls the job registry; a completion signal per job if this ever shows in a profile.
+	for s.backupsPendingFor(nodeID, containers) {
+		time.Sleep(stackBackupWatchInterval)
+	}
+	var missed []string
+	for _, c := range services {
+		if !s.backedUpSince(nodeID, c.Name, queuedAt) {
+			missed = append(missed, c.Name)
+		}
+	}
+	level, outcome, message := stackBackupVerdict(len(services), missed)
+	s.logSink("stack:"+project, level, message)
+	s.publishRunDone("stack:"+project, outcome, message)
+}
+
+// backedUpSince reports whether the container's newest backup is a success
+// started at or after since (unix seconds).
+func (s *Server) backedUpSince(nodeID, name string, since int64) bool {
+	newest, err := s.store.ListBackupsForTarget(nodeID, name, 1)
+	if err != nil || len(newest) == 0 {
+		return false
+	}
+	return newest[0].CreatedAt >= since && newest[0].Status == "success"
+}
+
+// stackBackupVerdict is the line a stack backup ends on, given how many
+// services it backed up and which of them did not get a backup. Pure.
+func stackBackupVerdict(total int, missed []string) (level, outcome, message string) {
+	if len(missed) == 0 {
+		return "INFO", runOutcomeOK, fmt.Sprintf("Stack backup complete — all %d service(s) backed up", total)
+	}
+	return "ERR", runOutcomeFailed, fmt.Sprintf("Stack backup failed for %d of %d service(s): %s — each one's own backup log says why", len(missed), total, strings.Join(missed, ", "))
 }
 
 // startConsistentStackBackup takes the stack-exclusive lock and runs the
@@ -218,21 +268,53 @@ func (s *Server) startConsistentStackBackup(nodeID, project string, dests []stri
 		return false
 	}
 	s.logSink("stack:"+project, "INFO", "Starting app-consistent snapshot of the stack")
+	tagged, forget := s.tagStackServices(nodeID, perService)
 	go func() {
 		defer guardPanic("stack consistent backup", "stack:"+project, func() {
 			s.logSink("stack:"+project, "ERR", "App-consistent snapshot failed: internal error (panic)")
 		})
 		defer s.releaseRestoreAndDispatch(lockKey)
+		defer forget()
+		end := s.beginOutsideQueueRun("stack:" + project)
+		defer end()
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 		defer cancel()
-		if err := s.engine.BackupStackConsistent(ctx, nodeID, project, backup.Options{
+		err := s.engine.BackupStackConsistent(ctx, nodeID, project, backup.Options{
 			NodeID: nodeID, Compression: "balanced",
 			Destinations: dests, DestinationsExplicit: true, PauseMode: pauseMode,
-		}, perService); err != nil {
+		}, tagged)
+		if err != nil {
 			s.logSink("stack:"+project, "ERR", "App-consistent snapshot: "+err.Error())
+			s.publishRunDone("stack:"+project, runOutcomeFailed, err.Error())
+			return
 		}
+		s.publishRunDone("stack:"+project, runOutcomeOK, "App-consistent snapshot complete")
 	}()
 	return true
+}
+
+// tagStackServices hands each service of an app-consistent stack backup its
+// backup id before the run writes a line, and records where that service runs,
+// so its log lines carry its node and container the way a queued backup's do.
+// The engine creates these runs itself, outside the job queue, so without this
+// the container's console, the stack's console and the Logs page's node filter
+// all missed every service line. Call forget once the run is over.
+func (s *Server) tagStackServices(nodeID string, perService func(cid, name string) backup.Options) (tagged func(cid, name string) backup.Options, forget func()) {
+	nodeName := s.nodeNameOr(nodeID)
+	var ids []string
+	tagged = func(cid, name string) backup.Options {
+		opts := perService(cid, name)
+		opts.BackupID = backup.NewID()
+		s.stackServices.Store(opts.BackupID, &backupJob{nodeID: nodeID, nodeName: nodeName, containerID: cid})
+		ids = append(ids, opts.BackupID)
+		return opts
+	}
+	forget = func() {
+		for _, id := range ids {
+			s.stackServices.Delete(id)
+		}
+	}
+	return tagged, forget
 }
 
 // crossRestoreInput is the raw, unvalidated cross-host restore request as it

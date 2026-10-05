@@ -397,7 +397,8 @@ func (s *Server) frequencySkip(nodeID, name string) (bool, time.Duration) {
 
 // handleGetContainerPolicy returns a container's override (if any) plus the
 // inherited (node→global) retention it would use otherwise, so the UI can show
-// inherited-vs-overridden per container (PLAN §4.2 granular control).
+// inherited-vs-overridden per container (PLAN §4.2 granular control), and the
+// schedules that back it up.
 func (s *Server) handleGetContainerPolicy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	cid := r.PathValue("cid")
@@ -420,6 +421,7 @@ func (s *Server) handleGetContainerPolicy(w http.ResponseWriter, r *http.Request
 			"generations": inhCfg.Generations, "keep_daily": inhCfg.Daily,
 			"keep_weekly": inhCfg.Weekly, "keep_monthly": inhCfg.Monthly, "keep_yearly": inhCfg.Yearly, "autoprune": inhAutoprune,
 		},
+		"schedules": s.containerSchedules(id, cid, name),
 	})
 }
 
@@ -935,11 +937,13 @@ func (s *Server) removeScheduleTargets(scheduleID string, drop []ScheduleTarget)
 	_ = s.store.UpsertSchedule(newRow)
 }
 
-// scheduleTargetIn reports whether t matches any target in list (by node +
-// container identity).
+// scheduleTargetIn reports whether t matches any target in list (by node and
+// container or stack identity). A stack target has empty container fields, so
+// without the stack in the match it would also match the node's whole-server
+// target and every other stack on it.
 func scheduleTargetIn(list []ScheduleTarget, t ScheduleTarget) bool {
 	for _, x := range list {
-		if x.NodeID == t.NodeID && x.ContainerName == t.ContainerName && x.ContainerID == t.ContainerID {
+		if x.NodeID == t.NodeID && x.ContainerName == t.ContainerName && x.ContainerID == t.ContainerID && x.Stack == t.Stack {
 			return true
 		}
 	}
@@ -1035,32 +1039,17 @@ func (s *Server) runScheduleTargets(sc Schedule) {
 			}
 
 			if t.Consistent {
-				// One coherent app-consistent snapshot under a single stack-exclusive
-				// lock — mirrors handleBackupStack's consistent goroutine.
-				lockKey := stackKey(t.NodeID, t.Stack, "")
-				if !s.locks.acquireRestore(lockKey) {
+				// The same run the Backup Stack button starts. F79: each service
+				// resolves its own remembered options, exactly like a
+				// non-consistent scheduled run of the same container.
+				nodeID := t.NodeID
+				started := s.startConsistentStackBackup(nodeID, t.Stack, dests, "", func(cid, name string) backup.Options {
+					return s.scheduledBackupOptions(nodeID, cid, name, dests)
+				})
+				if !started {
 					s.logSink("schedule", "WARN", fmt.Sprintf("Skipping app-consistent snapshot of stack %q on %q — a backup or restore of it is already in progress", t.Stack, node.Name))
 					continue
 				}
-				project := t.Stack
-				s.logSink("stack:"+project, "INFO", "Scheduled app-consistent snapshot of the stack")
-				go func(nodeID, project string, dests []string) {
-					defer guardPanic("stack consistent backup", "stack:"+project, func() {
-						s.logSink("stack:"+project, "ERR", "App-consistent snapshot failed: internal error (panic)")
-					})
-					defer s.releaseRestoreAndDispatch(lockKey)
-					bctx, bcancel := context.WithTimeout(context.Background(), 6*time.Hour)
-					defer bcancel()
-					// F79: each service resolves its own remembered options, exactly
-					// like a non-consistent scheduled run of the same container.
-					if err := s.engine.BackupStackConsistent(bctx, nodeID, project, backup.Options{
-						NodeID: nodeID, Compression: "balanced", Destinations: dests, DestinationsExplicit: true,
-					}, func(cid, name string) backup.Options {
-						return s.scheduledBackupOptions(nodeID, cid, name, dests)
-					}); err != nil {
-						s.logSink("stack:"+project, "ERR", "App-consistent snapshot: "+err.Error())
-					}
-				}(t.NodeID, project, dests)
 				count++ // the stack counts as one scheduled unit
 				continue
 			}
@@ -1082,16 +1071,10 @@ func (s *Server) runScheduleTargets(sc Schedule) {
 		var targets []ct
 		if t.ContainerName == "" && t.ContainerID == "" {
 			// Whole-node target: every running container, plus stopped ones when the
-			// schedule opts in (F9). F219: never DockBack's own test clones — a copy
-			// it created to prove a backup, and will delete tomorrow, is not a
-			// workload to protect.
-			for _, c := range cs {
-				if isTestClone(c) {
-					continue
-				}
-				if c.State == "running" || sc.IncludeStopped {
-					targets = append(targets, ct{c.ID, c.Name})
-				}
+			// schedule opts in (F9) — chosen the way Full Server Backup chooses, so
+			// test clones (F219) and ignored containers are left out of both.
+			for _, c := range nodeBackupTargets(cs, sc.IncludeStopped, s.ignoredOn(t.NodeID)) {
+				targets = append(targets, ct{c.ID, c.Name})
 			}
 		} else {
 			// Specific target: resolve by name (preferred), else legacy id.

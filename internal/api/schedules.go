@@ -278,6 +278,277 @@ func (s *Server) scheduleCoverage(now time.Time) scheduleCover {
 	return cover
 }
 
+// How a schedule reaches a container, as the container's page says it.
+const (
+	coveredByName  = "container"
+	coveredByStack = "stack"
+	coveredByNode  = "node"
+)
+
+// containerSchedule is a schedule that backs one container up, and how it
+// reaches it.
+type containerSchedule struct {
+	scheduleView
+	Covers string `json:"covers"`
+}
+
+// containerSchedules lists every schedule, on or off, that backs this
+// container up — what its page shows as the schedule set for it. A container
+// the inventory has not seen yet is matched by name alone.
+func (s *Server) containerSchedules(nodeID, cid, name string) []containerSchedule {
+	c := s.cachedContainer(nodeID, cid)
+	if c == nil {
+		c = &dockercli.Container{ID: cid, Name: name}
+	}
+	out := []containerSchedule{}
+	rows, err := s.store.ListSchedules()
+	if err != nil {
+		return out
+	}
+	ignored := s.ignoredOn(nodeID)
+	for _, row := range rows {
+		if covers := scheduleCovers(scheduleFromRow(row), nodeID, c, ignored); covers != "" {
+			out = append(out, containerSchedule{scheduleView: s.viewFor(row), Covers: covers})
+		}
+	}
+	return out
+}
+
+// scheduleCovers says how a schedule backs container c on nodeID up — by its
+// name, through its compose project, or with the rest of the server — or ""
+// when it does not. The most specific target wins. Pure.
+func scheduleCovers(sc Schedule, nodeID string, c *dockercli.Container, ignored ignoreSet) string {
+	found := map[string]bool{}
+	for _, t := range sc.Targets {
+		found[targetCovers(t, sc.IncludeStopped, nodeID, c, ignored)] = true
+	}
+	for _, covers := range []string{coveredByName, coveredByStack, coveredByNode} {
+		if found[covers] {
+			return covers
+		}
+	}
+	return ""
+}
+
+// targetCovers applies the scheduler's own matching (runScheduleTargets) to one
+// target: a stack target takes its project's members, a named target its
+// container, a legacy target its container id, and a whole-server target what
+// wholeServerTakes takes. Pure.
+func targetCovers(t ScheduleTarget, includeStopped bool, nodeID string, c *dockercli.Container, ignored ignoreSet) string {
+	if t.NodeID != nodeID {
+		return ""
+	}
+	if t.Stack != "" {
+		return coveredWhen(c.Stack == t.Stack, coveredByStack)
+	}
+	if t.ContainerName != "" {
+		return coveredWhen(c.Name == t.ContainerName, coveredByName)
+	}
+	if t.ContainerID != "" {
+		return coveredWhen(c.ID == t.ContainerID, coveredByName)
+	}
+	return coveredWhen(wholeServerTakes(c, includeStopped, ignored), coveredByNode)
+}
+
+// coveredWhen is how when it matched, else "".
+func coveredWhen(matched bool, how string) string {
+	if !matched {
+		return ""
+	}
+	return how
+}
+
+// stackSchedule is a schedule that backs a compose project up, and how it
+// reaches it.
+type stackSchedule struct {
+	scheduleView
+	Covers string `json:"covers"`
+	// Consistent marks a stack target that snapshots every service in one
+	// quiesce window.
+	Consistent bool `json:"consistent,omitempty"`
+	// Services names the members a schedule backs up by name.
+	Services []string `json:"services,omitempty"`
+	// Own marks the stack's own schedule, the one its page edits.
+	Own bool `json:"own"`
+}
+
+// stackSchedules lists every schedule, on or off, that backs this compose
+// project up, its own schedule marked.
+func (s *Server) stackSchedules(nodeID, project string) []stackSchedule {
+	out := []stackSchedule{}
+	rows, err := s.store.ListSchedules()
+	if err != nil {
+		return out
+	}
+	members := s.cachedStackMembers(nodeID, project)
+	ignored := s.ignoredOn(nodeID)
+	_, own := ownStackSchedule(rows, nodeID, project)
+	for _, row := range rows {
+		entry, covered := stackCoverage(scheduleFromRow(row), nodeID, project, members, ignored)
+		if !covered {
+			continue
+		}
+		entry.scheduleView = s.viewFor(row)
+		entry.Own = own != nil && row.ID == own.ID
+		out = append(out, entry)
+	}
+	return out
+}
+
+// stackCoverage says how a schedule backs compose project `project` on nodeID
+// up: as the stack itself, by naming some of its services, or with the rest of
+// the server — the services matched the way the scheduler matches them. Pure.
+func stackCoverage(sc Schedule, nodeID, project string, members []*dockercli.Container, ignored ignoreSet) (stackSchedule, bool) {
+	for _, t := range sc.Targets {
+		if t.NodeID == nodeID && t.Stack == project {
+			return stackSchedule{Covers: coveredByStack, Consistent: t.Consistent}, true
+		}
+	}
+	var named []string
+	withServer := false
+	for _, c := range members {
+		covers := scheduleCovers(sc, nodeID, c, ignored)
+		if covers == coveredByName {
+			named = append(named, c.Name)
+		}
+		withServer = withServer || covers == coveredByNode
+	}
+	if len(named) > 0 {
+		return stackSchedule{Covers: coveredByName, Services: named}, true
+	}
+	if withServer {
+		return stackSchedule{Covers: coveredByNode}, true
+	}
+	return stackSchedule{}, false
+}
+
+// ownStackSchedule finds the stack's own schedule — the first whose only
+// target is this stack — or nil when it has none.
+func ownStackSchedule(rows []*store.Schedule, nodeID, project string) (Schedule, *store.Schedule) {
+	for _, row := range rows {
+		sc := scheduleFromRow(row)
+		if isOwnStackSchedule(sc, nodeID, project) {
+			return sc, row
+		}
+	}
+	return Schedule{}, nil
+}
+
+// isOwnStackSchedule reports whether this stack is the schedule's only target.
+func isOwnStackSchedule(sc Schedule, nodeID, project string) bool {
+	return len(sc.Targets) == 1 && sc.Targets[0].NodeID == nodeID && sc.Targets[0].Stack == project
+}
+
+// cachedStackMembers returns a compose project's containers on a node from the
+// inventory cache, without a Docker call.
+func (s *Server) cachedStackMembers(nodeID, project string) []*dockercli.Container {
+	s.statMu.RLock()
+	defer s.statMu.RUnlock()
+	st, ok := s.stats[nodeID]
+	if !ok {
+		return nil
+	}
+	var members []*dockercli.Container
+	for _, c := range st.Containers {
+		if c.Stack == project {
+			members = append(members, c)
+		}
+	}
+	return members
+}
+
+// stackScheduleTiming is when a stack's own schedule runs, as its page sets it.
+type stackScheduleTiming struct {
+	Enabled    bool   `json:"enabled"`
+	Kind       string `json:"kind"`
+	Time       string `json:"time"`
+	Weekday    int    `json:"weekday"`
+	Monthday   int    `json:"monthday"`
+	Cron       string `json:"cron"`
+	Consistent bool   `json:"consistent"`
+}
+
+// handleStackSchedules returns every schedule that backs a compose project up.
+func (s *Server) handleStackSchedules(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.store.GetNode(id); err != nil {
+		errJSON(w, http.StatusNotFound, "node not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.stackSchedules(id, r.PathValue("project")))
+}
+
+// handleSetStackSchedule gives a compose project its own schedule — one whose
+// only target is the stack — or changes when the one it has runs. Other
+// schedules are left as they are.
+func (s *Server) handleSetStackSchedule(w http.ResponseWriter, r *http.Request) {
+	id, project := r.PathValue("id"), r.PathValue("project")
+	node, err := s.store.GetNode(id)
+	if err != nil {
+		errJSON(w, http.StatusNotFound, "node not found")
+		return
+	}
+	var timing stackScheduleTiming
+	if err := readJSON(r, &timing); err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	rows, err := s.store.ListSchedules()
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	sc, existing := ownStackSchedule(rows, id, project)
+	if existing == nil {
+		sc = Schedule{ID: randToken()[:12], Name: project + " on " + node.Name}
+	}
+	sc.Enabled, sc.Kind, sc.Time, sc.Weekday, sc.Monthday, sc.Cron = timing.Enabled, timing.Kind, timing.Time, timing.Weekday, timing.Monthday, timing.Cron
+	sc.Targets = []ScheduleTarget{{NodeID: id, Stack: project, Consistent: timing.Consistent}}
+	row, err := sc.toRow()
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if existing != nil {
+		row.LastRun = existing.LastRun // keep the baseline across edits
+	}
+	if err := s.store.UpsertSchedule(row); err != nil {
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.store.Audit(userFrom(r), "stack.schedule.update", project,
+		fmt.Sprintf("node=%s schedule=%q enabled=%v kind=%s consistent=%v", node.Name, sc.Name, sc.Enabled, sc.Kind, timing.Consistent))
+	writeJSON(w, http.StatusOK, s.stackSchedules(id, project))
+}
+
+// handleRemoveStackFromSchedule takes a compose project out of one schedule.
+// The stack's own schedule, left with no target, is deleted.
+func (s *Server) handleRemoveStackFromSchedule(w http.ResponseWriter, r *http.Request) {
+	id, project := r.PathValue("id"), r.PathValue("project")
+	row, err := s.store.GetSchedule(r.PathValue("sid"))
+	if err != nil {
+		errJSON(w, http.StatusNotFound, "schedule not found")
+		return
+	}
+	sc := scheduleFromRow(row)
+	target := ScheduleTarget{NodeID: id, Stack: project}
+	if !scheduleTargetIn(sc.Targets, target) {
+		errJSON(w, http.StatusNotFound, "this stack is not a target of that schedule")
+		return
+	}
+	if isOwnStackSchedule(sc, id, project) {
+		err = s.store.DeleteSchedule(row.ID)
+	} else {
+		s.removeScheduleTargets(row.ID, []ScheduleTarget{target})
+	}
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.store.Audit(userFrom(r), "stack.schedule.remove", project, fmt.Sprintf("node=%s schedule=%q", id, sc.Name))
+	writeJSON(w, http.StatusOK, s.stackSchedules(id, project))
+}
+
 // keepShortest records d under key unless a shorter interval is already there.
 func keepShortest(m map[string]time.Duration, key string, d time.Duration) {
 	if prev, ok := m[key]; ok && prev <= d {

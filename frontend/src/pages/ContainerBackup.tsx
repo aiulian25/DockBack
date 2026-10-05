@@ -22,9 +22,10 @@ import {
   ChevronRight, CloudUpload, CalendarClock, Pencil,
   CheckCircle2, Loader2, AlertTriangle, Database, ShieldCheck, HardDrive, Wrench, Bell, Gauge, X, History, RotateCcw, Tags, Copy, ClipboardPaste, Layers, ServerCog, Play, Users, Check,
 } from "lucide-react";
-import { api, Backup, ContainerInfo, CriticalStatus, Destination, ExportPreset, MountInfo, Node, RegenerablePath, PolicyOverride, ContainerPolicy, LabelPolicy, Standby, fmtBytes, fmtAgo } from "../api";
+import { api, Backup, ContainerInfo, CriticalStatus, Destination, ExportPreset, MountInfo, Node, RegenerablePath, PolicyOverride, ContainerPolicy, ContainerSchedule, LabelPolicy, Standby, fmtBytes, fmtAgo } from "../api";
 import { Button, Card, Input, Label, Select } from "../components/ui";
 import BackupCloudIcon from "../components/BackupCloudIcon";
+import ScheduleList from "../components/ScheduleList";
 import BackupConsole from "../components/BackupConsole";
 import { useToast } from "../components/Toast";
 import { usePoll } from "../hooks/usePoll";
@@ -957,7 +958,7 @@ export default function ContainerBackup() {
             </div>
 
             <Button variant="primary" className="mb-2 w-full py-3" disabled={starting || !c || backupInProgress || !!pendingId} onClick={initiate}>
-              <BackupCloudIcon size={18} active={starting || !!pendingId || backupInProgress} /> {backupInProgress ? "Backup in progress…" : pendingId ? "Backup queued…" : starting ? "Starting backup…" : "Initiate Backup Now"}
+              <BackupCloudIcon size={18} active={starting || !!pendingId || backupInProgress} /> {runButtonLabel({ backupInProgress, queued: !!pendingId, starting })}
             </Button>
           </Card>
         </div>
@@ -972,7 +973,7 @@ export default function ContainerBackup() {
       {/* ---------------- SCHEDULE & RETENTION ---------------- */}
       {tab === "schedule" && (
         <Card className="p-5">
-            <ContainerPolicyPanel id={id} cid={cid} onNavigateSettings={() => navigate("/settings#schedule")} />
+            <ContainerPolicyPanel id={id} cid={cid} stack={c?.stack} onNavigateSettings={() => navigate("/settings#schedule")} />
 
             {(recommendStop || c?.is_database) && (
               <div className="mt-4 flex items-start gap-2 rounded border border-warning/20 bg-warning/10 px-3 py-2 text-sm text-warning">
@@ -1394,12 +1395,20 @@ const FREQ_OPTS = [
   { h: 720, label: "At most once a month" },
 ];
 
+// What the run button says: the state of this container's backup, else what it does.
+function runButtonLabel(state: { backupInProgress: boolean; queued: boolean; starting: boolean }): string {
+  if (state.backupInProgress) return "Backup in progress…";
+  if (state.queued) return "Backup queued…";
+  if (state.starting) return "Starting backup…";
+  return "Start backup";
+}
+
 // ContainerPolicyPanel — per-container backup frequency + retention override
 // (PLAN §4.2 granular control). Collapsible like "Advanced — backup hooks";
 // replaces the old "Schedule in Settings" button. Overrides the global policy for
 // THIS container so large apps (Jellyfin, Plex, Bookstack…) can keep fewer/shorter
 // copies and back up less often, instead of eating space at the fleet default.
-function ContainerPolicyPanel({ id, cid, onNavigateSettings }: { id: string; cid: string; onNavigateSettings: () => void }) {
+function ContainerPolicyPanel({ id, cid, stack, onNavigateSettings }: { id: string; cid: string; stack?: string; onNavigateSettings: () => void }) {
   const [open, setOpen] = useState(false);
   const [cp, setCp] = useState<ContainerPolicy | null>(null);
   const [ov, setOv] = useState<PolicyOverride | null>(null);
@@ -1447,9 +1456,14 @@ function ContainerPolicyPanel({ id, cid, onNavigateSettings }: { id: string; cid
   );
 
   return (
-    <div className="mt-2 border-t border-outline-variant/50 pt-3">
+    <div>
+      <div className="mb-2 flex items-center gap-2 text-sm font-semibold"><CalendarClock size={15} className="text-primary" /> Backed up automatically by</div>
+      {cp ? <ScheduleCoverage schedules={cp.schedules || []} stack={stack} /> : <p className="text-xs text-on-surface-variant">Loading…</p>}
+      <button onClick={onNavigateSettings} className="mt-2 text-[11px] font-medium text-primary hover:underline">Change schedules in Settings →</button>
+
+      <div className="mt-4 border-t border-outline-variant/50 pt-3">
       <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-1 text-xs font-medium uppercase tracking-wider text-on-surface-variant hover:text-on-surface">
-        <CalendarClock size={13} /> Advanced — backup schedule &amp; retention {open ? "▾" : "▸"}
+        <CalendarClock size={13} /> Advanced — backup frequency &amp; retention {open ? "▾" : "▸"}
       </button>
 
       {open && ov && (
@@ -1474,11 +1488,11 @@ function ContainerPolicyPanel({ id, cid, onNavigateSettings }: { id: string; cid
                   </Select>
                 </label>
                 <p className="text-xs italic text-on-surface-variant">
-                  When the global schedule fires, this container is skipped if its last successful backup is newer than the interval — so it backs up less often than the rest of the fleet.
+                  When a schedule fires, this container is skipped if its last successful backup is newer than the interval — so it backs up less often than the rest of the fleet.
                 </p>
               </div>
             ) : (
-              <p className="mt-2 text-xs text-on-surface-variant">Inherits the global schedule — backs up on every scheduled run.</p>
+              <p className="mt-2 text-xs text-on-surface-variant">Backs up on every run of the schedules above.</p>
             )}
           </div>
 
@@ -1520,13 +1534,30 @@ function ContainerPolicyPanel({ id, cid, onNavigateSettings }: { id: string; cid
             </Button>
             {msg && <span className="text-sm text-on-surface-variant">{msg}</span>}
           </div>
-
-          <p className="text-[11px] text-on-surface-variant">
-            Automatic runs use the global schedule (on/off &amp; time).{" "}
-            <button onClick={onNavigateSettings} className="font-medium text-primary hover:underline">Configure the schedule in Settings →</button>
-          </p>
         </div>
       )}
+      </div>
     </div>
   );
+}
+
+// How a schedule reaches the container, in words.
+function coverageText(schedule: ContainerSchedule, stack?: string): string {
+  if (schedule.covers === "container") return "This container, by name";
+  if (schedule.covers === "stack") return stack ? `Its stack “${stack}”` : "Its compose stack";
+  return schedule.include_stopped ? "Every container on this server" : "Every running container on this server";
+}
+
+// ScheduleCoverage lists the schedules that back the container up, or says
+// that none does.
+function ScheduleCoverage({ schedules, stack }: { schedules: ContainerSchedule[]; stack?: string }) {
+  if (schedules.length === 0) {
+    return (
+      <div className="rounded border border-warning/30 bg-warning/10 px-3 py-2.5 text-sm">
+        <div className="font-medium text-warning">No schedule backs this container up</div>
+        <p className="mt-0.5 text-xs text-on-surface-variant">It is backed up only when someone runs a backup. Protect it, or add it to a schedule in Settings.</p>
+      </div>
+    );
+  }
+  return <ScheduleList schedules={schedules} describe={(schedule) => coverageText(schedule, stack)} />;
 }

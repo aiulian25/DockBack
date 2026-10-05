@@ -201,6 +201,11 @@ export type FollowOptions = {
   since?: number;
   /** Extra run ids whose lines are shown but can never end the run. */
   alsoShow?: string[];
+  /**
+   * Containers whose lines are shown but can never end the run: a stack's
+   * services, whose backups each log under their own backup id.
+   */
+  alsoShowContainers?: string[];
   /** Show only lines this accepts (e.g. isRestoreProgressLine). */
   filter?: (msg: string) => boolean;
 };
@@ -210,13 +215,14 @@ export type FollowOptions = {
  *
  * The structured `run.done` event is the verdict when it arrives. The line rules
  * remain as the fallback, deliberately: run.done is not replayed to a console
- * that connects late, and stack backups do not publish it yet.
+ * that connects late.
  *
  * Returns a function that stops following. It is safe to call after the run has
  * already ended.
  */
 export function followRun(runId: string, opts: FollowOptions): () => void {
   const also = new Set(opts.alsoShow || []);
+  const alsoContainers = new Set(opts.alsoShowContainers || []);
   let finished = false;
   let stopLines: (() => void) | null = null;
   let detachDone: (() => void) | null = null;
@@ -237,7 +243,8 @@ export function followRun(runId: string, opts: FollowOptions): () => void {
 
   stopLines = subscribeLines((line) => {
     const own = line.backup_id === runId;
-    if (!own && !also.has(line.backup_id || "")) return;
+    const related = also.has(line.backup_id || "") || alsoContainers.has(line.container_id || "");
+    if (!own && !related) return;
     if (opts.since !== undefined && new Date(line.time).getTime() < opts.since) return;
     if (opts.filter && !opts.filter(line.msg)) return;
     opts.onLine?.(line);

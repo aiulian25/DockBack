@@ -161,7 +161,10 @@ type serviceCapture struct {
 // normal backup apart from the ConsistencyGroup tag. Returns a ready capture;
 // the caller owns cleanup of work on success (storeAndVerify reads it).
 func (e *Engine) prepareServiceCapture(ctx context.Context, cli *client.Client, nodeName, nodeID, containerID, groupID string, groupAt int64, opts Options) (*serviceCapture, error) {
-	id := newID()
+	id := opts.BackupID
+	if id == "" {
+		id = newID()
+	}
 	b := &store.Backup{ID: id, NodeID: nodeID, Status: "running"}
 	start := time.Now()
 
@@ -369,7 +372,9 @@ func (e *Engine) prepareServiceCapture(ctx context.Context, cli *client.Client, 
 // plus any per-run overrides, so a consistent stack run produces the same
 // archive per service a manual or scheduled run would. nil = every service uses
 // the opts template verbatim (previous behavior). Group-wide fields (the
-// per-run PauseMode override) still come from the template.
+// per-run PauseMode override) still come from the template. A BackupID it sets
+// becomes that service's backup id, so the caller can tag the service's log
+// lines before the first one is written.
 func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project string, opts Options, perService func(containerID, name string) Options) error {
 	logID := "stack:" + project
 	cli, err := e.Reg.Get(nodeID)
@@ -428,6 +433,10 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 	// PHASE 1 — prepare every service with NO pause. A service that fails to
 	// prepare is skipped with a WARN; the remaining services still form a group.
 	var caps []*serviceCapture
+	// missed names every member that ends the run without a backup, and firstErr
+	// says why the first of them failed.
+	var missed []string
+	var firstErr error
 	for _, c := range members {
 		svcOpts := opts
 		if perService != nil {
@@ -444,6 +453,10 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 					memberKey(c), atomicSet.Why, atomicSet.Symptom, perr)
 			}
 			e.logf(logID, "WARN", "Skipping service %q — preparation failed: %v", c.Service, perr)
+			missed = append(missed, memberKey(c))
+			if firstErr == nil {
+				firstErr = fmt.Errorf("service %q: %w", memberKey(c), perr)
+			}
 			continue
 		}
 		if atomicSet != nil {
@@ -621,7 +634,6 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 	runPost()
 
 	// PHASE 3 — finalize each captured service OUTSIDE the pause window.
-	var firstErr error
 	ok := 0
 	for _, sc := range caps {
 		// F143: certificates are static files, so their inventory belongs out here
@@ -636,6 +648,7 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 		}
 		if sc.captureErr != nil {
 			_ = e.fail(sc.b, sc.captureErr)
+			missed = append(missed, sc.key)
 			if firstErr == nil {
 				firstErr = fmt.Errorf("service %q: %w", sc.service, sc.captureErr)
 			}
@@ -643,7 +656,10 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 		}
 		man := sc.man
 		if _, serr := e.storeAndVerify(ctx, sc.id, nodeName, sc.stack, sc.name, sc.b, &man, sc.opts, sc.work, sc.algo, sc.zlevel, sc.zwindow, sc.uncompressed, sc.start); serr != nil {
-			e.logf(logID, "ERR", "Service %q finalize failed: %v", sc.service, serr)
+			// Under the service's own id: an error under the stack's id ends the
+			// stack's console while the other services are still finishing.
+			e.logf(sc.id, "ERR", "Finalizing the backup of %q failed: %v", sc.name, serr)
+			missed = append(missed, sc.key)
 			if firstErr == nil {
 				firstErr = fmt.Errorf("service %q: %w", sc.service, serr)
 			}
@@ -651,7 +667,11 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 		}
 		ok++
 	}
-	e.logf(logID, "INFO", "App-consistent snapshot complete — %d/%d service(s) captured in group %s", ok, len(caps), groupID)
+	if len(missed) == 0 {
+		e.logf(logID, "INFO", "App-consistent snapshot complete — all %d service(s) captured in group %s", ok, groupID)
+		return nil
+	}
+	e.logf(logID, "ERR", "App-consistent snapshot failed for %d of %d service(s): %s — %d captured in group %s", len(missed), len(members), strings.Join(missed, ", "), ok, groupID)
 	return firstErr
 }
 

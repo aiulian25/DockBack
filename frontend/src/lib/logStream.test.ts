@@ -205,6 +205,17 @@ describe("followRun", () => {
     expect(onDone).toHaveBeenCalledWith("ok", expect.any(String));
   });
 
+  it("shows a stack's services, which log under their own ids, without letting them end it", () => {
+    const onDone = vi.fn(), onLine = vi.fn();
+    followRun("stack:shop", { mode: "stack", alsoShowContainers: ["c-web"], onDone, onLine });
+    live().line({ ...lineOf("b-web", "backup complete"), container_id: "c-web" });
+    live().line({ ...lineOf("b-other", "Archiving 1 volume path(s)"), container_id: "c-elsewhere" });
+    expect(onLine).toHaveBeenCalledTimes(1);
+    expect(onDone).not.toHaveBeenCalled();
+    live().line(lineOf("stack:shop", "Stack backup failed for 1 of 2 service(s): db — each one's own backup log says why", "ERR"));
+    expect(onDone.mock.calls[0][0]).toBe("failed");
+  });
+
   it("shows only what the filter accepts, and drops replayed history", () => {
     const onLine = vi.fn();
     const now = Date.now();

@@ -46,25 +46,19 @@ type nodeBackupAllResp struct {
 	Names   []string `json:"names"`
 }
 
-// nodeBackupTargets picks the containers a whole-node run should capture.
+// nodeBackupTargets picks the containers a whole-node run should capture —
+// Full Server Backup, and a schedule's whole-node target.
 //
 // Pure (no live Docker, no store) so the decision about WHAT gets backed up is
 // unit-testable, and sorted so two runs of the same node enqueue in the same
 // order — the queue is FIFO within a priority, so the order is what the operator
-// watches happen.
-func nodeBackupTargets(list []*dockercli.Container, includeStopped bool) []*dockercli.Container {
+// watches happen. F219: DockBack's own test clones are throwaway copies it will
+// delete tomorrow; backing one up would store a copy of a copy under a name that
+// stops existing (see wholeServerTakes, which also leaves out ignored ones).
+func nodeBackupTargets(list []*dockercli.Container, includeStopped bool, ignored ignoreSet) []*dockercli.Container {
 	out := []*dockercli.Container{}
 	for _, c := range list {
-		if c == nil || c.ID == "" {
-			continue
-		}
-		// F219: DockBack's own test clones are throwaway copies it will delete
-		// tomorrow. Backing one up would store a copy of a copy under a name that
-		// stops existing, and it would land in the catalog beside the real thing.
-		if isTestClone(c) {
-			continue
-		}
-		if c.State != "running" && !includeStopped {
+		if c == nil || c.ID == "" || !wholeServerTakes(c, includeStopped, ignored) {
 			continue
 		}
 		out = append(out, c)
@@ -111,7 +105,7 @@ func (s *Server) handleBackupNodeAll(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	targets := nodeBackupTargets(list, req.IncludeStopped)
+	targets := nodeBackupTargets(list, req.IncludeStopped, s.ignoredOn(id))
 	if len(targets) == 0 {
 		errJSON(w, http.StatusNotFound, "no containers to back up on this node")
 		return

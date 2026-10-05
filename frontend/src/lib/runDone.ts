@@ -12,9 +12,9 @@
 // operator still reads it — but nothing DECIDES on it.
 //
 // The text matching each console already has stays in place as a fallback, and
-// deliberately: run.done is not replayed to a client that connects late, and
-// stack BACKUPS do not publish it yet. A console that hears the event acts on
-// it; one that does not carries on exactly as it did.
+// deliberately: run.done is not replayed to a client that connects late. A
+// console that hears the event acts on it; one that does not carries on exactly
+// as it did.
 
 /** How a run ended. Canceled is its own answer — the operator chose it. */
 export type RunOutcome = "ok" | "failed" | "canceled";

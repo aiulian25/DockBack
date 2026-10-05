@@ -255,25 +255,80 @@ func (s *Server) removeFromQueue(id string) {
 	_ = s.store.DeleteQueuedJob(id)
 }
 
-// backupsInFlight reports how many backup jobs are queued or running. The jobs
-// map holds both, and entries are removed at completion.
-func (s *Server) backupsInFlight() int {
+// archiveWritersInFlight reports how many runs that write backup archives are
+// queued or running: every backup job (the jobs map holds queued and running
+// ones, removed at completion), plus the app-consistent stack backups and
+// restores counted by beginOutsideQueueRun.
+func (s *Server) archiveWritersInFlight() int {
 	s.jobMu.Lock()
 	defer s.jobMu.Unlock()
-	return len(s.jobs)
+	return len(s.jobs) + int(s.outsideQueueRuns.Load())
+}
+
+// backupsPendingFor reports whether any backup of these containers on the node
+// is queued or running.
+func (s *Server) backupsPendingFor(nodeID string, containers map[string]bool) bool {
+	s.jobMu.Lock()
+	defer s.jobMu.Unlock()
+	for _, j := range s.jobs {
+		if j.nodeID == nodeID && containers[j.containerID] {
+			return true
+		}
+	}
+	return false
 }
 
 // holdBackupsForRotation stops the dispatcher from STARTING anything new, so a
 // key rotation cannot begin re-wrapping the catalog while a backup is writing
 // into it (F16). Queued jobs simply stay queued — the same thing that happens
 // while a restore holds their stack — and the returned function releases the
-// hold and wakes the dispatcher.
-func (s *Server) holdBackupsForRotation() (release func()) {
-	s.rotating.Store(true)
+// hold and wakes the dispatcher. ok is false while another rotation holds it:
+// two rotations re-wrapping at once, the first to finish lifting the hold
+// under the other, is what the hold exists to prevent.
+func (s *Server) holdBackupsForRotation() (release func(), ok bool) {
+	if !s.rotating.CompareAndSwap(false, true) {
+		return nil, false
+	}
 	return func() {
 		s.rotating.Store(false)
 		s.signalQueue()
+	}, true
+}
+
+// rotationWaitInterval is how often a run held back by a key rotation looks
+// again whether the rotation is over.
+const rotationWaitInterval = time.Second
+
+// beginOutsideQueueRun counts an app-consistent stack backup or a restore as in
+// flight. Both write backup archives — the snapshot itself, a restore's safety
+// snapshot — without passing through the job queue, so the dispatcher's hold
+// never reached them and a key rotation could start under one (F16). Counted, a
+// rotation refuses to start; and while a rotation holds backups, this waits the
+// way queued jobs wait. It does not watch for a cancel: a run canceled while it
+// waits stops once the rotation is over. Call end when the run is over.
+func (s *Server) beginOutsideQueueRun(logID string) (end func()) {
+	end = func() { s.outsideQueueRuns.Add(-1) }
+	if s.countOutsideQueueRun() {
+		return end
 	}
+	s.logSink(logID, "INFO", "Waiting for the master-key rotation to finish before starting")
+	for !s.countOutsideQueueRun() {
+		time.Sleep(rotationWaitInterval)
+	}
+	return end
+}
+
+// countOutsideQueueRun counts one more run unless a rotation holds backups. A
+// rotation sets its hold and then counts runs; this counts and then reads the
+// hold. Each side writes before it reads, so at least one sees the other: a run
+// never starts under a rotation that has passed its check.
+func (s *Server) countOutsideQueueRun() bool {
+	s.outsideQueueRuns.Add(1)
+	if !s.rotating.Load() {
+		return true
+	}
+	s.outsideQueueRuns.Add(-1)
+	return false
 }
 
 // queueDepth reports the number of jobs waiting for a slot (for /metrics).

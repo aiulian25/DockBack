@@ -183,11 +183,13 @@ func (s *Server) computeCoverage(now time.Time) (coverageResp, error) {
 			resp.Nodes = append(resp.Nodes, cn)
 			continue
 		}
+		ignored := s.ignoredOn(n.ID)
 		for _, c := range st.Containers {
 			// F219: a test clone is DockBack's own, temporary, and about to be
 			// removed. Counting it as an unprotected container would ask the
 			// operator to go and protect something that will not exist tomorrow.
-			if isTestClone(c) {
+			// An ignored one was judged not worth a backup by the operator.
+			if isTestClone(c) || ignored.has(c) {
 				continue
 			}
 			interval, scheduled := cover.interval(n.ID, c)

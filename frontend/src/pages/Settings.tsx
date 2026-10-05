@@ -8,6 +8,7 @@ import {
   DatabaseBackup, Download, Upload, RotateCcw, Pencil, Palette, Check, AlertTriangle, X, Gauge, RefreshCw, ScanSearch, Search, Bell, Copy, Layers, ShieldCheck, Timer,
 } from "lucide-react";
 import { minPasswordLength, PASSWORD_LEN_FLOOR, PASSWORD_LEN_CEILING } from "../lib/passwordPolicy";
+import { WEEKDAYS } from "../lib/format";
 import ExportPresetsCard from "../components/ExportPresetsCard";
 import { api, AdoptSkip, Destination, Policy, Schedule, Node, Container, AppBackup, AppDest, AppBackupSchedule, MigrateLayoutStatus, NamedSchedule, RetentionPreview, ScheduleTarget, ApiToken, SessionDevice, StepUpError, EgressAudit, fmtBytes, fmtAgo } from "../api";
 import { Button, Card, Input, Label, Select, Modal } from "../components/ui";
@@ -965,7 +966,7 @@ function SettingsInner() {
                         <div>
                           <Label>Day of week</Label>
                           <Select value={ps.weekday} onChange={(e) => setPrune({ weekday: parseInt(e.target.value, 10) })}>
-                            {["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].map((d, i) => <option key={i} value={i}>{d}</option>)}
+                            {WEEKDAYS.map((d, i) => <option key={i} value={i}>{d}</option>)}
                           </Select>
                         </div>
                       )}
@@ -1898,7 +1899,7 @@ function SettingsInner() {
               <div>
                 <Label>Day of week</Label>
                 <Select value={abSched.weekday} onChange={(e) => setAbSchedField({ weekday: parseInt(e.target.value, 10) })}>
-                  {["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].map((d, i) => <option key={i} value={i}>{d}</option>)}
+                  {WEEKDAYS.map((d, i) => <option key={i} value={i}>{d}</option>)}
                 </Select>
               </div>
             )}
@@ -2091,7 +2092,7 @@ function SettingsInner() {
                   <div>
                     <Label>Day of week</Label>
                     <Select value={sc.weekday} onChange={(e) => patchSched(idx, { weekday: parseInt(e.target.value, 10) })}>
-                      {["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].map((d, i) => <option key={i} value={i}>{d}</option>)}
+                      {WEEKDAYS.map((d, i) => <option key={i} value={i}>{d}</option>)}
                     </Select>
                   </div>
                 )}

@@ -8,10 +8,10 @@ import {
   CloudUpload, MoreVertical, Wifi, WifiOff, TrendingUp, CheckCircle2, XCircle,
   History, Loader2, Copy, DatabaseBackup, Search,
 } from "lucide-react";
-import { Layers, RotateCcw, SlidersHorizontal, HardDrive, ShieldAlert, ShieldCheck, KeyRound, FileJson } from "lucide-react";
+import { Layers, RotateCcw, SlidersHorizontal, HardDrive, ShieldAlert, ShieldCheck, KeyRound, FileJson, EyeOff } from "lucide-react";
 import ExportDownloadButton from "../components/ExportDownloadButton";
 import { followRun } from "../lib/logStream";
-import { api, Container, ContainerPage, Backup, StackInfo, Destination, CoverageContainer, NodePolicy, PolicyOverride, NodeDetail as NodeDetailT, OrphanVolume, NodeHealthResp, Node as NodeT, fmtBytes, fmtAgo } from "../api";
+import { api, Container, ContainerPage, Backup, StackInfo, Destination, CoverageContainer, IgnoredItem, NodePolicy, PolicyOverride, NodeDetail as NodeDetailT, OrphanVolume, NodeHealthResp, Node as NodeT, fmtBytes, fmtAgo } from "../api";
 import { Button, Card, Chip, Modal, Select } from "../components/ui";
 import BackupCloudIcon from "../components/BackupCloudIcon";
 import { useEventStream } from "../hooks/useEventStream";
@@ -73,6 +73,22 @@ export default function NodeDetail() {
       setStale(node?.stale || []);
     }).catch(() => {});
   }, [id]);
+
+  // Containers and stacks left out of the warnings above and of whole-server
+  // backups — ones whose data comes back on its own.
+  const [ignored, setIgnored] = useState<IgnoredItem[]>([]);
+  const [ignoredOpen, setIgnoredOpen] = useState(false);
+  const loadIgnored = useCallback(() => { api.ignored(id).then(setIgnored).catch(() => setIgnored([])); }, [id]);
+  useEffect(() => { loadIgnored(); }, [loadIgnored]);
+  const isIgnored = (kind: IgnoredItem["kind"], name: string) => ignored.some((item) => item.kind === kind && item.name === name);
+  const ignoredWithStack = (c: { name: string; stack?: string }) => isIgnored("container", c.name) || (!!c.stack && isIgnored("stack", c.stack));
+  const setIgnore = async (kind: IgnoredItem["kind"], name: string, ignore: boolean) => {
+    try {
+      setIgnored(await (ignore ? api.ignore(id, kind, name) : api.unignore(id, kind, name)));
+      toast.success(ignore ? `${name} is ignored: no more warnings, and whole-server backups leave it out.` : `${name} is no longer ignored.`);
+    } catch (e) { toast.error(`Couldn't change ${name}: ${(e as Error).message}`); }
+    loadCoverage();
+  };
   // One-click protect (B5) from the unprotected banner: smart defaults + first backup.
   const protectContainer = async (cid: string) => {
     try {
@@ -184,7 +200,7 @@ export default function NodeDetail() {
   // The bulk action awaiting a destination choice ("Backup Stack" / "Full
   // Server Backup"). Holds the running-container count for the server case.
   // Full-server bulk backup picker; the stack backup has its own F80 panel.
-  const [pending, setPending] = useState<{ kind: "server"; count: number } | null>(null);
+  const [pending, setPending] = useState<{ kind: "server"; count: number; ignored: number } | null>(null);
 
   // Stacks.
   const [stacks, setStacks] = useState<StackInfo[]>([]);
@@ -402,10 +418,11 @@ export default function NodeDetail() {
 
   // Open the destination picker for a bulk action; nothing runs until confirmed.
   const openServerBackup = async () => {
-    const run = await allRunning();
+    const running = await allRunning();
+    const run = running.filter((c) => !ignoredWithStack(c));
     if (run.length === 0) { setMsg("No running containers to back up."); return; }
     setIncludeStopped(false); // an opt-in, re-asked each time rather than remembered
-    setPending({ kind: "server", count: run.length });
+    setPending({ kind: "server", count: run.length, ignored: running.length - run.length });
   };
   const confirmPending = (selected: string[]) => {
     if (!pending) return;
@@ -446,7 +463,7 @@ export default function NodeDetail() {
       <BackupTargetsModal
         open={!!pending}
         title="Full server backup"
-        subtitle={pending?.kind === "server" ? `Backs up all ${pending.count} running container(s) on ${nodeName}, each with its own remembered options. Choose where the copies go.` : undefined}
+        subtitle={pending?.kind === "server" ? `Backs up all ${pending.count} running container(s) on ${nodeName}, each with its own remembered options${pending.ignored > 0 ? ` — ${pending.ignored} ignored left out` : ""}. Choose where the copies go.` : undefined}
         destinations={dests}
         defaultSelected={defaultDests}
         confirmLabel="Start backup"
@@ -463,6 +480,33 @@ export default function NodeDetail() {
           </span>
         </label>
       </BackupTargetsModal>
+
+      <Modal open={ignoredOpen} onClose={() => setIgnoredOpen(false)} title={`Ignored on ${nodeName}`}
+        footer={<Button onClick={() => setIgnoredOpen(false)}>Close</Button>}>
+        <p className="mb-3 text-xs text-on-surface-variant">
+          Left out of the never-backed-up and stale warnings, their alerts and the daily digest, and of whole-server backups
+          (Full Server Backup and whole-server schedules). A schedule that names one still backs it up, and so does a backup
+          started from its own page.
+        </p>
+        {ignored.length === 0 ? (
+          <p className="py-4 text-center text-sm text-on-surface-variant">Nothing is ignored on this server. Use Ignore on a warning, a stack, or a container&rsquo;s menu.</p>
+        ) : (
+          <div className="space-y-1.5">
+            {ignored.map((item) => (
+              <div key={`${item.kind}:${item.name}`} className="flex items-center gap-2.5 rounded-lg bg-surface-container px-3 py-2">
+                {item.kind === "stack" ? <Layers size={15} className="shrink-0 text-on-surface-variant" /> : <Box size={15} className="shrink-0 text-on-surface-variant" />}
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm text-on-surface">{item.name}</div>
+                  <div className="truncate text-xs text-on-surface-variant">
+                    {item.kind}{item.detail ? ` · ${item.detail}` : ""}{item.present ? "" : " · not on this server now"}
+                  </div>
+                </div>
+                <Button size="sm" onClick={() => void setIgnore(item.kind, item.name, false)}>Stop ignoring</Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Modal>
 
 
       {/* Breadcrumb */}
@@ -526,6 +570,9 @@ export default function NodeDetail() {
             title="Download how every container here is put together — inspect records with environment names only, networks and volumes — as one file. Confirms your password first."
             request={async (password, code) => api.evidenceURL(id, (await api.evidenceGrant(id, password, code)).ticket)} />
           <Button onClick={refresh}><RefreshCw size={16} /> Refresh</Button>
+          <Button onClick={() => setIgnoredOpen(true)} title="Containers and stacks left out of the warnings and of whole-server backups">
+            <EyeOff size={16} /> Ignored{ignored.length > 0 ? ` (${ignored.length})` : ""}
+          </Button>
           <Button variant="primary" onClick={openServerBackup} disabled={busyAll}>
             <BackupCloudIcon size={16} active={busyAll} /> Full Server Backup
           </Button>
@@ -579,6 +626,7 @@ export default function NodeDetail() {
         stale={stale}
         stoppedAtRisk={stoppedAtRisk}
         onProtect={protectContainer}
+        onIgnore={(c) => setIgnore("container", c.name, true)}
         onProtectAll={protectAll}
         protectingAll={protectingAll}
         onOpen={(cid) => navigate(`/servers/${id}/containers/${cid}`)}
@@ -596,7 +644,9 @@ export default function NodeDetail() {
             <span className="text-xs text-on-surface-variant">compose projects — back up or rebuild the whole stack at once</span>
           </div>
           <div className="divide-y divide-outline-variant/30">
-            {stacks.map((st) => (
+            {stacks.map((st) => {
+              const stackIgnored = isIgnored("stack", st.name);
+              return (
               <div key={st.name} className="flex flex-wrap items-center gap-3 px-4 py-2.5 text-sm">
                 <Layers size={15} className="text-on-surface-variant" />
                 <span className="font-medium">{st.name}</span>
@@ -604,6 +654,7 @@ export default function NodeDetail() {
                 {st.backed_up > 0
                   ? <Chip kind="ok">{st.backed_up}/{st.services} backed up</Chip>
                   : <Chip kind="muted">not backed up</Chip>}
+                {stackIgnored && <Chip kind="muted"><EyeOff size={11} /> ignored</Chip>}
                 {/* F224: both open the stack's own pages now. A compose project
                     is a thing with a page, not a dialog you summon from a row. */}
                 <div className="ml-auto flex flex-wrap gap-2">
@@ -611,7 +662,11 @@ export default function NodeDetail() {
                       the project ONE app-consistent schedule target and a first
                       backup — the alternative is a visit to each service's page,
                       which also loses the consistency this button buys. */}
-                  {st.backed_up < st.services && (
+                  <Button variant="ghost" onClick={() => setIgnore("stack", st.name, !stackIgnored)}
+                    title={stackIgnored ? `Warn about ${st.name} again and include it in whole-server backups` : `Stop warning about ${st.name} and leave it out of whole-server backups`}>
+                    <EyeOff size={15} /> {stackIgnored ? "Stop ignoring" : "Ignore"}
+                  </Button>
+                  {st.backed_up < st.services && !stackIgnored && (
                     <Button variant="secondary" onClick={() => protectStack(st.name)} disabled={stackRunning || protectingStack === st.name}
                       title={`Add ${st.name} to the automatic schedule as one app-consistent stack, and back it up now`}>
                       {protectingStack === st.name ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />} Protect
@@ -622,7 +677,8 @@ export default function NodeDetail() {
                     onClick={() => navigate(`/servers/${id}/stacks/${encodeURIComponent(st.name)}/restore`)}><RotateCcw size={15} /> Restore Stack</Button>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
           {stackOp && (
             <div className="border-t border-outline-variant/60 bg-surface-lowest p-4">
@@ -734,7 +790,10 @@ export default function NodeDetail() {
                           <Icon size={18} />
                         </div>
                         <div>
-                          <div className="font-bold text-on-surface">{c.name}</div>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="font-bold text-on-surface">{c.name}</span>
+                            {ignoredWithStack(c) && <Chip kind="muted"><EyeOff size={11} /> ignored</Chip>}
+                          </div>
                           {/* Copy-safe zone: clicking / double-clicking the ID never navigates. */}
                           <div className="cursor-text select-text font-mono text-[11px] text-on-surface-variant" onClick={(e) => e.stopPropagation()}>ID: {c.id.slice(0, 12)}</div>
                         </div>
@@ -775,6 +834,7 @@ export default function NodeDetail() {
                             <button onClick={() => backupOne(c)} disabled={busy === c.id} className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-surface-highest disabled:opacity-50"><BackupCloudIcon size={14} active={busy === c.id} /> Back up now</button>
                             <button onClick={() => { setRowMenu(""); navigate(`/servers/${id}/containers/${c.id}`); }} className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-surface-highest"><History size={14} /> Manage backups</button>
                             <button onClick={async () => { const ok = await copyText(c.id); setRowMenu(""); setMsg(ok ? "Container ID copied." : "Couldn't access the clipboard."); }} className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-surface-highest"><Copy size={14} /> Copy ID</button>
+                            <button onClick={() => { setRowMenu(""); void setIgnore("container", c.name, !isIgnored("container", c.name)); }} className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-surface-highest"><EyeOff size={14} /> {isIgnored("container", c.name) ? "Stop ignoring" : "Ignore"}</button>
                           </div>
                         )}
                       </div>

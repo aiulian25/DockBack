@@ -56,6 +56,8 @@ The flow is deliberately guarded:
 3. DockBack re-wraps and re-seals in place, then switches the running process to the new key. It reports how many backups were re-wrapped, skipped, or failed.
 4. It finishes by taking **one fresh app-backup on the new key automatically**, so the control-plane is immediately recoverable under the new key even if every earlier app-backup predates envelope encryption. The dialog shows its filename; if that step ever fails it becomes a follow-up warning, not a rotation failure.
 
+Rotation needs a quiet moment. It is refused while any backup — app-consistent stack snapshots included — or any restore is queued or running, since each of those can be sealing an archive with the outgoing key; the dialog says how many, and you try again once they finish. Only one rotation runs at a time. Backups and restores started while a rotation runs wait for it to finish, then carry on.
+
 **After a successful rotation you must update `DOCKBACK_ENCRYPTION_KEY`** (in your `.env`, or your keyfile) to the **new** key before the next restart — the running process is already on the new key, but a restart reads the environment. **Keep the old key archived** until you've verified backups restore under the new key.
 
 Two things rotation intentionally does **not** touch:

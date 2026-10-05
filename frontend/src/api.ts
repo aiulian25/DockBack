@@ -159,6 +159,11 @@ export interface Container {
 }
 export interface Stack { name: string; working_dir: string; config_files: string; containers: Container[]; running: number; total: number; }
 export interface StackInfo { name: string; services: number; running: number; backed_up: number; }
+// A container or stack the operator told DockBack to leave alone on one server:
+// no never-backed-up or stale warnings, no alerts, skipped by whole-server
+// backups. `present` turns false once it is gone; it stays listed so the choice
+// can be undone. `detail` is a container's image or a stack's service count.
+export interface IgnoredItem { kind: "container" | "stack"; name: string; present: boolean; container_id?: string; detail?: string; }
 export interface OrphanVolume { name: string; driver: string; bytes: number; } // F23: named volume with no container
 // F40: node connection-health history.
 export interface NodeHealthRow { ts: number; reachable: boolean; error?: string; }
@@ -410,6 +415,23 @@ export interface ContainerPolicy {
   name: string;
   override: PolicyOverride;
   inherited: { generations: number; keep_daily: number; keep_weekly: number; keep_monthly: number; keep_yearly: number; autoprune: boolean };
+  // Every schedule, on or off, that backs this container up, and how it reaches
+  // it: by name, through its compose stack, or with the rest of the server.
+  schedules: ContainerSchedule[];
+}
+export interface ContainerSchedule extends NamedSchedule { covers: "container" | "stack" | "node"; }
+// A schedule that backs a compose project up: as the stack itself (consistent =
+// every service in one quiesce window), by naming some of its services, or with
+// the whole server. `own` marks the stack's own schedule, the one its page edits.
+export interface StackSchedule extends NamedSchedule {
+  covers: "stack" | "container" | "node";
+  consistent?: boolean;
+  services?: string[];
+  own: boolean;
+}
+// When a stack's own schedule runs, and whether it snapshots every service at once.
+export interface StackScheduleTiming {
+  enabled: boolean; kind: string; time: string; weekday: number; monthday: number; cron: string; consistent: boolean;
 }
 export interface RetentionPreview {
   active: boolean; total_prune: number; total_prune_bytes: number;
@@ -1078,6 +1100,11 @@ export const api = {
   // F80: per-service effective backup options for the stack-backup panel — the
   // same settings the container page reads/writes (one source of truth).
   stackOptions: (id: string, project: string) => req<StackServiceOptions[]>("GET", `/api/nodes/${id}/stacks/${encodeURIComponent(project)}/options`),
+  stackSchedules: (id: string, project: string) => req<StackSchedule[]>("GET", `/api/nodes/${id}/stacks/${encodeURIComponent(project)}/schedules`),
+  setStackSchedule: (id: string, project: string, timing: StackScheduleTiming) =>
+    req<StackSchedule[]>("PUT", `/api/nodes/${id}/stacks/${encodeURIComponent(project)}/schedule`, timing),
+  removeStackFromSchedule: (id: string, project: string, scheduleId: string) =>
+    req<StackSchedule[]>("DELETE", `/api/nodes/${id}/stacks/${encodeURIComponent(project)}/schedules/${encodeURIComponent(scheduleId)}`),
   // F80: update a container's remembered backup options WITHOUT starting a
   // backup. Partial: omitted fields keep their stored values.
   setBackupOptions: (id: string, cid: string, body: { compression?: string; app_export?: boolean; save_image?: boolean; incremental?: boolean; incremental_full_every?: number }) =>
@@ -1320,6 +1347,11 @@ export const api = {
   // F220: protect a whole compose project as ONE app-consistent schedule target.
   protectStack: (id: string, project: string, backupNow = true) =>
     req<ProtectStackResult>("POST", `/api/nodes/${id}/stacks/${encodeURIComponent(project)}/protect`, backupNow ? {} : { backup_now: false }),
+  ignored: (id: string) => req<IgnoredItem[]>("GET", `/api/nodes/${id}/ignored`),
+  ignore: (id: string, kind: IgnoredItem["kind"], name: string) =>
+    req<IgnoredItem[]>("PUT", `/api/nodes/${id}/ignored/${kind}/${encodeURIComponent(name)}`),
+  unignore: (id: string, kind: IgnoredItem["kind"], name: string) =>
+    req<IgnoredItem[]>("DELETE", `/api/nodes/${id}/ignored/${kind}/${encodeURIComponent(name)}`),
   audit: () => req<AuditEntry[]>("GET", "/api/audit"),
   // Server-side paged/searched/date-ranged audit history (F7).
   auditPage: (p: AuditQuery) => req<AuditPage>("GET", `/api/audit${qstr(p as Record<string, unknown>)}`),

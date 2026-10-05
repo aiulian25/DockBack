@@ -92,10 +92,16 @@ func (s *Server) handleKeyRotate(w http.ResponseWriter, r *http.Request) {
 	// invisible until someone tries. So the dispatcher is held first, and if
 	// anything is already in flight the rotation is refused rather than raced:
 	// the queue drains on its own and the operator simply tries again.
-	releaseHold := s.holdBackupsForRotation()
+	// App-consistent stack backups and restores count as in flight too; they
+	// write archives outside the queue and wait out the hold themselves.
+	releaseHold, held := s.holdBackupsForRotation()
+	if !held {
+		errJSON(w, http.StatusConflict, "a key rotation is already in progress — wait for it to finish")
+		return
+	}
 	defer releaseHold()
-	if n := s.backupsInFlight(); n > 0 {
-		errJSON(w, http.StatusConflict, fmt.Sprintf("%d backup(s) queued or running — wait for them to finish, then rotate the key", n))
+	if n := s.archiveWritersInFlight(); n > 0 {
+		errJSON(w, http.StatusConflict, fmt.Sprintf("%d backup(s) or restore(s) queued or running — wait for them to finish, then rotate the key", n))
 		return
 	}
 

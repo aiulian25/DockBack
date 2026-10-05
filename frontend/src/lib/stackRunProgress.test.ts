@@ -16,8 +16,9 @@ describe("stackVerdict", () => {
 
   it("only the whole-stack line reports success", () => {
     expect(stackVerdict('Stack "paperlessngx" restored — all 5 services are running', "INFO")).toBe("ok");
-    expect(stackVerdict("Stack snapshot complete", "INFO")).toBe("ok");
-    expect(stackVerdict("Stack backup complete", "INFO")).toBe("ok");
+    // The lines the two kinds of stack backup end on.
+    expect(stackVerdict("App-consistent snapshot complete — all 3 service(s) captured in group cg-1-ab12", "INFO")).toBe("ok");
+    expect(stackVerdict("Stack backup complete — all 3 service(s) backed up", "INFO")).toBe("ok");
   });
 
   it("failures end the run", () => {
@@ -26,6 +27,9 @@ describe("stackVerdict", () => {
     expect(stackVerdict("Stack restore refused: something", "ERROR")).toBe("fail");
     expect(stackVerdict('Stack "x" restored, but 2 service(s) did not become healthy: a, b', "ERR")).toBe("fail");
     expect(stackVerdict("Stack restore CANCELED after 2 of 5 service(s)", "WARN")).toBe("fail");
+    // A stack backup that missed a service failed, however many others landed.
+    expect(stackVerdict("App-consistent snapshot failed for 1 of 3 service(s): db — 2 captured in group cg-1-ab12", "ERR")).toBe("fail");
+    expect(stackVerdict("Stack backup failed for 1 of 3 service(s): db — each one's own backup log says why", "ERR")).toBe("fail");
   });
 
   it("a failure inside a per-service line still does not end the run", () => {

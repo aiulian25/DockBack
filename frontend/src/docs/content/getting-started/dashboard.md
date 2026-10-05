@@ -28,6 +28,8 @@ Open the node to protect either kind: the node page's coverage banner lists them
 
 **Protect all counts actions, not containers.** A compose project is protected **once, as a stack** — one app-consistent schedule target for the whole project — rather than service by service, so a six-service stack is one of the N, not six. That is not just tidier: six separate container targets capture six separate moments, and an application whose database and files must agree cannot be restored from that. Standalone containers are protected individually as before. Anything that fails is named in the result; it is never reported as a clean sweep.
 
+**Ignoring what isn't worth a backup.** Some containers hold nothing you would miss — a model server whose models download again, a cache, a scratch tool. **Ignore** on a banner row, on a stack's row, or in a container's **⋮** menu leaves it out for good: no never-backed-up or stale warning, no alert or digest line, and **Full Server Backup** and whole-server schedules skip it. Ignoring a stack covers every service in it. A schedule that names the container or stack still backs it up, and so does a backup started from its own page. The node page's **Ignored** button, next to **Full Server Backup**, lists everything ignored on that server — including what has since been removed — with **Stop ignoring** to bring it back.
+
 ## The sidebar
 
 - **Dashboard** — fleet overview.

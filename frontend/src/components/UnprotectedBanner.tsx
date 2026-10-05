@@ -7,15 +7,18 @@
 // (they never count toward the primary "unprotected running" number).
 // Collapsed by default; expands to the actionable list.
 import { useState } from "react";
-import { ShieldAlert, ShieldCheck, ChevronDown, Box as BoxIcon, Loader2 } from "lucide-react";
+import { ShieldAlert, ShieldCheck, ChevronDown, Box as BoxIcon, Loader2, EyeOff } from "lucide-react";
 import { CoverageContainer, fmtAgo } from "../api";
 
-export default function UnprotectedBanner({ nodeName, unprotected, stale = [], stoppedAtRisk = [], onProtect, onProtectAll, protectingAll, onOpen }: {
+export default function UnprotectedBanner({ nodeName, unprotected, stale = [], stoppedAtRisk = [], onProtect, onIgnore, onProtectAll, protectingAll, onOpen }: {
   nodeName: string;
   unprotected: CoverageContainer[];
   stale?: CoverageContainer[];
   stoppedAtRisk?: CoverageContainer[];
   onProtect: (cid: string) => Promise<void>;
+  // Leave a container out of these warnings, and of whole-server backups, for
+  // good — one whose data comes back on its own (downloaded models, caches).
+  onIgnore?: (c: CoverageContainer) => Promise<void>;
   // F220: protect everything listed in one action, grouped so a compose project
   // is protected ONCE as a stack rather than service by service.
   onProtectAll?: () => Promise<void>;
@@ -37,9 +40,9 @@ export default function UnprotectedBanner({ nodeName, unprotected, stale = [], s
   const stacks = new Set(unprotected.filter((c) => c.stack).map((c) => c.stack));
   const units = unprotected.filter((c) => !c.stack).length + stacks.size;
 
-  const protect = async (cid: string) => {
+  const withBusy = async (cid: string, action: () => Promise<void>) => {
     setBusy((b) => new Set(b).add(cid));
-    try { await onProtect(cid); }
+    try { await action(); }
     finally { setBusy((b) => { const s = new Set(b); s.delete(cid); return s; }); }
   };
 
@@ -56,8 +59,18 @@ export default function UnprotectedBanner({ nodeName, unprotected, stale = [], s
             {c.scheduled ? " · scheduled" : ""}
           </span>
         </button>
+        {onIgnore && (
+          <button
+            onClick={() => withBusy(c.container_id, () => onIgnore(c))}
+            disabled={isBusy}
+            className="flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-on-surface-variant hover:bg-surface-high hover:text-on-surface disabled:opacity-60"
+            title={`Stop warning about ${c.name} and leave it out of whole-server backups`}
+          >
+            <EyeOff size={13} /> Ignore
+          </button>
+        )}
         <button
-          onClick={() => protect(c.container_id)}
+          onClick={() => withBusy(c.container_id, () => onProtect(c.container_id))}
           disabled={isBusy}
           className="flex shrink-0 items-center gap-1.5 rounded-md border border-warning/40 bg-warning/10 px-2.5 py-1 text-xs font-semibold text-warning hover:bg-warning/20 disabled:opacity-60"
           title={`Protect ${c.name} with smart defaults`}

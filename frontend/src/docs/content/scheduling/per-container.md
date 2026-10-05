@@ -6,7 +6,9 @@ Overrides resolve most-specific-first: **container → node → cluster → glob
 
 ## Granular control per container
 
-On a container's detail page, open **Advanced — backup schedule & retention** (below the backup button). Each section is independent — leave one off to inherit the global setting.
+On a container's page, the **Schedule & retention** tab opens with **Backed up automatically by**: every schedule that backs the container up — by its name, through its compose stack, or with the rest of the server — with whether it is on, when it fires and how long until its next run. A schedule that is switched off still shows, marked *off*, so one set for the container earlier is never invisible. **Change schedules in Settings →** takes you to edit them.
+
+Below that, open **Advanced — backup frequency & retention**. Each section is independent — leave one off to inherit the global setting.
 
 ### How often to back up
 
@@ -15,7 +17,7 @@ Turn on **Override how often to back up** and choose **Back up at most**:
 - **Every scheduled run** (default) — no throttle.
 - **At most once a day / week / month.**
 
-When the global schedule fires, the container is skipped if its last successful backup is newer than that interval. So you can keep small apps on the nightly schedule while a large media server backs up weekly or monthly — fewer copies created, less space used. (Manual "Initiate Backup Now" always runs; the throttle only affects scheduled runs.)
+When a schedule fires, the container is skipped if its last successful backup is newer than that interval. So you can keep small apps on the nightly schedule while a large media server backs up weekly or monthly — fewer copies created, less space used. (A manual **Start backup** always runs; the throttle only affects scheduled runs.)
 
 ### How many copies to keep (and for how long)
 

@@ -1,3 +1,5 @@
+import type { Schedule } from "../api";
+
 // Seconds thresholds shared by every duration label, so the three pages that
 // render one cannot drift into disagreeing about where "minutes" becomes
 // "hours".
@@ -33,4 +35,15 @@ export function fmtDuration(seconds: number, style: DurationStyle = "long"): str
     return `${value}${compact ? "h" : " h"}`;
   }
   return `${Math.round(seconds / ONE_DAY)}${compact ? "d" : " d"}`;
+}
+
+/** The days a weekly schedule can fire on, indexed by its `weekday` (0 = Sunday). */
+export const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+/** scheduleWhen says when a schedule fires, in the terms its Settings card sets. */
+export function scheduleWhen(schedule: Pick<Schedule, "kind" | "time" | "weekday" | "monthday" | "cron">): string {
+  if (schedule.kind === "daily") return `Daily at ${schedule.time}`;
+  if (schedule.kind === "weekly") return `Weekly on ${WEEKDAYS[schedule.weekday] ?? WEEKDAYS[0]} at ${schedule.time}`;
+  if (schedule.kind === "monthly") return `Monthly on day ${schedule.monthday} at ${schedule.time}`;
+  return `Custom (cron ${schedule.cron})`;
 }

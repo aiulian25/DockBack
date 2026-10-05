@@ -37,7 +37,9 @@ type restoreRun struct {
 // beginRestoreRun registers a cancelable restore under id and returns its
 // context plus a finish func the caller MUST defer. ok=false when a restore
 // with that id is already registered (the stack/container locks normally
-// prevent this; this is the last-resort guard).
+// prevent this; this is the last-resort guard). A restore writes a safety
+// snapshot outside the job queue, so it is counted for key rotation, waiting
+// first while a rotation is under way (beginOutsideQueueRun).
 func (s *Server) beginRestoreRun(parent context.Context, id, label, nodeID string, timeout time.Duration) (context.Context, func(), bool) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	s.restoreMu.Lock()
@@ -51,8 +53,10 @@ func (s *Server) beginRestoreRun(parent context.Context, id, label, nodeID strin
 	}
 	s.restores[id] = &restoreRun{cancel: cancel, startedAt: time.Now().Unix(), label: label, nodeID: nodeID}
 	s.restoreMu.Unlock()
+	endRun := s.beginOutsideQueueRun(id)
 
 	return ctx, func() {
+		endRun()
 		s.restoreMu.Lock()
 		delete(s.restores, id)
 		s.restoreMu.Unlock()

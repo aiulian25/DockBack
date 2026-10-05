@@ -28,6 +28,14 @@ Tick **App-consistent (quiesce during capture)** on a selected stack to schedule
 
 A stack target honors the schedule's **destination override** and per-node policy just like any other target, and — like a removed container — a stack that no longer has any members is flagged so you can remove it (and is auto-cleaned after the grace period).
 
+## A stack's own schedule
+
+A stack with several side-car services often needs its own timing — say, an app with a search index and a headless browser backed up every night at 02:00 while the rest of the server goes weekly. Open the stack's page (*Servers → node → Stacks → Backup Stack*): its **Schedule** card sets that up without the Settings form.
+
+- **Give this stack its own schedule** — pick daily, weekly, monthly or a custom cron, and whether the run is **app-consistent** (on by default when the stack has more than one service). DockBack creates a schedule named after the stack and the server, with the stack as its only target, so it picks up services added to the stack later.
+- **Edit** changes its timing in place; **Remove** deletes it.
+- **Also backed up by** lists every other schedule that reaches the stack: as a stack target, by naming some of its services, or with the whole server. A stack that **Protect** added to a shared schedule is still in it after you give it its own, so it would run on both — **Take out** removes just this stack from that schedule and leaves its other targets alone. A whole-server schedule backs each service up one by one; that one can only be changed in Settings.
+
 > Upgrading from an earlier version? Your existing single schedule appears automatically as a schedule named **Default** — nothing to reconfigure.
 
 ## How it behaves

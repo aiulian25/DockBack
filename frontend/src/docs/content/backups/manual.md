@@ -56,7 +56,7 @@ Expand to define application-aware **pre/post hooks** (e.g. put an app into main
 
 ## Start it
 
-Click **Initiate Backup Now**. The button immediately switches to *Backup queued…* and stays disabled until the run is visible, then shows *Backup in progress…* — one click is always enough. If the run finishes before you can see it (small containers back up in under a second), a toast confirms the completion instead. Repeat clicks are harmless: while a backup of the container is already queued or running, the app reuses that run rather than starting another.
+Click **Start backup**. The button immediately switches to *Backup queued…* and stays disabled until the run is visible, then shows *Backup in progress…* — one click is always enough. It shows *Backup in progress…* for any backup of the container, including one a schedule or a stack backup started, and goes back to **Start backup** when it ends. A stack's page does the same for its own **Start backup** button. If the run finishes before you can see it (small containers back up in under a second), a toast confirms the completion instead. Repeat clicks are harmless: while a backup of the container is already queued or running, the app reuses that run rather than starting another.
 
 The run appears in **Available Backups** as *In Progress*, with live output in the console below. When it finishes it becomes **Success** and then **Verified** after the automatic verification pass. You can **Schedule Future Backup** from the same panel to hand off to the global schedule (see *Scheduling & Retention*).
 

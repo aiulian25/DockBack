@@ -177,8 +177,9 @@ func (s *Server) alertNewUnscheduledProjects(now time.Time) {
 		if st == nil {
 			continue
 		}
+		ignored := s.ignoredOn(n.ID)
 		for _, c := range st.Containers {
-			if c == nil || c.Stack == "" || isTestClone(c) {
+			if c == nil || c.Stack == "" || isTestClone(c) || ignored.has(c) {
 				continue
 			}
 			key := n.ID + "/" + c.Stack

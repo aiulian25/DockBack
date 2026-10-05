@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"dockback/internal/backup"
 	"dockback/internal/config"
 	"dockback/internal/crypto"
+	"dockback/internal/dockercli"
 )
 
 // F16 master-key rotation. Two things went wrong at once: the swap was an
@@ -119,7 +121,7 @@ func TestRotationHoldsTheDispatcher(t *testing.T) {
 	s.locks = newOpLocks()
 	s.queue = []*queuedJob{{id: "q1", nodeID: "n1", stackKey: stackKey("n1", "", "app"), ctrKey: containerKey("n1", "app")}}
 
-	release := s.holdBackupsForRotation()
+	release, _ := s.holdBackupsForRotation()
 	if j, _, _ := s.takeEligible(); j != nil {
 		t.Fatal("no job may start while the master key is being re-wrapped")
 	}
@@ -134,6 +136,102 @@ func TestRotationHoldsTheDispatcher(t *testing.T) {
 	if j, _, _ := s.takeEligible(); j == nil {
 		t.Fatal("the job must run once the rotation is done")
 	}
+}
+
+// AC2b — two rotations at once would re-wrap the same keys twice, and the first
+// to finish would lift the hold while the other was still re-wrapping.
+func TestOnlyOneRotationHoldsTheQueue(t *testing.T) {
+	s := rotateTestServer(t)
+	release, held := s.holdBackupsForRotation()
+	if !held {
+		t.Fatal("an idle server must grant the hold")
+	}
+
+	rec := postRotate(s, s.cfg.EncryptionKey, otherKey(0xAB))
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "already in progress") {
+		t.Fatalf("a second rotation = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if !s.rotating.Load() {
+		t.Fatal("a refused second rotation must not lift the first one's hold")
+	}
+
+	release()
+	if rec := postRotate(s, s.cfg.EncryptionKey, otherKey(0xAB)); rec.Code != http.StatusOK {
+		t.Fatalf("rotation once the first is over = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// AC4 — a restore writes a safety snapshot outside the job queue, so the queue's
+// count never saw it and a rotation could start under it, re-wrapping the data
+// keys the restore was reading and missing the snapshot it was sealing.
+func TestRotationRefusedWhileARestoreRuns(t *testing.T) {
+	s := rotateTestServer(t)
+	_, finish, ok := s.beginRestoreRun(context.Background(), "b1", "web", "", time.Minute)
+	if !ok {
+		t.Fatal("the restore was not registered")
+	}
+
+	rec := postRotate(s, s.cfg.EncryptionKey, otherKey(0xAB))
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "wait for them to finish") {
+		t.Fatalf("a rotation under a running restore = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+
+	finish()
+	if rec := postRotate(s, s.cfg.EncryptionKey, otherKey(0xAB)); rec.Code != http.StatusOK {
+		t.Fatalf("rotation once the restore is over = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// AC5 — an app-consistent stack backup runs outside the job queue too, so the
+// dispatcher's hold never stopped it starting mid-rotation. It waits now, like a
+// queued job. The registry knows no node, so once it does start it fails at once
+// and logs why — which is how the test sees that it started.
+func TestConsistentStackBackupWaitsOutARotation(t *testing.T) {
+	s := rotateTestServer(t)
+	s.locks = newOpLocks()
+	s.engine.Reg = dockercli.NewRegistry()
+	release, _ := s.holdBackupsForRotation()
+
+	started := s.startConsistentStackBackup("n1", "shop", nil, "", func(cid, name string) backup.Options { return backup.Options{} })
+	if !started {
+		t.Fatal("the stack backup must be accepted and wait, not refused")
+	}
+	waitForRunLogLine(t, s, "stack:shop", "Waiting for the master-key rotation")
+	if runLogHas(s, "stack:shop", "App-consistent snapshot:") {
+		t.Fatal("the snapshot must not start while the key is being rotated")
+	}
+
+	release()
+	waitForRunLogLine(t, s, "stack:shop", "App-consistent snapshot:")
+	deadline := time.Now().Add(5 * time.Second)
+	for s.outsideQueueRuns.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a finished run must stop counting, or no rotation could ever start again")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// waitForRunLogLine waits until a run's persisted log has a line containing text.
+func waitForRunLogLine(t *testing.T, s *Server, runID, text string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !runLogHas(s, runID, text) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never logged %q", runID, text)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func runLogHas(s *Server, runID, text string) bool {
+	lines, _ := s.store.GetRunLog(runID)
+	for _, line := range lines {
+		if strings.Contains(line.Msg, text) {
+			return true
+		}
+	}
+	return false
 }
 
 // AC3 — the key and its fingerprint are always read as one consistent pair, and

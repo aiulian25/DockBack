@@ -2,11 +2,15 @@ package api
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"dockback/internal/backup"
+	"dockback/internal/dockercli"
 	"dockback/internal/store"
 )
 
@@ -380,4 +384,207 @@ func TestMigrateSchedules(t *testing.T) {
 	if rows, _ := st.ListSchedules(); len(rows) != 1 {
 		t.Fatalf("migration must be idempotent, got %d schedules", len(rows))
 	}
+}
+
+// A container's page names the schedules that back it up, so it must match the
+// scheduler: a stack target covers only its own project, a whole-server target
+// only running containers unless it includes stopped ones, and within one
+// schedule the most specific target is the one named.
+func TestScheduleCoversFollowsTheScheduler(t *testing.T) {
+	web := &dockercli.Container{ID: "c1", Name: "web", Stack: "shop", State: "running"}
+	idle := &dockercli.Container{ID: "c2", Name: "idle", State: "exited"}
+	wholeServer := ScheduleTarget{NodeID: "n1"}
+	cases := []struct {
+		name string
+		sc   Schedule
+		c    *dockercli.Container
+		want string
+	}{
+		{"by name", Schedule{Targets: []ScheduleTarget{{NodeID: "n1", ContainerName: "web"}}}, web, coveredByName},
+		{"by a legacy id", Schedule{Targets: []ScheduleTarget{{NodeID: "n1", ContainerID: "c1"}}}, web, coveredByName},
+		{"through its stack", Schedule{Targets: []ScheduleTarget{{NodeID: "n1", Stack: "shop"}}}, web, coveredByStack},
+		{"another stack", Schedule{Targets: []ScheduleTarget{{NodeID: "n1", Stack: "blog"}}}, web, ""},
+		{"the whole server", Schedule{Targets: []ScheduleTarget{wholeServer}}, web, coveredByNode},
+		{"another server", Schedule{Targets: []ScheduleTarget{{NodeID: "n2"}}}, web, ""},
+		{"stopped, left out", Schedule{Targets: []ScheduleTarget{wholeServer}}, idle, ""},
+		{"stopped, included", Schedule{IncludeStopped: true, Targets: []ScheduleTarget{wholeServer}}, idle, coveredByNode},
+		{"the most specific target", Schedule{Targets: []ScheduleTarget{wholeServer, {NodeID: "n1", Stack: "shop"}, {NodeID: "n1", ContainerName: "web"}}}, web, coveredByName},
+	}
+	for _, tc := range cases {
+		if got := scheduleCovers(tc.sc, "n1", tc.c, nil); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The schedule set for a container is shown even when it is switched off, so
+// the page can say it exists and is not running.
+func TestContainerSchedulesIncludeSwitchedOffOnes(t *testing.T) {
+	web := &dockercli.Container{ID: "c1", Name: "web", Stack: "shop", State: "running"}
+	s := &Server{store: testStore(t), stats: map[string]*nodeStat{"n1": {Containers: []*dockercli.Container{web}}}}
+	for _, sc := range []Schedule{
+		{ID: "off", Name: "Weekly offsite", Kind: "weekly", Time: "04:00", Targets: []ScheduleTarget{{NodeID: "n1", Stack: "shop"}}},
+		{ID: "other", Name: "Blog nightly", Enabled: true, Kind: "daily", Time: "03:00", Targets: []ScheduleTarget{{NodeID: "n1", Stack: "blog"}}},
+	} {
+		row, err := sc.toRow()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.store.UpsertSchedule(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := s.containerSchedules("n1", "c1", "web")
+	if len(got) != 1 || got[0].ID != "off" || got[0].Enabled || got[0].Covers != coveredByStack {
+		t.Fatalf("want only the switched-off stack schedule, got %+v", got)
+	}
+}
+
+// Taking one stack out of a schedule took more with it: a stack target has empty
+// container fields, and the match ignored the stack, so it also matched the
+// node's whole-server target and every other stack on it. The missing-stack
+// auto-clean removes targets exactly this way.
+func TestRemovingAStackTargetLeavesTheOthers(t *testing.T) {
+	s := &Server{store: testStore(t)}
+	sc := Schedule{ID: "nightly", Name: "Nightly", Enabled: true, Kind: "daily", Time: "03:00", Targets: []ScheduleTarget{
+		{NodeID: "n1"}, {NodeID: "n1", Stack: "shop", Consistent: true}, {NodeID: "n1", Stack: "blog"},
+	}}
+	row, err := sc.toRow()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertSchedule(row); err != nil {
+		t.Fatal(err)
+	}
+
+	s.removeScheduleTargets("nightly", []ScheduleTarget{{NodeID: "n1", Stack: "shop"}})
+
+	got, err := s.store.GetSchedule("nightly")
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := scheduleFromRow(got).Targets
+	if len(left) != 2 || left[0].Stack != "" || left[1].Stack != "blog" {
+		t.Fatalf("only the shop stack should be gone, left %+v", left)
+	}
+}
+
+// A stack's page names what backs it up: the stack itself, some of its
+// services by name, or the whole server — and says which schedule is its own.
+func TestStackCoverageFollowsTheScheduler(t *testing.T) {
+	web := &dockercli.Container{ID: "c1", Name: "shop-web-1", Stack: "shop", State: "running"}
+	db := &dockercli.Container{ID: "c2", Name: "shop-db-1", Stack: "shop", State: "running"}
+	members := []*dockercli.Container{web, db}
+	cases := []struct {
+		name       string
+		sc         Schedule
+		covers     string
+		consistent bool
+		services   int
+	}{
+		{"the stack, app-consistent", Schedule{Targets: []ScheduleTarget{{NodeID: "n1", Stack: "shop", Consistent: true}}}, coveredByStack, true, 0},
+		{"one service by name", Schedule{Targets: []ScheduleTarget{{NodeID: "n1", ContainerName: "shop-db-1"}}}, coveredByName, false, 1},
+		{"the whole server", Schedule{Targets: []ScheduleTarget{{NodeID: "n1"}}}, coveredByNode, false, 0},
+		{"the stack beats the server", Schedule{Targets: []ScheduleTarget{{NodeID: "n1"}, {NodeID: "n1", Stack: "shop"}}}, coveredByStack, false, 0},
+		{"another stack", Schedule{Targets: []ScheduleTarget{{NodeID: "n1", Stack: "blog"}}}, "", false, 0},
+		{"another server", Schedule{Targets: []ScheduleTarget{{NodeID: "n2", Stack: "shop"}}}, "", false, 0},
+	}
+	for _, tc := range cases {
+		got, covered := stackCoverage(tc.sc, "n1", "shop", members, nil)
+		if covered != (tc.covers != "") || got.Covers != tc.covers || got.Consistent != tc.consistent || len(got.Services) != tc.services {
+			t.Errorf("%s: got %+v (covered %v)", tc.name, got, covered)
+		}
+	}
+}
+
+// A stack gets its own schedule from its page, edits it in place, can be taken
+// out of a shared schedule without touching that schedule's other targets, and
+// removing its own schedule deletes it.
+func TestStackOwnSchedule(t *testing.T) {
+	s := &Server{store: testStore(t), stats: map[string]*nodeStat{}}
+	if err := s.store.UpsertNode(&store.Node{ID: "n1", Name: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	shared := Schedule{ID: "nightly", Name: "Nightly", Enabled: true, Kind: "daily", Time: "03:00", Targets: []ScheduleTarget{
+		{NodeID: "n1", Stack: "shop", Consistent: true}, {NodeID: "n1", ContainerName: "other"},
+	}}
+	row, err := shared.toRow()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertSchedule(row); err != nil {
+		t.Fatal(err)
+	}
+
+	weekly := `{"enabled":true,"kind":"weekly","time":"04:00","weekday":3,"monthday":1,"cron":"","consistent":true}`
+	got := callStackSchedule(t, s, http.MethodPut, "", weekly)
+	own := ownEntry(got)
+	if len(got) != 2 || own == nil || own.Name != "shop on node-a" || !own.Consistent || own.Kind != "weekly" || len(own.Targets) != 1 {
+		t.Fatalf("want the shared schedule plus the stack's own, got %+v", got)
+	}
+
+	ownRow, _ := s.store.GetSchedule(own.ID)
+	ownRow.LastRun = 12345
+	if err := s.store.UpsertSchedule(ownRow); err != nil {
+		t.Fatal(err)
+	}
+	got = callStackSchedule(t, s, http.MethodPut, "", strings.Replace(weekly, "04:00", "05:30", 1))
+	if edited := ownEntry(got); len(got) != 2 || edited == nil || edited.ID != own.ID || edited.Time != "05:30" || edited.LastRun != 12345 {
+		t.Fatalf("an edit changes the same schedule and keeps its baseline, got %+v", got)
+	}
+
+	got = callStackSchedule(t, s, http.MethodDelete, "nightly", "")
+	nightly, _ := s.store.GetSchedule("nightly")
+	if len(got) != 1 || len(scheduleFromRow(nightly).Targets) != 1 || scheduleFromRow(nightly).Targets[0].ContainerName != "other" {
+		t.Fatalf("taking the stack out of a shared schedule keeps its other targets, got %+v", scheduleFromRow(nightly).Targets)
+	}
+
+	got = callStackSchedule(t, s, http.MethodDelete, own.ID, "")
+	if _, err := s.store.GetSchedule(own.ID); err == nil || len(got) != 0 {
+		t.Fatalf("removing the stack from its own schedule deletes it, left %+v", got)
+	}
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodDelete, "/", nil)
+	r.SetPathValue("id", "n1")
+	r.SetPathValue("project", "shop")
+	r.SetPathValue("sid", "nightly")
+	s.handleRemoveStackFromSchedule(rec, r)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("a schedule the stack is not in = %d, want 404", rec.Code)
+	}
+}
+
+// callStackSchedule calls the stack schedule endpoints for stack "shop" on n1:
+// PUT sets its own schedule, DELETE takes it out of schedule sid.
+func callStackSchedule(t *testing.T, s *Server, method, sid, body string) []stackSchedule {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(method, "/", strings.NewReader(body))
+	r.SetPathValue("id", "n1")
+	r.SetPathValue("project", "shop")
+	r.SetPathValue("sid", sid)
+	if method == http.MethodPut {
+		s.handleSetStackSchedule(rec, r)
+	} else {
+		s.handleRemoveStackFromSchedule(rec, r)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s = %d: %s", method, rec.Code, rec.Body.String())
+	}
+	var out []stackSchedule
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func ownEntry(list []stackSchedule) *stackSchedule {
+	for i := range list {
+		if list[i].Own {
+			return &list[i]
+		}
+	}
+	return nil
 }

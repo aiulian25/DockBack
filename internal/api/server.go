@@ -71,6 +71,11 @@ type Server struct {
 	jobMu sync.Mutex
 	jobs  map[string]*backupJob
 
+	// stackServices maps the backup id of each service in a running
+	// app-consistent stack backup to where it runs (see tagStackServices). Those
+	// runs never pass through the job queue, so jobs cannot tag their log lines.
+	stackServices sync.Map // backup id -> *backupJob
+
 	// createMu serializes the manual-backup dedup check with its enqueue, so a
 	// double-click can't slip two identical jobs past activeBackup (the queue is
 	// otherwise only consulted, not reserved, between check and enqueue).
@@ -110,6 +115,14 @@ type Server struct {
 	// so no backup can be written with the outgoing key after the re-wrap has
 	// already passed it by.
 	rotating atomic.Bool
+	// outsideQueueRuns counts the app-consistent stack backups and restores in
+	// flight, which write archives without passing through the job queue (see
+	// beginOutsideQueueRun).
+	outsideQueueRuns atomic.Int64
+
+	// ignoreMu serializes edits to a node's ignore list (read, change, write).
+	ignoreMu sync.Mutex
+
 	queueSeq int64 // FIFO tiebreak
 
 	// Background-refreshed node inventory cache so the dashboard reads an
@@ -1145,8 +1158,13 @@ func isRunLogID(backupID string) bool {
 // own run. PLAN §4.13.
 func (s *Server) logSourceFor(backupID string) (nodeID, nodeName, containerID string) {
 	s.jobMu.Lock()
-	defer s.jobMu.Unlock()
-	if j, ok := s.jobs[backupID]; ok {
+	j, queued := s.jobs[backupID]
+	s.jobMu.Unlock()
+	if queued {
+		return j.nodeID, j.nodeName, j.containerID
+	}
+	if v, tagged := s.stackServices.Load(backupID); tagged {
+		j := v.(*backupJob)
 		return j.nodeID, j.nodeName, j.containerID
 	}
 	return "", "", ""
@@ -1259,6 +1277,12 @@ func (s *Server) Handler(uiFS fs.FS) http.Handler {
 	// offer them instead of asking for the same domain and paths again.
 	mux.Handle("GET /api/nodes/{id}/stacks/{project}/restore-defaults", s.auth(http.HandlerFunc(s.handleStackRestoreDefaults)))
 	mux.Handle("GET /api/nodes/{id}/stacks/{project}/options", s.auth(http.HandlerFunc(s.handleStackOptions))) // F80 per-service backup options
+	mux.Handle("GET /api/nodes/{id}/stacks/{project}/schedules", s.auth(http.HandlerFunc(s.handleStackSchedules)))
+	mux.Handle("GET /api/nodes/{id}/ignored", s.auth(http.HandlerFunc(s.handleListIgnored)))
+	mux.Handle("PUT /api/nodes/{id}/ignored/{kind}/{name}", s.auth(s.csrf(http.HandlerFunc(s.handleIgnore))))
+	mux.Handle("DELETE /api/nodes/{id}/ignored/{kind}/{name}", s.auth(s.csrf(http.HandlerFunc(s.handleIgnore))))
+	mux.Handle("PUT /api/nodes/{id}/stacks/{project}/schedule", s.auth(s.csrf(http.HandlerFunc(s.handleSetStackSchedule))))
+	mux.Handle("DELETE /api/nodes/{id}/stacks/{project}/schedules/{sid}", s.auth(s.csrf(http.HandlerFunc(s.handleRemoveStackFromSchedule))))
 	mux.Handle("GET /api/nodes/{id}/containers/{cid}", s.auth(http.HandlerFunc(s.handleContainerDetail)))
 	mux.Handle("GET /api/nodes/{id}/containers/{cid}/mounts", s.auth(http.HandlerFunc(s.handleContainerMounts)))
 	mux.Handle("GET /api/nodes/{id}/containers/{cid}/databases", s.auth(http.HandlerFunc(s.handleListDatabases)))

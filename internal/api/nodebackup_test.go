@@ -262,21 +262,21 @@ func TestNodeBackupTargets(t *testing.T) {
 		{ID: "", Name: "no-id", State: "running"},
 	}
 
-	got := nodeBackupTargets(list, false)
+	got := nodeBackupTargets(list, false, nil)
 	if len(got) != 2 || got[0].Name != "alpha" || got[1].Name != "zeta" {
 		t.Fatalf("running only, sorted by name: %v", targetNames(got))
 	}
 	// F219: a throwaway test clone is never captured — it is a copy of a copy
 	// under a name that stops existing tomorrow.
-	for _, c := range nodeBackupTargets(list, true) {
+	for _, c := range nodeBackupTargets(list, true, nil) {
 		if c.Name == "app-test-0104" {
 			t.Error("a test clone must never be backed up")
 		}
 	}
-	if got := nodeBackupTargets(list, true); len(got) != 4 {
+	if got := nodeBackupTargets(list, true, nil); len(got) != 4 {
 		t.Errorf("with stopped included: want 4 (running + exited + paused), got %v", targetNames(got))
 	}
-	if got := nodeBackupTargets(nil, true); len(got) != 0 || got == nil {
+	if got := nodeBackupTargets(nil, true, nil); len(got) != 0 || got == nil {
 		t.Error("an empty node is an empty list, not nil")
 	}
 }

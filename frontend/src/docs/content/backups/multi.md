@@ -29,7 +29,7 @@ The run is queued, not fired all at once: it obeys the same fleet-wide and per-n
 
 The stack page offers one per-run override: a **Compression** selector, defaulting to **"Each service's saved setting"**. Pick a specific mode to force it for every service in this run only — the saved per-container settings are not changed.
 
-**The stack has a page of its own.** Reachable at *Servers → node → Stacks → Backup Stack*, it shows every service with its remembered options and its mounts (editable inline — the same settings that container's own page writes), the project's app-consistent snapshots, and a console that follows the run. You can leave it; the backup carries on and the console re-attaches when you come back.
+**The stack has a page of its own.** Reachable at *Servers → node → Stacks → Backup Stack*, it shows every service with its remembered options and its mounts (editable inline — the same settings that container's own page writes), the project's app-consistent snapshots, its **schedule** (see *Scheduled (automatic) backups → A stack's own schedule*), and a console that follows the run: every service's own output, labelled with its name, ending on one line that says whether every service got its backup. You can leave the page; the backup carries on, and each service's output stays on its container page's console and under **Logs**.
 
 ## Choosing what each service captures
 

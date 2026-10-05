@@ -134,6 +134,14 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   stack that no schedule covers. A fresh install starts with a weekly backup of
   its machine, scrubs, drills and pruning retention; an existing one is never
   changed.
+  **A stack gets its own schedule from its page** — daily, weekly, monthly or
+  cron, app-consistent by default — and every container and stack page names the
+  schedules that back it up, switched-off ones included, with how each one reaches
+  it. A stack that also rides in a shared schedule can be taken out of it there.
+  **Ignore what isn't worth a backup** — a model server whose models download
+  again, a cache: an ignored container or stack drops out of the warnings, alerts
+  and digest, and whole-server backups skip it, while a schedule that names it
+  still runs. Each node's **Ignored** list brings them back.
 - **App-native exports** — for supported apps (Paperless, Gitea/Forgejo) DockBack
   can capture the application's own first-party dump for a portable,
   version-independent restore — recognized automatically, no setup.
@@ -185,7 +193,11 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   A backup you start shows its **live console right on the page you started it
   from**, and every place a backup is running — buttons, history rows, the
   dashboard — shows the same cloud with its arrow lifting while data moves (it
-  holds still for anyone whose system asks for reduced motion).
+  holds still for anyone whose system asks for reduced motion). A stack backup's
+  console shows every service's output, labelled, and ends on one line that says
+  whether every service got its backup; a container's console follows its part of
+  a stack backup too. Run buttons read **Backup in progress…** whenever one is
+  running, whoever started it.
   See **[Access control & account security](#access-control--account-security)** below.
 
 ---
@@ -250,7 +262,8 @@ reasonable reduction in strictness — not a security hole.
 > in place (archives are not re-encrypted). After a successful rotation, update
 > `DOCKBACK_ENCRYPTION_KEY` to the **new** key before the next restart and keep the
 > old key archived until verified. Don't change the variable on its own — that
-> strands every existing backup.
+> strands every existing backup. A rotation is refused while any backup or restore
+> is running, and ones started during it wait until it is done.
 
 The UI binds to `127.0.0.1:28734` by default. **Keep it that way** unless you have
 read the section below — DockBack is not meant to be reachable from the internet.

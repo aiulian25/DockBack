@@ -413,7 +413,7 @@ export default function ContainerDetail() {
                 </Link>
                 <Link to={`/servers/${id}/containers/${cid}/backup`}
                   className="inline-flex items-center gap-1.5 rounded bg-docker-blue px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1f86d6]">
-                  <BackupCloudIcon size={15} active={backupInProgress} /> Back up now
+                  <BackupCloudIcon size={15} active={backupInProgress} /> {backupInProgress ? "Backup in progress…" : "Back up now"}
                 </Link>
               </div>
             </div>

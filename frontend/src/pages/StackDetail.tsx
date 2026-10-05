@@ -14,14 +14,17 @@ import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   ChevronRight, ChevronDown, Database, ExternalLink, HardDrive, Layers,
-  Loader2, RotateCcw, ShieldCheck, CheckCircle2, XCircle, Clock,
+  Loader2, RotateCcw, CheckCircle2, XCircle, CalendarClock, Plus,
 } from "lucide-react";
 import { followRun } from "../lib/logStream";
 import { stackProgress, type StackProgress } from "../lib/stackRunProgress";
-import { api, Destination, MountInfo, Node, StackInfo, StackServiceOptions, fmtAgo, fmtBytes } from "../api";
+import { api, Destination, MountInfo, Node, StackInfo, StackSchedule, StackScheduleTiming, StackServiceOptions, fmtAgo, fmtBytes } from "../api";
 import { Button, Card, Chip } from "../components/ui";
 import BackupCloudIcon from "../components/BackupCloudIcon";
+import ScheduleList from "../components/ScheduleList";
+import ScheduleWhenFields from "../components/ScheduleWhenFields";
 import { useStickyScroll } from "../hooks/useStickyScroll";
+import { usePoll } from "../hooks/usePoll";
 import { useToast } from "../components/Toast";
 
 // F115: how many services' mounts are measured at once. Measuring runs `du` in a
@@ -34,6 +37,24 @@ const MOUNT_SCAN_CONCURRENCY = 3;
 // stack fits on screen, and hiding its mounts behind a disclosure would be
 // ceremony. Anything larger stays collapsed.
 const AUTO_EXPAND_MAX_SERVICES = 2;
+
+// How many lines the run panel keeps. Every service's backup output lands here,
+// so it has to hold a whole stack's run, not one container's.
+const MAX_RUN_LINES = 500;
+
+// How often the page looks for a backup of this stack started elsewhere — a
+// schedule, the favourites menu, another tab — the same cadence the container
+// pages poll their backups at. A stack has a running row per service at most.
+const RUNNING_POLL_MS = 6000;
+const RUNNING_PAGE_SIZE = 50;
+
+// What the run buttons say: what is happening to the stack, else what they do.
+function runButtonLabel(state: { starting: boolean; backupInProgress: boolean; restoreRunning: boolean }, idle: string): string {
+  if (state.backupInProgress) return "Backup in progress…";
+  if (state.restoreRunning) return "Restore in progress…";
+  if (state.starting) return "Starting backup…";
+  return idle;
+}
 
 interface MountState {
   mounts: MountInfo[] | null;
@@ -64,7 +85,7 @@ export default function StackDetail() {
   const [starting, setStarting] = useState(false);
 
   // The live run, streamed under this stack's own log id.
-  const [lines, setLines] = useState<{ level: string; msg: string }[]>([]);
+  const [lines, setLines] = useState<{ level: string; msg: string; service?: string }[]>([]);
   const [runState, setRunState] = useState<"" | "running" | "ok" | "fail">("");
   // #N9: how many services of how many are done, read from the run's own
   // `[N/M]` lines — the answer the console could not give while a restore ran.
@@ -74,6 +95,9 @@ export default function StackDetail() {
   // lifting cloud, a restore keeps its spinner.
   const backupRunning = runState === "running" && runKind === "backup";
   const restoreRunning = runState === "running" && runKind === "restore";
+  // A backup of this stack this page did not start: it still owns the buttons.
+  const [runningElsewhere, setRunningElsewhere] = useState(false);
+  const backupInProgress = backupRunning || runningElsewhere;
   const esRef = useRef<(() => void) | null>(null);
   const log = useStickyScroll(lines.length);
   useEffect(() => () => esRef.current?.(), []);
@@ -87,9 +111,17 @@ export default function StackDetail() {
   const loadGroups = useCallback(() => {
     api.stackGroups(nodeID, project).then(setGroups).catch(() => setGroups([]));
   }, [nodeID, project]);
+  // The search matches stack names as substrings, so the rows are kept to this
+  // stack exactly.
+  const loadRunning = useCallback(() => {
+    api.backupsPage({ node_id: nodeID, status: "running", q: project, page_size: RUNNING_PAGE_SIZE })
+      .then((page) => setRunningElsewhere(page.items.some((b) => b.stack === project)))
+      .catch(() => {});
+  }, [nodeID, project]);
 
   useEffect(() => { api.nodes().then(setNodes).catch(() => setNodes([])); }, []);
-  useEffect(() => { loadStack(); loadGroups(); }, [loadStack, loadGroups]);
+  useEffect(() => { loadStack(); loadGroups(); loadRunning(); }, [loadStack, loadGroups, loadRunning]);
+  usePoll(loadRunning, RUNNING_POLL_MS, [nodeID, project]);
 
   // The node's effective destination policy — a node that redirects where its
   // backups go (e.g. a Synology not copying to the same Synology box) is honored
@@ -146,14 +178,17 @@ export default function StackDetail() {
     esRef.current?.();
     setRunKind(kind); setRunState("running"); setLines([]); setRunProgress(null);
     const start = Date.now();
+    // Each service's backup logs under its own id, so the stack's id alone
+    // carried one line of the whole run. Its services' lines are the run.
+    const services = new Map((rows || []).map((r) => [r.container_id, r.name]));
     // #N10: the structured verdict, with the shared stack line rules as the
-    // fallback — run.done is not replayed to a late subscriber, and stack
-    // BACKUPS do not publish it yet.
+    // fallback — run.done is not replayed to a late subscriber.
     esRef.current = followRun("stack:" + project, {
       mode: "stack",
       since: start - 2000, // skip replayed history
+      alsoShowContainers: [...services.keys()],
       onLine: (l) => {
-        setLines((p) => [...p.slice(-120), { level: l.level, msg: l.msg }]);
+        setLines((p) => [...p, { level: l.level, msg: l.msg, service: services.get(l.container_id || "") }].slice(-MAX_RUN_LINES));
         // The count the header shows, so a five-service restore is visibly a
         // five-service restore while it runs.
         const p = stackProgress(l.msg);
@@ -161,10 +196,10 @@ export default function StackDetail() {
       },
       onDone: (outcome) => {
         setRunState(outcome === "ok" ? "ok" : "fail");
-        loadStack(); loadGroups();
+        loadStack(); loadGroups(); loadRunning();
       },
     });
-  }, [project, loadStack, loadGroups]);
+  }, [project, rows, loadStack, loadGroups, loadRunning]);
 
   // Arriving back from the restore page: attach to the run it just started.
   useEffect(() => {
@@ -285,8 +320,8 @@ export default function StackDetail() {
               className="inline-flex items-center gap-1.5 rounded border border-outline-variant bg-surface-high/40 px-3 py-1.5 text-sm font-medium text-on-surface hover:bg-surface-high">
               <RotateCcw size={15} /> Restore stack…
             </Link>
-            <Button variant="primary" onClick={startBackup} disabled={starting || runState === "running"}>
-              <BackupCloudIcon size={15} active={starting || backupRunning} /> Back up stack
+            <Button variant="primary" onClick={startBackup} disabled={starting || runState === "running" || runningElsewhere}>
+              <BackupCloudIcon size={15} active={starting || backupInProgress} /> {runButtonLabel({ starting, backupInProgress, restoreRunning }, "Back up stack")}
             </Button>
           </div>
         </div>
@@ -536,7 +571,9 @@ export default function StackDetail() {
               <div ref={log.ref} onScroll={log.onScroll} className="max-h-64 overflow-y-auto bg-surface-lowest p-4 font-mono text-xs leading-relaxed">
                 {lines.length === 0 && <div className="text-on-surface-variant">Waiting for the first line…</div>}
                 {lines.map((l, i) => (
-                  <div key={i} className={`break-words ${l.level === "ERR" ? "text-error" : l.level === "WARN" ? "text-warning" : "text-on-surface-variant"}`}>{l.msg}</div>
+                  <div key={i} className={`break-words ${l.level === "ERR" ? "text-error" : l.level === "WARN" ? "text-warning" : "text-on-surface-variant"}`}>
+                    {l.service && <span className="mr-2 font-semibold text-primary">{l.service}</span>}{l.msg}
+                  </div>
                 ))}
               </div>
             </Card>
@@ -645,28 +682,136 @@ export default function StackDetail() {
               </div>
             )}
 
-            <Button variant="primary" className="w-full justify-center" onClick={startBackup} disabled={starting || runState === "running"}>
-              <BackupCloudIcon size={15} active={starting || backupRunning} /> Start stack backup
+            <Button variant="primary" className="w-full justify-center" onClick={startBackup} disabled={starting || runState === "running" || runningElsewhere}>
+              <BackupCloudIcon size={15} active={starting || backupInProgress} /> {runButtonLabel({ starting, backupInProgress, restoreRunning }, "Start backup")}
             </Button>
             <p className="mt-2 break-words text-[11px] text-on-surface-variant">
               Backing up to: <span className="font-medium text-on-surface">{summary}</span>. You can leave this page &mdash; the run
-              continues and the console re-attaches.
+              continues, and each service&rsquo;s output stays on its own page and under Logs.
             </p>
           </Card>
 
-          <Card className="p-5">
-            <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant">Automatic protection</div>
-            {stack && stack.backed_up >= stack.services
-              ? <div className="flex flex-wrap items-center gap-2"><Chip kind="ok"><ShieldCheck size={11} /> every service has a backup</Chip></div>
-              : <div className="flex flex-wrap items-center gap-2"><Chip kind="warn"><Clock size={11} /> not every service is covered</Chip></div>}
-            <p className="mt-2 break-words text-xs text-on-surface-variant">
-              One app-consistent stack target keeps this whole project on the schedule &mdash; every current member is captured each
-              run, so a service added later is picked up without editing anything. Protect it from the{" "}
-              <Link to={`/servers/${nodeID}`} className="text-primary hover:underline">node page</Link>.
-            </p>
-          </Card>
+          <StackSchedulePanel nodeID={nodeID} project={project} services={stack?.services ?? rows?.length ?? 0} />
         </div>
       </div>
     </div>
+  );
+}
+
+// What the stack's own schedule starts as. App-consistent is decided by the
+// number of services: one service has nothing to keep in step with.
+const NEW_STACK_SCHEDULE = { enabled: true, kind: "daily", time: "03:00", weekday: 0, monthday: 1, cron: "0 3 * * *" };
+
+// How a schedule reaches the stack, in words.
+function stackCoverageText(schedule: StackSchedule): string {
+  if (schedule.covers === "stack") return schedule.consistent ? "This stack, app-consistent" : "This stack, each service on its own";
+  if (schedule.covers === "container") return `${(schedule.services || []).join(", ")}, by name`;
+  return schedule.include_stopped ? "Every container on this server, one by one" : "Every running container on this server, one by one";
+}
+
+// StackSchedulePanel is when the stack backs up: its own schedule, set here, and
+// every other schedule that reaches it. A stack Protect added to a shared
+// schedule stays in it after it gets its own, so it would run on both — each of
+// those can be taken out here.
+function StackSchedulePanel({ nodeID, project, services }: { nodeID: string; project: string; services: number }) {
+  const toast = useToast();
+  const [schedules, setSchedules] = useState<StackSchedule[] | null>(null);
+  const [draft, setDraft] = useState<StackScheduleTiming | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.stackSchedules(nodeID, project).then(setSchedules).catch(() => setSchedules([]));
+  }, [nodeID, project]);
+
+  const own = schedules?.find((schedule) => schedule.own);
+  const others = (schedules || []).filter((schedule) => !schedule.own);
+  const sharedNames = others.filter((schedule) => schedule.covers === "stack").map((schedule) => schedule.name);
+
+  const edit = (from?: StackSchedule) => setDraft(from
+    ? { enabled: from.enabled, kind: from.kind, time: from.time, weekday: from.weekday, monthday: from.monthday, cron: from.cron, consistent: !!from.consistent }
+    : { ...NEW_STACK_SCHEDULE, consistent: services > 1 });
+
+  const apply = async (change: () => Promise<StackSchedule[]>, done: string) => {
+    setBusy(true);
+    try {
+      setSchedules(await change());
+      setDraft(null);
+      toast.success(done);
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const save = (timing: StackScheduleTiming) => apply(() => api.setStackSchedule(nodeID, project, timing), "Stack schedule saved.");
+  const takeOut = (schedule: StackSchedule) => {
+    const question = schedule.own
+      ? `Remove the schedule "${schedule.name}"? The stack stops backing up on it.`
+      : `Take ${project} out of "${schedule.name}"? Its other targets stay as they are.`;
+    if (!confirm(question)) return;
+    void apply(() => api.removeStackFromSchedule(nodeID, project, schedule.id), schedule.own ? "Schedule removed." : `Taken out of ${schedule.name}.`);
+  };
+
+  return (
+    <Card className="p-5">
+      <h2 className="mb-3 flex items-center gap-2 text-base font-bold"><CalendarClock size={16} className="shrink-0 text-primary" /> Schedule</h2>
+      {schedules === null && <p className="text-xs text-on-surface-variant">Loading…</p>}
+
+      {schedules !== null && draft && (
+        <div className="space-y-3 rounded border border-outline-variant bg-surface-lowest p-3">
+          <ScheduleWhenFields value={draft} onChange={(patch) => setDraft({ ...draft, ...patch })} />
+          <label className="flex cursor-pointer items-start gap-2 text-sm">
+            <input type="checkbox" className="mt-0.5 shrink-0" checked={draft.consistent} onChange={(e) => setDraft({ ...draft, consistent: e.target.checked })} />
+            <span className="min-w-0">
+              App-consistent snapshot
+              <span className="block break-words text-xs text-on-surface-variant">Every service in one quiesce window, so they restore to the same moment. Off = each service backed up on its own.</span>
+            </span>
+          </label>
+          <label className="flex cursor-pointer items-center gap-2 text-sm">
+            <input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} /> On
+          </label>
+          {sharedNames.length > 0 && (
+            <p className="break-words text-xs text-warning">It also runs as part of {sharedNames.join(", ")} — take it out below if it should run on this schedule only.</p>
+          )}
+          <p className="text-xs text-on-surface-variant">Scheduled runs go to this server&rsquo;s default destinations.</p>
+          <div className="flex gap-2">
+            <Button variant="primary" onClick={() => void save(draft)} disabled={busy}>Save</Button>
+            <Button variant="ghost" onClick={() => setDraft(null)} disabled={busy}>Cancel</Button>
+          </div>
+        </div>
+      )}
+
+      {schedules !== null && !draft && own && (
+        <ScheduleList schedules={[own]} describe={stackCoverageText} action={() => (
+          <span className="flex gap-1.5">
+            <Button size="sm" onClick={() => edit(own)} disabled={busy}>Edit</Button>
+            <Button size="sm" variant="ghost" onClick={() => takeOut(own)} disabled={busy}>Remove</Button>
+          </span>
+        )} />
+      )}
+
+      {schedules !== null && !draft && !own && (
+        <div>
+          <Button onClick={() => edit()} disabled={busy}><Plus size={14} /> Give this stack its own schedule</Button>
+          <p className="mt-1.5 break-words text-xs text-on-surface-variant">Back it up on its own timing, every service at one moment.</p>
+        </div>
+      )}
+
+      {schedules !== null && others.length > 0 && (
+        <div className="mt-4">
+          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant">{own ? "Also backed up by" : "Backed up automatically by"}</div>
+          <ScheduleList schedules={others} describe={stackCoverageText} action={(schedule) => schedule.covers === "stack" && (
+            <Button size="sm" variant="ghost" onClick={() => takeOut(schedule)} disabled={busy}>Take out</Button>
+          )} />
+        </div>
+      )}
+
+      {schedules !== null && !own && others.length === 0 && (
+        <div className="mt-3 rounded border border-warning/30 bg-warning/10 px-3 py-2.5 text-sm">
+          <div className="font-medium text-warning">No schedule backs this stack up</div>
+          <p className="mt-0.5 text-xs text-on-surface-variant">It is backed up only when someone runs a backup.</p>
+        </div>
+      )}
+    </Card>
   );
 }
