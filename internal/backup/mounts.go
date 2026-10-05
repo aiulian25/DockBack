@@ -779,6 +779,23 @@ func (e *Engine) recordMountedVolumes(ctx context.Context, cli *client.Client, i
 	return out
 }
 
+// logPartialSkips warns about the mounts this backup leaves out that no other
+// backup captures — the ones that make it PARTIAL. A bind another container's
+// backups capture was logged as covered by selectMounts and is not counted,
+// the way the grade, the runbook and the digest count it.
+func (e *Engine) logPartialSkips(id string, skipped []SkippedMount) {
+	uncovered := 0
+	for _, sk := range skipped {
+		if sk.CoveredBy == "" {
+			uncovered++
+		}
+	}
+	if uncovered == 0 {
+		return
+	}
+	e.logf(id, "WARN", "%d mount(s) NOT captured in this backup — see the backup's details; this backup is PARTIAL", uncovered)
+}
+
 func (e *Engine) selectMounts(ctx context.Context, cli *client.Client, insp types.ContainerJSON, opts Options, id, dumpedDataDir string) ([]string, []VolumeRef, []SkippedMount) {
 	name := strings.TrimPrefix(insp.Name, "/")
 	cands := candidateMounts(insp.Mounts)

@@ -665,7 +665,7 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 			// why. The failure this replaces was worse in the way that matters —
 			// the whole container had no backup at all.
 			e.logf(id, "WARN", "Could not authenticate to Redis, so no consistent snapshot was taken — capturing its /data directory as files instead. That holds the RDB Redis last wrote on its own save schedule, so a restore works from a slightly older point in time. Set REDIS_PASSWORD on this container for a point-in-time snapshot.")
-			e.logf(id, "WARN", "Redis said: %v", derr)
+			e.logf(id, "WARN", "Redis said: %s", redisServerReply(derr))
 			man.DBFallback = redisAuthFallbackNote
 			engineKind = ""
 		case dumpToolMissing(derr):
@@ -903,9 +903,7 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 		// auto-create an unlabelled replacement.
 		man.MountedVolumes = e.recordMountedVolumes(ctx, cli, insp)
 		man.SkippedMounts = skipped
-		if len(skipped) > 0 {
-			e.logf(id, "WARN", "%d mount(s) NOT captured in this backup — see the backup's details; this backup is PARTIAL", len(skipped))
-		}
+		e.logPartialSkips(id, skipped)
 		// Bind destinations among the selection — used to warn on UID/GID/permission
 		// mismatches the reader can't access (PLAN §2.13). Keep each bind's host
 		// source so an unreadable one can be recorded with its path.

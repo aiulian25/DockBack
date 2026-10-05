@@ -41,8 +41,8 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
 - **Auto-discovery** — lists containers and reconstructs Compose stacks via labels.
 - **Your own Compose file comes back as the real file** — every backup carries
   the stack's own compose file(s), its `.env` and the rest of its project folder
-  (scripts, READMEs; bind-mounted data and caches left out, plus anything listed
-  in a `.dockbackignore`), and a restore writes them back as the files
+  (scripts, READMEs; every service's bind-mounted data and caches left out, plus
+  anything listed in a `.dockbackignore`), and a restore writes them back as the files
   `docker compose` runs. DockBack's own reconstruction, built from what Docker
   reports, goes beside them as `docker-compose.dockback.yml`: it joins shared
   networks instead of re-declaring them, declares named volumes, writes every `$`

@@ -187,3 +187,16 @@ func TestMountProbeScriptStaysPOSIXAndBacktickFree(t *testing.T) {
 		}
 	}
 }
+
+// A failed `sh -c` quoted its whole script in the error, and the error went
+// into the backup's log: a Redis password probe ran to a screenful there.
+func TestCommandForErrorStaysShort(t *testing.T) {
+	if got := commandForError([]string{"pg_dumpall", "-U", "postgres"}); got != "pg_dumpall -U postgres" {
+		t.Errorf("a short command is quoted whole, got %q", got)
+	}
+	script := []string{"/bin/sh", "-c", strings.Repeat("echo probe; ", 100)}
+	got := commandForError(script)
+	if len([]rune(got)) != maxCommandInError+1 || !strings.HasPrefix(got, "/bin/sh -c echo probe;") || !strings.HasSuffix(got, "…") {
+		t.Errorf("a long command is cut to %d characters and marked, got %q", maxCommandInError, got)
+	}
+}

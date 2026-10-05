@@ -323,9 +323,7 @@ func (e *Engine) prepareServiceCapture(ctx context.Context, cli *client.Client, 
 	// here because this is the one moment the tool is already looking at this
 	// image, and because the answer is only useful BEFORE the pull.
 	e.reportTagDrift(ctx, cli, containerID, man, id, name, insp.Config.Image)
-	if len(skipped) > 0 {
-		e.logf(id, "WARN", "%d mount(s) NOT captured for %q — this service's backup is PARTIAL", len(skipped), name)
-	}
+	e.logPartialSkips(id, skipped)
 	var bindDests []string
 	bindSrc := map[string]string{}
 	for _, r := range refs {
@@ -581,7 +579,7 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 				// where a torn SQL data directory is not a backup at all.
 				if redisAuthUnavailable(sc.engineKind, derr) {
 					e.logf(sc.id, "WARN", "Could not authenticate to Redis, so no consistent snapshot was taken — capturing its /data directory as files instead. That holds the RDB Redis last wrote on its own save schedule, so a restore works from a slightly older point in time. Set REDIS_PASSWORD on this container for a point-in-time snapshot.")
-					e.logf(sc.id, "WARN", "Redis said: %v", derr)
+					e.logf(sc.id, "WARN", "Redis said: %s", redisServerReply(derr))
 					sc.man.DBFallback = redisAuthFallbackNote
 					sc.engineKind = ""
 					// The data dir was EXCLUDED from the volume selection because

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/docker/docker/api/types"
+	"dockback/internal/dockercli"
 )
 
 func TestParseProjectIgnore(t *testing.T) {
@@ -44,16 +44,23 @@ func TestIgnoredBy(t *testing.T) {
 // The volume capture owns every bind-mounted path inside the project folder,
 // whether it captured it or left it out on purpose (a media library).
 func TestBindPathsUnder(t *testing.T) {
-	mounts := []types.MountPoint{
-		{Type: "bind", Source: "/srv/app/data"},
-		{Type: "bind", Source: "/srv/app/config/app.ini"},
-		{Type: "bind", Source: "/srv/app/data"},
-		{Type: "bind", Source: "/mnt/media"},
-		{Type: "bind", Source: "/srv/app"},
-		{Type: "volume", Name: "app_db", Source: "/var/lib/docker/volumes/app_db/_data"},
-	}
-	if got := fmt.Sprint(bindPathsUnder(mounts, "/srv/app")); got != "[config/app.ini data]" {
+	sources := []string{"/srv/app/data", "/srv/app/config/app.ini", "/srv/app/data", "/mnt/media", "/srv/app"}
+	if got := fmt.Sprint(bindPathsUnder(sources, "/srv/app")); got != "[config/app.ini data]" {
 		t.Errorf("only binds inside the folder, relative, once each: %s", got)
+	}
+}
+
+// A side-car that mounts nothing — a PDF converter beside a document manager —
+// walked the whole project folder, siblings' data included, and tripped the
+// size cap. Every service's binds are left out, and only binds count.
+func TestDockerBindSourcesTakesOnlyBinds(t *testing.T) {
+	mounts := []dockercli.Mount{
+		{Type: "bind", Source: "/srv/app/media"},
+		{Type: "volume", Name: "app_db", Source: "/var/lib/docker/volumes/app_db/_data"},
+		{Type: "tmpfs", Destination: "/tmp"},
+	}
+	if got := fmt.Sprint(dockerBindSources(mounts)); got != "[/srv/app/media]" {
+		t.Errorf("only bind sources: %s", got)
 	}
 }
 

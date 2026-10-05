@@ -40,10 +40,24 @@ export function fmtDuration(seconds: number, style: DurationStyle = "long"): str
 /** The days a weekly schedule can fire on, indexed by its `weekday` (0 = Sunday). */
 export const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
-/** scheduleWhen says when a schedule fires, in the terms its Settings card sets. */
+// The days a monthly schedule can fire on. The scheduler runs any other value on
+// the 1st, so that is what a label says.
+const FIRST_MONTHDAY = 1;
+const LAST_MONTHDAY = 28;
+
+/**
+ * scheduleWhen says when a schedule fires, in the terms its Settings card sets,
+ * and on the day the scheduler actually uses — a monthly day outside 1–28 runs
+ * on the 1st, a weekday counts round the week.
+ */
 export function scheduleWhen(schedule: Pick<Schedule, "kind" | "time" | "weekday" | "monthday" | "cron">): string {
   if (schedule.kind === "daily") return `Daily at ${schedule.time}`;
-  if (schedule.kind === "weekly") return `Weekly on ${WEEKDAYS[schedule.weekday] ?? WEEKDAYS[0]} at ${schedule.time}`;
-  if (schedule.kind === "monthly") return `Monthly on day ${schedule.monthday} at ${schedule.time}`;
+  if (schedule.kind === "weekly") return `Weekly on ${WEEKDAYS[((schedule.weekday % 7) + 7) % 7]} at ${schedule.time}`;
+  if (schedule.kind === "monthly") return `Monthly on day ${effectiveMonthday(schedule.monthday)} at ${schedule.time}`;
   return `Custom (cron ${schedule.cron})`;
+}
+
+function effectiveMonthday(monthday: number): number {
+  const inRange = monthday >= FIRST_MONTHDAY && monthday <= LAST_MONTHDAY;
+  return inRange ? monthday : FIRST_MONTHDAY;
 }

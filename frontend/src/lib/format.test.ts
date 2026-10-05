@@ -57,4 +57,11 @@ describe("scheduleWhen", () => {
     expect(scheduleWhen({ ...base, kind: "monthly", monthday: 15 })).toBe("Monthly on day 15 at 03:00");
     expect(scheduleWhen({ ...base, kind: "custom" })).toBe("Custom (cron 0 3 * * 0)");
   });
+
+  it("names the day the scheduler really uses", () => {
+    // A monthly schedule saved with day 0 ran on the 1st while its label said "day 0".
+    expect(scheduleWhen({ ...base, kind: "monthly", monthday: 0 })).toBe("Monthly on day 1 at 03:00");
+    expect(scheduleWhen({ ...base, kind: "monthly", monthday: 31 })).toBe("Monthly on day 1 at 03:00");
+    expect(scheduleWhen({ ...base, kind: "weekly", weekday: 7 })).toBe("Weekly on Sunday at 03:00");
+  });
 });

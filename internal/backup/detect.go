@@ -219,6 +219,23 @@ func redisAuthUnavailable(engineKind string, err error) bool {
 	return strings.Contains(err.Error(), "this Redis requires a password")
 }
 
+// redisServerReply is what Redis itself answered in a failed dump, for the log
+// line that follows the fallback warning. The whole error carries the probe
+// script and repeats the warning's advice; the reply is the part worth reading.
+// The last marker, because the script quoted at the front of the error holds
+// the same words. The whole error when the probe never got an answer. Pure.
+func redisServerReply(err error) string {
+	msg := err.Error()
+	at := strings.LastIndex(msg, redisReplyMarker)
+	if at < 0 {
+		return msg
+	}
+	return strings.TrimSpace(msg[at+len(redisReplyMarker):])
+}
+
+// redisReplyMarker introduces Redis's own reply in the dump probe's message.
+const redisReplyMarker = "Server said: "
+
 // cleanDBNames drops empty entries from a requested database-selection list and
 // reports the cleaned slice — the caller treats an empty result as "all
 // databases" (the full-cluster default), so a garbage-only selection can never

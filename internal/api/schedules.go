@@ -595,7 +595,7 @@ func (s *Server) scheduleProtect(nodeID, name string) (covered, added, enabled b
 	// No schedules at all — create one so protection actually automates.
 	sc := Schedule{
 		ID: randToken()[:12], Name: "Protected containers", Enabled: true,
-		Kind: "daily", Time: "03:00",
+		Kind: "daily", Time: "03:00", Monthday: 1,
 		Targets: []ScheduleTarget{{NodeID: nodeID, ContainerName: name}},
 	}
 	if newRow, e := sc.toRow(); e == nil && s.store.UpsertSchedule(newRow) == nil {
@@ -700,7 +700,7 @@ func (s *Server) scheduleProtectStack(nodeID, project string, consistent bool, m
 	// No schedules at all — create one, so protection actually automates.
 	sc := Schedule{
 		ID: randToken()[:12], Name: "Protected containers", Enabled: true,
-		Kind: "daily", Time: "03:00",
+		Kind: "daily", Time: "03:00", Monthday: 1,
 		Targets: []ScheduleTarget{{NodeID: nodeID, Stack: project, Consistent: consistent}},
 	}
 	if newRow, e := sc.toRow(); e == nil && s.store.UpsertSchedule(newRow) == nil {

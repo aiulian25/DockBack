@@ -91,13 +91,10 @@ func ignoredBy(rel string, patterns []string) bool {
 
 // bindPathsUnder lists the bind-mount sources inside dir, relative to it. The
 // volume capture owns those, captured or deliberately left out. Pure.
-func bindPathsUnder(mounts []types.MountPoint, dir string) []string {
+func bindPathsUnder(sources []string, dir string) []string {
 	var rels []string
-	for _, m := range mounts {
-		if m.Type != "bind" {
-			continue
-		}
-		rel, err := filepath.Rel(dir, m.Source)
+	for _, source := range sources {
+		rel, err := filepath.Rel(dir, source)
 		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
 			continue
 		}
@@ -105,6 +102,43 @@ func bindPathsUnder(mounts []types.MountPoint, dir string) []string {
 	}
 	slices.Sort(rels)
 	return slices.Compact(rels)
+}
+
+// stackBindSources lists the bind-mount sources of every container in this
+// container's compose project, its own included. A project folder holds the
+// bind-mounted data of all its services, and each service's own backup owns
+// its share. Leaving out only this container's let a side-car with no mounts
+// of its own walk into its siblings' data — a document library, a live
+// database — and either carry it or trip the size cap.
+func stackBindSources(ctx context.Context, cli *client.Client, insp types.ContainerJSON) []string {
+	var sources []string
+	for _, m := range insp.Mounts {
+		if m.Type == "bind" {
+			sources = append(sources, m.Source)
+		}
+	}
+	containers, err := dockercli.ListContainers(ctx, cli)
+	if err != nil {
+		return sources
+	}
+	project := insp.Config.Labels[composeProjectLabel]
+	for _, c := range containers {
+		if c.Stack == project {
+			sources = append(sources, dockerBindSources(c.Mounts)...)
+		}
+	}
+	return sources
+}
+
+// dockerBindSources lists the sources of the bind mounts among mounts. Pure.
+func dockerBindSources(mounts []dockercli.Mount) []string {
+	var sources []string
+	for _, m := range mounts {
+		if m.Type == "bind" {
+			sources = append(sources, m.Source)
+		}
+	}
+	return sources
 }
 
 // selectProjectEntries keeps the entries no pattern ignores, sorted so every
@@ -137,7 +171,7 @@ func (e *Engine) captureProjectFolder(ctx context.Context, cli *client.Client, i
 		return skip(err.Error())
 	}
 	defer folder.Close()
-	binds := bindPathsUnder(insp.Mounts, dir)
+	binds := bindPathsUnder(stackBindSources(ctx, cli, insp), dir)
 	entries, err := folder.Entries(ctx, binds, projectFolderDefaultIgnores)
 	if err != nil {
 		return skip(err.Error())

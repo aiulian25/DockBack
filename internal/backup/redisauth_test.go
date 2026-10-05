@@ -152,6 +152,15 @@ func TestRedisAuthUnavailableIsRedisOnly(t *testing.T) {
 			t.Errorf("must not be classified as an auth failure: %v", other)
 		}
 	}
+	// The log line after the warning quotes Redis, not the probe script that
+	// asked it: the whole error ran to a screenful of shell.
+	probeErr := errors.New(`command "/bin/sh -c command -v redis-cli >/dev/null 2>&1 || exit 127; echo \"DockBack: … Server said: $P\" >&2; exit 3" exited 3: DockBack: this Redis requires a password and none of the places DockBack looks had a working one. Server said: NOAUTH Authentication required.`)
+	if got := redisServerReply(probeErr); got != "NOAUTH Authentication required." {
+		t.Errorf("only Redis's own reply belongs in the log line, got %q", got)
+	}
+	if got := redisServerReply(errors.New("exec create: no such container")); got != "exec create: no such container" {
+		t.Errorf("an error with no reply in it is kept whole, got %q", got)
+	}
 	// The recorded note has to say a consistent snapshot was NOT taken — that is
 	// what keeps it off the archive's face as an ordinary backup.
 	if !strings.Contains(redisAuthFallbackNote, "no consistent snapshot") {

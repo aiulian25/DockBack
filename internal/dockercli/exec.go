@@ -164,9 +164,24 @@ func ExecStreamEnv(ctx context.Context, c *client.Client, id string, cmd, env []
 		return fmt.Errorf("exec inspect: %w", err)
 	}
 	if insp.ExitCode != 0 {
-		return fmt.Errorf("command %q exited %d: %s", strings.Join(cmd, " "), insp.ExitCode, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("command %q exited %d: %s", commandForError(cmd), insp.ExitCode, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+// maxCommandInError bounds how much of a command an exec error quotes: enough
+// to tell which command failed, not the whole script a `sh -c` carries, which
+// ran to a screenful in a backup's log.
+const maxCommandInError = 80
+
+// commandForError is cmd as an exec error quotes it, cut short past
+// maxCommandInError. Pure.
+func commandForError(cmd []string) string {
+	runes := []rune(strings.Join(cmd, " "))
+	if len(runes) <= maxCommandInError {
+		return string(runes)
+	}
+	return string(runes[:maxCommandInError]) + "…"
 }
 
 // maxExecOutputTail bounds what an exec's output can cost in memory. A database
