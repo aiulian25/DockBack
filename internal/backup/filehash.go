@@ -119,6 +119,14 @@ func (e *Engine) verifyRestoredFiles(ctx context.Context, cli *client.Client, b 
 	hashes, owners := parseRestoredFiles(string(out))
 	e.reportRestoredOwners(b, owners)
 
+	// A database laid down from its consistent snapshot is not the raw copy the
+	// index hashed, and its stale journal files were removed on purpose; the
+	// SQLite check proves those instead.
+	if overlaid := sqliteOverlaidPaths(man); len(overlaid) > 0 {
+		idx = withoutPaths(idx, overlaid)
+		e.logf(b.ID, "INFO", "%d SQLite database(s) came back from their consistent snapshot, so they are checked as databases, not against the raw copy", len(man.SQLiteDumps))
+	}
+
 	verdict := CompareFileHashes(idx, hashes)
 	verdict.Phase = HashPhasePreStart
 	e.persistFileVerdict(b, verdict)
@@ -217,4 +225,32 @@ func restoredScanRoots(man *Manifest) []string {
 		roots = append(roots, dest)
 	}
 	return roots
+}
+
+// sqliteOverlaidPaths lists, as the index names them, the files a restore
+// replaces or removes when it lays each SQLite snapshot over its raw file: the
+// database and its -wal, -shm and -journal. Pure.
+func sqliteOverlaidPaths(man *Manifest) map[string]bool {
+	paths := map[string]bool{}
+	for _, s := range man.SQLiteDumps {
+		db := strings.TrimPrefix(s.Source, "/")
+		if db == "" {
+			continue
+		}
+		for _, side := range []string{"", "-wal", "-shm", "-journal"} {
+			paths[db+side] = true
+		}
+	}
+	return paths
+}
+
+// withoutPaths is the index without the given entries. Pure.
+func withoutPaths(idx VolIndex, drop map[string]bool) VolIndex {
+	kept := make([]FileEntry, 0, len(idx.Entries))
+	for _, entry := range idx.Entries {
+		if !drop[entry.Path] {
+			kept = append(kept, entry)
+		}
+	}
+	return VolIndex{Entries: kept}
 }

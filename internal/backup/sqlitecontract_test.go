@@ -249,3 +249,46 @@ func TestAssertSQLiteRestoredNamesTheTable(t *testing.T) {
 		t.Errorf("the error must name the table and the counts, got %v", err)
 	}
 }
+
+// The shipped sidecar has no sqlite3, so a restore could never read a database
+// back — and so never compared even its checksum, which needs no sqlite3. A file
+// byte-identical to the snapshot is the database that checked clean at capture.
+func TestAssertSQLiteRestoredByChecksumAlone(t *testing.T) {
+	var lines []string
+	e := &Engine{Log: captureLog(&lines)}
+	man := &Manifest{SQLiteDumps: []SQLiteRef{{Source: "/config/app.db", SHA256: "aaaa1111", Tables: 5, Rows: 10}}}
+
+	if err := e.assertSQLiteRestored("b1", man, []dockercli.SQLiteRestoreCheck{
+		{Path: "/config/app.db", Integrity: "", Tables: -1, SHA256: "aaaa1111"},
+	}); err != nil {
+		t.Fatalf("a byte-identical database is verified without sqlite3: %v", err)
+	}
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "INFO ") || !strings.Contains(lines[0], "byte-identical") {
+		t.Errorf("the match is said, not warned about: %v", lines)
+	}
+
+	if err := e.assertSQLiteRestored("b1", man, []dockercli.SQLiteRestoreCheck{
+		{Path: "/config/app.db", Integrity: "", Tables: -1, SHA256: "bbbb2222"},
+	}); err == nil || !strings.Contains(err.Error(), "checksum differs") {
+		t.Fatalf("a different file fails the restore even without sqlite3: %v", err)
+	}
+}
+
+// A database laid down from its snapshot is not the raw copy the file index
+// hashed, and its stale journal files are removed on purpose: the file check
+// leaves them to the SQLite check rather than failing the restore. Pure.
+func TestFileCheckLeavesOverlaidDatabasesToTheSQLiteCheck(t *testing.T) {
+	man := &Manifest{SQLiteDumps: []SQLiteRef{{Source: "/data/gitea/gitea.db"}}}
+	idx := VolIndex{Entries: []FileEntry{
+		{Path: "data/gitea/gitea.db", MD5: "raw"}, {Path: "data/gitea/gitea.db-wal", MD5: "wal"},
+		{Path: "data/gitea/gitea.db-shm", MD5: "shm"}, {Path: "data/repos/a.git/HEAD", MD5: "head"},
+	}}
+	kept := withoutPaths(idx, sqliteOverlaidPaths(man))
+	if len(kept.Entries) != 1 || kept.Entries[0].Path != "data/repos/a.git/HEAD" {
+		t.Fatalf("only the database and its journal files are left out: %+v", kept.Entries)
+	}
+	verdict := CompareFileHashes(kept, map[string]string{"data/gitea/gitea.db": "snapshot", "data/repos/a.git/HEAD": "head"})
+	if !verdict.Clean() {
+		t.Errorf("a restored snapshot must not read as different content: %+v", verdict)
+	}
+}

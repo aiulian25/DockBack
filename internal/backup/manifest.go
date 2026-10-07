@@ -216,6 +216,12 @@ type Manifest struct {
 	// SQLiteFallbackCount is how many databases that covers, so the finding can
 	// say how much is at stake rather than that something is.
 	SQLiteFallbackCount int `json:"sqlite_fallback_count,omitempty"`
+	// SQLiteCrashConsistent counts SQLite databases captured as raw files while
+	// the container could not write (paused, stopped or not running): copied at
+	// one frozen moment, so crash-consistent, which SQLite recovers like a power
+	// cut. Not a fallback — nothing in the copy can be torn — but no integrity
+	// check ran on it.
+	SQLiteCrashConsistent int `json:"sqlite_crash_consistent,omitempty"`
 
 	// CorruptDatabases records SQLite files that FAILED `PRAGMA integrity_check`
 	// at capture (F116) — damaged at the source, so the backup preserves the

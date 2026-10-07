@@ -29,11 +29,9 @@ Plex keeps everything — libraries, users, watch history, sharing — in a SQLi
 
 DockBack's answer is a consistent snapshot: the database is checkpointed into a sidecar copy, and on restore that copy is laid down and the stale write-ahead log removed, so Plex opens something coherent.
 
-**That requires `sqlite3` in the volume sidecar image, and the shipped default does not have one.** When it is missing, DockBack falls back to copying the raw files — which for a busy Plex is exactly the risk the snapshot exists to remove. It now says so: the backup is graded down, the reason names the fix, and the list shows a **raw DB files** chip. Set a sidecar image that includes `sqlite3` under **Settings → Backups** and take the backup again.
+**DockBack takes that snapshot itself**, with the SQLite engine it carries for its own catalog — no special sidecar image needed. While Plex is paused, the database and its write-ahead log are copied out together; once Plex is running again, that copy is written into one clean database file, integrity-checked, and counted table by table, so none of it lengthens the pause. If Plex runs during the copy (no pause), a copy can be caught mid-write: the snapshot is then skipped rather than trusted, the raw files still travel, and the backup is graded down with a **raw DB files** chip and the fix — pause the container during the copy.
 
-This is worth checking even if you do not run Plex. Every application with an embedded database — and that is most self-hosted software — is affected by the same default.
-
-Once the snapshot is engaging, a restore proves itself: the database is re-read on the target, its integrity checked, its per-table row counts compared against what was captured, and its checksum compared byte for byte. A restored Plex with **no libraries** or **no items** fails the restore before the container is started, rather than coming up looking like a fresh install.
+With a volume sidecar image that includes `sqlite3` (**Settings → Advanced → Performance & tuning**), a restore also proves itself: the database is re-read on the target, its integrity checked, its per-table row counts compared against what was captured, and its checksum compared byte for byte. A restored Plex with **no libraries** or **no items** fails the restore before the container is started, rather than coming up looking like a fresh install.
 
 ## Identity: the reason a copy is dangerous
 

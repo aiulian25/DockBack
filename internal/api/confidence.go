@@ -136,7 +136,7 @@ func gradeBackup(b *store.Backup, man *backup.Manifest, locs []backup.Location, 
 		if n <= 0 {
 			n = 1
 		}
-		reasons = append(reasons, fmt.Sprintf("%d embedded database(s) were captured as raw files — %s. A database being written to can be torn by a raw copy; set a volume sidecar image that has sqlite3 in Settings → Backups and back up again", n, man.SQLiteFallback))
+		reasons = append(reasons, fmt.Sprintf("%d embedded database(s) were captured as raw files — %s. A database being written to can be torn by a raw copy; pause the container during the copy and back up again", n, man.SQLiteFallback))
 	}
 	if credStore != "" {
 		reasons = append(reasons, "decryptable by this server — "+credStore+". Turn on write-only encryption so only an offline key can open it")

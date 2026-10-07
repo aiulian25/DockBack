@@ -14,9 +14,9 @@ Both are now **always excluded**, no toggle — the same treatment rotated logs 
 
 `tautulli.db` is SQLite and it is being written to while you back it up. DockBack takes a **consistent snapshot** rather than copying the file, so a write in progress cannot leave you with a torn database.
 
-That path needs `sqlite3` in the volume sidecar image, and the shipped default does not have one. When it is missing, DockBack falls back to copying the raw files and now says so — the backup is graded down and the reason names the fix. **Set a sidecar image that includes `sqlite3` under Settings → Backups**, or the snapshot this page describes is not happening.
+DockBack takes that snapshot itself, with its own SQLite engine: while Tautulli is paused, the database and its write-ahead log are copied out together; once it is running again, that copy is written into one clean file, integrity-checked and counted, so none of it lengthens the pause. A copy taken while Tautulli was running can be caught mid-write, so the snapshot is skipped rather than trusted and the backup is graded down with the fix — pause the container during the copy.
 
-Once it is engaging, the restore proves itself: the database is re-read on the target, its integrity checked, its per-table counts compared against capture, and its checksum compared byte for byte. A restored Tautulli with **no history** or **no users** fails the restore before the container starts, rather than coming back looking like a fresh install.
+With a volume sidecar image that includes `sqlite3` (Settings → Advanced → Performance & tuning), the restore also proves itself: the database is re-read on the target, its integrity checked, its per-table counts compared against capture, and its checksum compared byte for byte. A restored Tautulli with **no history** or **no users** fails the restore before the container starts, rather than coming back looking like a fresh install.
 
 ## The interesting half: moving Tautulli is free, moving Plex is not
 

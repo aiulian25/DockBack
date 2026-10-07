@@ -416,6 +416,13 @@ func TestGradeSQLiteFallback(t *testing.T) {
 		[]backup.Location{local(), destOK()}, drillPass(), nil); grade != "A" || len(reasons) != 0 {
 		t.Errorf("a clean backup must stay A and silent: %s / %v", grade, reasons)
 	}
+
+	// Nor does one whose raw copy was taken while the app could not write:
+	// frozen at one moment, crash-consistent, nothing in it can be torn.
+	if grade, reasons := gradeBackup(&store.Backup{Verified: "verified"}, &backup.Manifest{SQLiteCrashConsistent: 1},
+		[]backup.Location{local(), destOK()}, drillPass(), nil); grade != "A" || len(reasons) != 0 {
+		t.Errorf("a crash-consistent copy must not be graded down: %s / %v", grade, reasons)
+	}
 }
 
 // The list row shows it through the same chip as a raw-copied database

@@ -150,8 +150,9 @@ type serviceCapture struct {
 
 	// window state
 	paused     bool
-	pauseKind  string // PausePause | PauseStop
-	captureErr error  // set if a window step failed => skip finalize, mark failed
+	pauseKind  string        // PausePause | PauseStop
+	sqlite     sqliteCapture // the SQLite copies the window took, recorded after it
+	captureErr error         // set if a window step failed => skip finalize, mark failed
 }
 
 // prepareServiceCapture does everything that does NOT require the app to be
@@ -610,15 +611,7 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 				continue
 			}
 			sc.man.VolumesSHA256 = volSHA
-			// F116: a corruption verdict fails THIS service only. The group's other
-			// members are already captured and still form a coherent point-in-time;
-			// discarding them because a sibling's database is damaged would turn one
-			// problem into several.
-			if sqerr := e.snapshotSQLite(ctx, cli, sc.containerID, sc.volDests, sc.work, sc.man, sc.id); sqerr != nil {
-				sc.captureErr = sqerr
-				e.logf(sc.id, "ERR", "Capture failed for %q: %v", sc.name, sqerr)
-				continue
-			}
+			sc.sqlite = e.captureSQLite(ctx, cli, sc.containerID, sc.volDests, sc.work, sc.id, sc.paused || !sc.running)
 		case "resume":
 			if sc.paused && !resumed[sc.key] {
 				resumed[sc.key] = true
@@ -627,13 +620,21 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 		}
 	}
 	// Window over: end downtime NOW (resume + post-hooks) before the slow
-	// pack/encrypt/store/verify tail, which works entirely from the spooled files.
+	// snapshot/pack/encrypt/store/verify tail, which works entirely from the
+	// spooled files.
 	resumeAll()
 	runPost()
 
 	// PHASE 3 — finalize each captured service OUTSIDE the pause window.
 	ok := 0
 	for _, sc := range caps {
+		// F116: a corruption verdict fails THIS service only. The group's other
+		// members are already captured and still form a coherent point-in-time;
+		// discarding them because a sibling's database is damaged would turn one
+		// problem into several.
+		if sc.captureErr == nil {
+			sc.captureErr = e.recordSQLite(sc.man, sc.sqlite, sc.id)
+		}
 		// F143: certificates are static files, so their inventory belongs out here
 		// rather than inside the window — a stack snapshot should hold every
 		// service still for as short a time as it can.

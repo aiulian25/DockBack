@@ -2851,7 +2851,7 @@ func (e *Engine) overlaySQLite(ctx context.Context, cli *client.Client, b *store
 			if oerr != nil {
 				continue
 			}
-			hdr := &tar.Header{Name: strings.TrimPrefix(src, "/"), Mode: 0o600, Size: fi.Size(), Typeflag: tar.TypeReg}
+			hdr := &tar.Header{Name: strings.TrimPrefix(src, "/"), Mode: 0o600, Size: fi.Size(), ModTime: fi.ModTime(), Typeflag: tar.TypeReg}
 			if werr = tw.WriteHeader(hdr); werr != nil {
 				f.Close()
 				break
@@ -2875,6 +2875,17 @@ func (e *Engine) overlaySQLite(ctx context.Context, cli *client.Client, b *store
 		return oerr
 	}
 	return e.assertSQLiteRestored(b.ID, man, checks)
+}
+
+// checksumVerdict compares a restored database's checksum with the snapshot's
+// recorded at capture: "" when they match, which it logs, else the failure.
+func (e *Engine) checksumVerdict(backupID string, c dockercli.SQLiteRestoreCheck, ref SQLiteRef) string {
+	if c.SHA256 != ref.SHA256 {
+		return fmt.Sprintf("%s is not the database that was captured — its checksum differs (expected %s…, got %s…)",
+			c.Path, shortHash(ref.SHA256), shortHash(c.SHA256))
+	}
+	e.logf(backupID, "INFO", "Verified %s: byte-identical to the captured database (%s…) — every row and value is exactly as backed up", c.Path, shortHash(ref.SHA256))
+	return ""
 }
 
 // assertSQLiteRestored compares what the overlay sidecar read back off disk
@@ -2914,7 +2925,17 @@ func (e *Engine) assertSQLiteRestored(backupID string, man *Manifest, checks []d
 	var failures []string
 	for _, c := range checks {
 		ref, known := want[c.Path]
+		hashable := known && ref.SHA256 != "" && c.SHA256 != ""
 
+		// No sqlite3 on the target to read it back, but the checksum needs none:
+		// a file byte-identical to the snapshot is the database that checked
+		// clean at capture.
+		if c.Integrity == "" && hashable {
+			if failure := e.checksumVerdict(backupID, c, ref); failure != "" {
+				failures = append(failures, failure)
+			}
+			continue
+		}
 		if c.Integrity == "" {
 			e.logf(backupID, "WARN", "Restored %s but could not run an integrity check on it — applied, not confirmed", c.Path)
 			continue
@@ -2943,13 +2964,10 @@ func (e *Engine) assertSQLiteRestored(backupID string, man *Manifest, checks []d
 		// that was captured — which is the only way to prove something like
 		// Karakeep's AI-vs-human tag attribution survived, since that lives in a
 		// column value no count can see.
-		if known && ref.SHA256 != "" && c.SHA256 != "" {
-			if c.SHA256 != ref.SHA256 {
-				failures = append(failures, fmt.Sprintf("%s is not the database that was captured — its checksum differs (expected %s…, got %s…)",
-					c.Path, shortHash(ref.SHA256), shortHash(c.SHA256)))
-				continue
+		if hashable {
+			if failure := e.checksumVerdict(backupID, c, ref); failure != "" {
+				failures = append(failures, failure)
 			}
-			e.logf(backupID, "INFO", "Verified %s: byte-identical to the captured database (%s…) — every row and value is exactly as backed up", c.Path, shortHash(ref.SHA256))
 			continue
 		}
 

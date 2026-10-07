@@ -24,7 +24,7 @@ func TestIntrospectionPrecedesBulkTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := runFunctionBody(t, string(src))
+	body := functionBody(t, string(src), "func (e *Engine) Run(")
 
 	// The markers: the container introspection Run does for itself, and the call
 	// that opens the volume stream.
@@ -59,14 +59,43 @@ func TestIntrospectionPrecedesBulkTransfer(t *testing.T) {
 	}
 }
 
-// runFunctionBody returns the text of Engine.Run, so the assertion is about the
-// capture path and not about wherever a helper happens to be defined in the file.
-func runFunctionBody(t *testing.T, src string) string {
+// The SQLite copies are the only part of capturing a database that needs the
+// app held still. Turning them into snapshots — vacuum, integrity check, row
+// counts, minutes on a large database — works on the copies alone, so it runs
+// after the resume: inside the window it would only lengthen the freeze.
+func TestSQLiteIsRecordedAfterTheAppResumes(t *testing.T) {
+	engineSrc, err := os.ReadFile("engine.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stackSrc, err := os.ReadFile("consistent.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, capturePath := range []struct{ name, body, resume string }{
+		{"Run", functionBody(t, string(engineSrc), "func (e *Engine) Run("), "\n\t\tdoResume()\n"},
+		{"BackupStackConsistent", functionBody(t, string(stackSrc), "func (e *Engine) BackupStackConsistent("), "\n\tresumeAll()\n\trunPost()\n"},
+	} {
+		capture := strings.Index(capturePath.body, "e.captureSQLite(")
+		resume := strings.Index(capturePath.body, capturePath.resume)
+		record := strings.Index(capturePath.body, "e.recordSQLite(")
+		if capture < 0 || resume < 0 || record < 0 {
+			t.Fatalf("%s: marker not found — this test needs updating alongside the code", capturePath.name)
+		}
+		if !(capture < resume && resume < record) {
+			t.Errorf("%s must copy the databases inside the window and snapshot them after the app resumes", capturePath.name)
+		}
+	}
+}
+
+// functionBody returns the text of the function declared by sig, so an
+// assertion is about that capture path and not about wherever a helper happens
+// to be defined in the file.
+func functionBody(t *testing.T, src, sig string) string {
 	t.Helper()
-	const sig = "func (e *Engine) Run("
 	start := strings.Index(src, sig)
 	if start < 0 {
-		t.Fatal("Engine.Run not found in engine.go")
+		t.Fatalf("%s not found", sig)
 	}
 	// Up to the next top-level declaration.
 	rest := src[start+len(sig):]

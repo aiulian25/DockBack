@@ -1,6 +1,9 @@
 package dockercli
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestParseSQLiteRestoreChecks locks in the restore-side read-back parse (F109).
 //
@@ -211,5 +214,25 @@ func TestParseSQLiteRestoreChecksAcceptsBothShapes(t *testing.T) {
 	// a digest — comparing against it would fail every restore.
 	if got[2].SHA256 != "" {
 		t.Errorf(`"-" must not be treated as a hash, got %q`, got[2].SHA256)
+	}
+}
+
+// The overlay laid each snapshot down as root's with mode 600, so an app that
+// runs as anyone else could not open its own database after a restore; and with
+// no sqlite3 it reported nothing, not even the checksum that needs none.
+func TestOverlaySQLiteScriptKeepsOwnershipAndChecksums(t *testing.T) {
+	script := overlaySQLiteScript([]string{"/data/app.db"})
+	for _, want := range []string{"stat -c '%u:%g:%a'", `chown "${own%:*}"`, `chmod "${own##*:}"`, "if ! command -v sqlite3", "sha256sum"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the overlay script must contain %q", want)
+		}
+	}
+	read, extract, restore := strings.Index(script, "stat -c"), strings.Index(script, "tar -xf"), strings.Index(script, "chown")
+	if !(read < extract && extract < restore) {
+		t.Error("ownership is read before tar replaces the file and put back after")
+	}
+	checks := parseSQLiteRestoreChecks("DBCHK\t/data/app.db\t\t-1\t-1\tabc123\n")
+	if len(checks) != 1 || checks[0].Integrity != "" || checks[0].SHA256 != "abc123" || checks[0].RowsKnown {
+		t.Errorf("a database read back without sqlite3 carries its checksum and nothing else: %+v", checks)
 	}
 }

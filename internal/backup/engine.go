@@ -965,17 +965,21 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 	if mode, why := AppPauseDefault(insp.Config.Image); mode == pm && why != "" && mode == PauseNone && len(volDests) > 0 && running {
 		e.logf(id, "INFO", "Not pausing %s during the copy — %s.", name, why)
 	}
+	// quiesced: nothing in the container can write while its volumes are
+	// copied — it is not running, or it was stopped or paused for the copy.
+	quiesced := !running
 	if shouldPause(pm, engineKind, running, len(volDests)) {
 		switch pm {
 		case PauseStop:
 			e.logf(id, "INFO", "Stopping container for a consistent volume snapshot")
-			_ = cli.ContainerStop(ctx, opts.ContainerID, container.StopOptions{})
+			quiesced = cli.ContainerStop(ctx, opts.ContainerID, container.StopOptions{}) == nil
 			resume = func() { e.resumeContainer(cli, opts.ContainerID, id, false) }
 		case PausePause:
 			e.logf(id, "INFO", "Pausing container for a consistent volume snapshot (brief freeze)")
 			if perr := cli.ContainerPause(ctx, opts.ContainerID); perr != nil {
 				e.logf(id, "WARN", "Pause failed (%v) — continuing with a live copy", perr)
 			} else {
+				quiesced = true
 				resume = func() { e.resumeContainer(cli, opts.ContainerID, id, true) }
 			}
 		}
@@ -997,18 +1001,18 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 			return id, e.fail(b, fmt.Errorf("volume archive: %w", verr))
 		}
 		// F22: capture any SQLite databases under the selected mounts as CONSISTENT
-		// snapshots (sqlite3 online backup) alongside the raw copy, so a live WAL/
-		// journal can't leave a torn database in the backup. Fail-safe: the raw file
-		// is already in the volume payload, so any snapshot failure just falls back to
-		// it. Runs on the changed-set only for a delta — a SQLite file that didn't
-		// change isn't re-snapshotted; the newest generation that touched it holds it.
-		sqerr := e.snapshotSQLite(ctx, cli, opts.ContainerID, volDests, work, man, id)
-		// Snapshot captured — bring the app back up NOW; the rest of the pipeline
-		// (compress/encrypt/store/verify) works from the spooled file. The resume
-		// happens BEFORE acting on a corruption verdict (F116): an app must never be
-		// left paused because its database turned out to be damaged.
+		// snapshots alongside the raw copy, so a live WAL/journal can't leave a torn
+		// database in the backup. Fail-safe: the raw file is already in the volume
+		// payload, so any snapshot failure just falls back to it. Runs on the
+		// changed-set only for a delta — a SQLite file that didn't change isn't
+		// re-snapshotted; the newest generation that touched it holds it.
+		sqliteCopies := e.captureSQLite(ctx, cli, opts.ContainerID, volDests, work, id, quiesced)
+		// Copies taken — bring the app back up NOW; the rest of the pipeline
+		// (snapshot/compress/encrypt/store/verify) works from the spooled files. The
+		// resume happens BEFORE acting on a corruption verdict (F116): an app must
+		// never be left paused because its database turned out to be damaged.
 		doResume()
-		if sqerr != nil {
+		if sqerr := e.recordSQLite(man, sqliteCopies, id); sqerr != nil {
 			return id, e.fail(b, sqerr)
 		}
 		// F143: record the TLS certificates that travelled with the data — what
@@ -2620,32 +2624,41 @@ var sqliteDbkName = regexp.MustCompile(`^[0-9]+\.dbk$`)
 // as a numbered rows file.
 var sqliteRowsName = regexp.MustCompile(`^rows-[0-9]+\.txt$`)
 
-// snapshotSQLite finds SQLite databases under the captured mounts and stores a
-// CONSISTENT snapshot of each into work/sqlite/<n>.dbk, recording them in the
-// manifest (F22). It is entirely best-effort and fail-safe: the raw file is always
-// already in volumes.tar, so any failure (no SQLite files, no sqlite3 in the
-// sidecar, a snapshot that doesn't verify) simply leaves the raw capture in place.
-func (e *Engine) snapshotSQLite(ctx context.Context, cli *client.Client, containerID string, volDests []string, work string, man *Manifest, id string) error {
+// sqliteCapture is what the copy window took of a container's SQLite databases,
+// waiting to be recorded once the app is running again.
+type sqliteCapture struct {
+	found    int    // databases found under the captured mounts
+	dir      string // where the sidecar's copies landed; "" when there is nothing to record
+	quiesced bool   // the copies were taken while the container could not write
+}
+
+// captureSQLite finds SQLite databases under the captured mounts and has the
+// sidecar copy each one out while the app is still held: a consistent snapshot
+// when the sidecar has sqlite3, the raw database and journal files when it does
+// not (F22). It is entirely best-effort and fail-safe: the raw file is always
+// already in volumes.tar, so any failure simply leaves the raw capture in place.
+// quiesced says the container could not write while its volumes were copied.
+func (e *Engine) captureSQLite(ctx context.Context, cli *client.Client, containerID string, volDests []string, work, id string, quiesced bool) sqliteCapture {
 	dbs, err := dockercli.DetectSQLiteFiles(ctx, cli, containerID, volDests)
 	if err != nil {
 		e.logf(id, "INFO", "SQLite scan skipped (%v) — volumes captured as-is", err)
-		return nil
+		return sqliteCapture{}
 	}
 	if len(dbs) == 0 {
-		return nil
+		return sqliteCapture{}
 	}
 	e.logf(id, "INFO", "Found %d SQLite database(s) under the captured volumes — snapshotting consistently", len(dbs))
 	rc, err := dockercli.SnapshotSQLite(ctx, cli, containerID, dbs)
 	if err != nil {
 		e.logf(id, "WARN", "SQLite consistent snapshot unavailable (%v) — the raw file(s) are still captured", err)
-		return nil
+		return sqliteCapture{}
 	}
 	defer rc.Close()
 
 	sqliteDir := filepath.Join(work, "sqlite")
 	if err := os.MkdirAll(sqliteDir, 0o750); err != nil {
 		_, _ = io.Copy(io.Discard, rc)
-		return nil
+		return sqliteCapture{}
 	}
 	// Extract the sidecar's tar (numbered .dbk files + index.txt) into work/sqlite.
 	// filepath.Base + a strict name check anchor path-traversal out (defense in depth).
@@ -2658,14 +2671,14 @@ func (e *Engine) snapshotSQLite(ctx context.Context, cli *client.Client, contain
 		if terr != nil {
 			e.logf(id, "WARN", "SQLite snapshot read failed (%v) — raw file(s) captured instead", terr)
 			os.RemoveAll(sqliteDir)
-			return nil
+			return sqliteCapture{}
 		}
 		if h.FileInfo().IsDir() {
 			continue
 		}
 		base := filepath.Base(h.Name)
-		if base != "index.txt" && base != "stats.txt" && base != "failed.txt" &&
-			!sqliteRowsName.MatchString(base) && !sqliteDbkName.MatchString(base) {
+		if base != "index.txt" && base != "stats.txt" && base != "failed.txt" && base != sqliteRawIndex &&
+			!sqliteRowsName.MatchString(base) && !sqliteDbkName.MatchString(base) && !sqliteRawName.MatchString(base) {
 			continue
 		}
 		out, cerr := os.OpenFile(filepath.Join(sqliteDir, base), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
@@ -2675,6 +2688,19 @@ func (e *Engine) snapshotSQLite(ctx context.Context, cli *client.Client, contain
 		_, _ = io.Copy(out, tr)
 		out.Close()
 	}
+	return sqliteCapture{found: len(dbs), dir: sqliteDir, quiesced: quiesced}
+}
+
+// recordSQLite records what captureSQLite took in the manifest, once the app is
+// running again: it works only on the copies, so nothing here is worth holding
+// the app still for. Only a database measured as corrupt returns an error.
+func (e *Engine) recordSQLite(man *Manifest, capture sqliteCapture, id string) error {
+	if capture.dir == "" {
+		return nil
+	}
+	sqliteDir := capture.dir
+	// A sidecar without sqlite3 handed back raw files instead: snapshot them here.
+	snapshotSQLiteLocally(sqliteDir, capture.quiesced)
 
 	// stats.txt maps "<n>\t<tables>\t<rows>" for each snapshot (F109) — read
 	// first so the index loop below can attach each database's contract. Absent
@@ -2745,18 +2771,7 @@ func (e *Engine) snapshotSQLite(ctx context.Context, cli *client.Client, contain
 
 	if len(man.SQLiteDumps) == 0 {
 		os.RemoveAll(sqliteDir)
-		// F154: record it, not just log it. Until now a run that found databases
-		// and snapshotted none produced a manifest identical to one for an app
-		// with no database — so the backup graded A while holding a file copied
-		// out from under a live writer.
-		man.SQLiteFallbackCount = len(dbs)
-		if len(failures) == 0 {
-			man.SQLiteFallback = "the volume sidecar image has no sqlite3, so no consistent snapshot could be taken"
-			e.logf(id, "WARN", "%d SQLite database(s) were found but captured as RAW FILES — %s. A database that is being written to can be torn by a raw copy; point the sidecar at an image that has sqlite3 (Settings → Backups) for a guaranteed-consistent snapshot", len(dbs), man.SQLiteFallback)
-		} else {
-			man.SQLiteFallback = "no database produced a usable consistent snapshot"
-			e.logf(id, "WARN", "%d SQLite database(s) were found and %s — the raw file(s) are captured instead, which can be torn if they were mid-write", len(dbs), man.SQLiteFallback)
-		}
+		e.recordRawSQLite(man, capture.found, len(failures) > 0, capture.quiesced, id)
 	}
 
 	// A database MEASURED as corrupt fails the backup, so it is found now — while
@@ -2783,6 +2798,29 @@ func (e *Engine) snapshotSQLite(ctx context.Context, cli *client.Client, contain
 		}
 	}
 	return nil
+}
+
+// recordRawSQLite records SQLite databases that went out only as raw files —
+// neither the sidecar nor DockBack itself could snapshot them (F154: recorded,
+// not just logged, or the manifest reads like an app with no database at all).
+// A copy made while the container was paused or stopped froze every file — the
+// database and its journal — at one moment: crash-consistent, which SQLite
+// opens the way it recovers from a power cut. That is noted, not held against
+// the backup. A copy made while the app was running can be torn.
+func (e *Engine) recordRawSQLite(man *Manifest, count int, snapshotFailed, quiesced bool, id string) {
+	if quiesced && !snapshotFailed {
+		man.SQLiteCrashConsistent = count
+		e.logf(id, "INFO", "%d SQLite database(s) captured as raw files while the container could not write — copied at one frozen moment, which SQLite opens the way it recovers from a power cut. No consistent snapshot could be taken this time, so no integrity check ran.", count)
+		return
+	}
+	man.SQLiteFallbackCount = count
+	if snapshotFailed {
+		man.SQLiteFallback = "no database produced a usable consistent snapshot"
+		e.logf(id, "WARN", "%d SQLite database(s) were found and %s — the raw file(s) are captured instead, which can be torn if they were mid-write", count, man.SQLiteFallback)
+		return
+	}
+	man.SQLiteFallback = "no consistent snapshot could be taken"
+	e.logf(id, "WARN", "%d SQLite database(s) were copied as RAW FILES while the container was running, and %s. A database being written to can be torn by a live copy: pause the container during the copy.", count, man.SQLiteFallback)
 }
 
 // sqliteFailure is one database that produced no usable snapshot (F116).

@@ -688,6 +688,10 @@ func DetectSQLiteFiles(ctx context.Context, c *client.Client, targetID string, m
 // the wrong branch.
 const maxSQLiteRowCountBytesStr = "2000000000"
 
+// MaxSQLiteRowCountBytes is the same cap as a number, for a snapshot taken by
+// DockBack itself, so both ways of counting skip the same databases.
+const MaxSQLiteRowCountBytes = 2000000000
+
 // sqliteCountScript is the shared body that measures ONE SQLite database — used
 // at capture against the snapshot and at restore against the file that landed on
 // disk, so both sides count the same way and their numbers are comparable.
@@ -719,6 +723,10 @@ const sqliteCountScript = `tb=$(sqlite3 "$db" "select count(*) from sqlite_maste
 // putting thousands of entries into a manifest. Above it the aggregate still
 // applies, so the contract degrades rather than disappearing.
 const maxSQLiteTablesStr = "100"
+
+// MaxSQLiteTables is the same cap as a number, for a snapshot taken by
+// DockBack itself.
+const MaxSQLiteTables = 100
 
 // sqliteTableRowsScript emits one "TBLROW<TAB><table><TAB><rows>" line per user
 // table of $db (F124), shared by capture and restore so both sides count
@@ -752,6 +760,14 @@ const sqliteStatsScript = `db="/out/$i.dbk"; ` + sqliteCountScript +
 	// the rows came back unchanged rather than merely equally numerous.
 	`{ ` + sqliteTableHashScript + `} > "/out/hash-$i.txt" 2>/dev/null; `
 
+// sqliteRawCopyScript ends the loop over the databases when the sidecar has no
+// sqlite3: each database and the journal files beside it are copied under
+// numbered names, recorded in raw-index.txt, and handed back as a tar.
+const sqliteRawCopyScript = `; do i=$((i+1)); [ -f "$db" ] || continue; ` +
+	`cp "$db" "/out/raw-$i.db" 2>/dev/null || continue; ` +
+	`for side in wal shm journal; do [ -f "$db-$side" ] && cp "$db-$side" "/out/raw-$i.db-$side" 2>/dev/null || true; done; ` +
+	`printf '%s\t%s\n' "$i" "$db" >> /out/raw-index.txt; done; tar -cf - -C /out . ; exit 0; `
+
 // SnapshotSQLite produces a CONSISTENT snapshot of each SQLite file in dbPaths via
 // a read-only sidecar (F22) and streams a tar of the results. Because the source
 // volume is mounted read-only (and so is never modified), each database's file set
@@ -761,9 +777,11 @@ const sqliteStatsScript = `db="/out/$i.dbk"; ` + sqliteCountScript +
 // `<n>.dbk` files, an `index.txt` mapping `<n>\t<source-path>`, (F109) a
 // `stats.txt` mapping `<n>\t<tables>\t<rows>`, and (F116) a `failed.txt` mapping
 // `<kind>\t<source-path>\t<detail>` for every database that did NOT produce a
-// usable snapshot. If the sidecar image has no sqlite3, the tar is empty
-// (index.txt only) and the caller falls back to the raw capture already in
-// volumes.tar — never a torn or missing database.
+// usable snapshot. If the sidecar image has no sqlite3 — the shipped default —
+// the tar holds each database's raw files instead (`raw-<n>.db` and any
+// `-wal`/`-shm`/`-journal` beside it, copied while the caller holds the app
+// quiesced) and a `raw-index.txt` mapping `<n>\t<source-path>`, for DockBack to
+// snapshot with its own SQLite engine.
 func SnapshotSQLite(ctx context.Context, c *client.Client, targetID string, dbPaths []string) (io.ReadCloser, error) {
 	if len(dbPaths) == 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
@@ -779,15 +797,16 @@ func SnapshotSQLite(ctx context.Context, c *client.Client, targetID string, dbPa
 	// db + its -wal/-shm into a writable dir so sqlite3 can open a WAL database (the
 	// source is read-only), VACUUM INTO a single consistent /out/<i>.dbk, verify it,
 	// and record the mapping only on success. The source files are never written.
+	var dbList strings.Builder
+	for _, p := range dbPaths {
+		dbList.WriteString(" '")
+		dbList.WriteString(shellEscape(p))
+		dbList.WriteString("'")
+	}
 	var script strings.Builder
 	script.WriteString("set -e; mkdir -p /out; i=0; ")
-	script.WriteString("if ! command -v sqlite3 >/dev/null 2>&1; then tar -cf - -C /out . ; exit 0; fi; ")
-	script.WriteString("for db in")
-	for _, p := range dbPaths {
-		script.WriteString(" '")
-		script.WriteString(shellEscape(p))
-		script.WriteString("'")
-	}
+	script.WriteString("if ! command -v sqlite3 >/dev/null 2>&1; then for db in" + dbList.String() + sqliteRawCopyScript + "fi; ")
+	script.WriteString("for db in" + dbList.String())
 	// Note: VACUUM INTO fails if the destination exists, so /out/<i>.dbk is always fresh.
 	script.WriteString(`; do i=$((i+1)); [ -f "$db" ] || continue; st="/tmp/s$i"; mkdir -p "$st"; ` +
 		`cp "$db" "$st/d" 2>/dev/null || continue; ` +
@@ -883,6 +902,51 @@ type SQLiteRestoreCheck struct {
 	SHA256 string
 }
 
+// overlaySQLiteScript is the overlay sidecar's script: tar -xf - lays each .dbk
+// over its source database, then the stale side-files are dropped so SQLite does
+// not replay an old WAL over the freshly-restored database. Finally each
+// restored database is re-read and its state printed as
+// "DBCHK\t<path>\t<integrity>\t<tables>\t<rows>\t<sha256>" for the caller.
+// Pure.
+func overlaySQLiteScript(sources []string) string {
+	var list strings.Builder
+	for _, s := range sources {
+		list.WriteString(" '")
+		list.WriteString(shellEscape(s))
+		list.WriteString("'")
+	}
+	var rm strings.Builder
+	// Each database keeps the owner and mode its raw file was just restored
+	// with: the snapshot arrives as root's, mode 600, and an application that
+	// runs as anyone else could not open its own database after the restore.
+	rm.WriteString("for s in" + list.String() + `; do [ -f "$s" ] && printf '%s\t%s\n' "$(stat -c '%u:%g:%a' "$s")" "$s"; done > /tmp/dockback-owners 2>/dev/null; `)
+	rm.WriteString(`tar -xf - -C / && { while IFS="$(printf '\t')" read -r own path; do chown "${own%:*}" "$path" 2>/dev/null; chmod "${own##*:}" "$path" 2>/dev/null; done < /tmp/dockback-owners; `)
+	rm.WriteString("for s in" + list.String() + `; do rm -f "$s-wal" "$s-shm" "$s-journal"; done; }; `)
+	// Verification pass. Every field defaults to the "could not read" value, so a
+	// missing sqlite3 or an unreadable file reports honestly instead of silently
+	// looking like a pass. The checksum needs no sqlite3, so it is taken either
+	// way: a file byte-identical to the snapshot is the snapshot that checked
+	// clean at capture.
+	rm.WriteString("if ! command -v sqlite3 >/dev/null 2>&1; then for s in" + list.String() +
+		`; do [ -f "$s" ] || continue; sha=$(sha256sum "$s" 2>/dev/null | cut -d" " -f1); [ -n "$sha" ] || sha=-; ` +
+		`printf 'DBCHK\t%s\t\t-1\t-1\t%s\n' "$s" "$sha"; done; exit 0; fi; `)
+	rm.WriteString("for s in" + list.String())
+	rm.WriteString(`; do [ -f "$s" ] || continue; db="$s"; ` +
+		`ic=$(sqlite3 "$db" 'PRAGMA integrity_check' 2>/dev/null | head -1); ` +
+		sqliteCountScript +
+		// DBCHK first, then this database's TBLROW lines: the parser attaches
+		// each run of TBLROWs to the DBCHK above it, so the path never has to be
+		// repeated on every line.
+		// F134: the SHA-256 of the file as it now sits on disk. Compared against
+		// the checksum recorded at capture, this proves the restored database is
+		// BYTE-IDENTICAL — every row, every column value — which no count or
+		// app-specific digest can match.
+		`sha=$(sha256sum "$s" 2>/dev/null | cut -d" " -f1); [ -n "$sha" ] || sha=-; ` +
+		`printf 'DBCHK\t%s\t%s\t%s\t%s\t%s\n' "$s" "$ic" "$tb" "$rw" "$sha"; ` +
+		sqliteTableRowsScript + `done`)
+	return rm.String()
+}
+
 // OverlaySQLiteRestore writes each consistent `.dbk` snapshot back over its source
 // database and removes the now-stale WAL/shm/journal side-files (F22), so the
 // consistent copy — not the raw file already restored from volumes.tar — is what
@@ -902,42 +966,7 @@ func OverlaySQLiteRestore(ctx context.Context, c *client.Client, targetID string
 	if err := ensureSidecar(ctx, c); err != nil {
 		return nil, err
 	}
-	// tar -xf - lays each .dbk over its source db; then drop the stale side-files so
-	// SQLite doesn't replay an old WAL over the freshly-restored database. Finally
-	// each restored database is re-read and its state printed as
-	// "DBCHK\t<path>\t<integrity>\t<tables>\t<rows>" for the caller to parse.
-	var rm strings.Builder
-	rm.WriteString("tar -xf - -C / && ")
-	rm.WriteString("for s in")
-	for _, s := range sources {
-		rm.WriteString(" '")
-		rm.WriteString(shellEscape(s))
-		rm.WriteString("'")
-	}
-	rm.WriteString(`; do rm -f "$s-wal" "$s-shm" "$s-journal"; done; `)
-	// Verification pass. Every field defaults to the "could not read" value, so a
-	// missing sqlite3 or an unreadable file reports honestly instead of silently
-	// looking like a pass.
-	rm.WriteString("command -v sqlite3 >/dev/null 2>&1 || exit 0; ")
-	rm.WriteString("for s in")
-	for _, s := range sources {
-		rm.WriteString(" '")
-		rm.WriteString(shellEscape(s))
-		rm.WriteString("'")
-	}
-	rm.WriteString(`; do [ -f "$s" ] || continue; db="$s"; ` +
-		`ic=$(sqlite3 "$db" 'PRAGMA integrity_check' 2>/dev/null | head -1); ` +
-		sqliteCountScript +
-		// DBCHK first, then this database's TBLROW lines: the parser attaches
-		// each run of TBLROWs to the DBCHK above it, so the path never has to be
-		// repeated on every line.
-		// F134: the SHA-256 of the file as it now sits on disk. Compared against
-		// the checksum recorded at capture, this proves the restored database is
-		// BYTE-IDENTICAL — every row, every column value — which no count or
-		// app-specific digest can match.
-		`sha=$(sha256sum "$s" 2>/dev/null | cut -d" " -f1); [ -n "$sha" ] || sha=-; ` +
-		`printf 'DBCHK\t%s\t%s\t%s\t%s\t%s\n' "$s" "$ic" "$tb" "$rw" "$sha"; ` +
-		sqliteTableRowsScript + `done`)
+	script := overlaySQLiteScript(sources)
 
 	hostConfig, err := restoreHostConfig(ctx, c, targetID)
 	if err != nil {
@@ -945,7 +974,7 @@ func OverlaySQLiteRestore(ctx context.Context, c *client.Client, targetID string
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{
-			Image: sidecarRef(), Cmd: []string{"sh", "-c", rm.String()},
+			Image: sidecarRef(), Cmd: []string{"sh", "-c", script},
 			OpenStdin: true, StdinOnce: true, AttachStdin: true, AttachStdout: true, AttachStderr: true,
 			Labels: sidecarLabels(),
 		},
