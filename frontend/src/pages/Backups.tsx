@@ -71,7 +71,12 @@ export default function Backups() {
   // Ids with a pending soft-delete (undo window). Filtered out at render so the
   // 5s poll can't resurrect a row the user just deleted (A3).
   const [pendingDel, setPendingDel] = useState<Set<string>>(new Set());
-  const [selected, setSelected] = useState<string | null>(null);
+  // The node being looked at lives in the URL (?node=<id>), so the sidebar's
+  // Backups link — the same route without it — and the browser's Back button
+  // both return to all nodes.
+  const [sp, setSp] = useSearchParams();
+  const selected = sp.get("node");
+  const setSelected = (node: string | null) => setSp(node ? { node } : {});
   const [sel, setSel] = useState<Backup | null>(null);
 
   // Selected-node drill-down: server-side searched/filtered/paginated so the
@@ -123,22 +128,19 @@ export default function Backups() {
   useEffect(() => { load(); }, []);
 
   // Deep-link from the container timeline (C9): "/backups?node=<id>&open=<backupId>"
-  // selects that node and opens the restore drawer pre-targeted to that backup,
-  // then clears the params so a refresh doesn't reopen it. Waits for the full
-  // list to resolve so the backup can be found.
-  const [sp, setSp] = useSearchParams();
+  // shows that node and opens the restore drawer pre-targeted to that backup,
+  // then drops `open` so a refresh doesn't reopen it. Waits for the full list
+  // to resolve so the backup can be found.
   const deepLinked = useRef(false);
   useEffect(() => {
     if (deepLinked.current) return;
-    const node = sp.get("node");
     const open = sp.get("open");
-    if (!node && !open) return;
-    if (open && list.length === 0) return; // wait for backups to load
-    if (node) { setSelected(node); setQ(""); setStatusF(""); setVerifiedF(""); setBpage(1); }
-    if (open) { const b = list.find((x) => x.id === open); if (b) setSel(b); }
+    if (!open || list.length === 0) return;
+    const b = list.find((x) => x.id === open);
+    if (b) setSel(b);
     deepLinked.current = true;
-    setSp({}, { replace: true });
-  }, [list, sp, setSp]);
+    setSp(selected ? { node: selected } : {}, { replace: true });
+  }, [list, sp, setSp, selected]);
 
   // F100: which restores are running RIGHT NOW, server-side. A restore outlives
   // the page that started it, so without this a reload during a 40-minute

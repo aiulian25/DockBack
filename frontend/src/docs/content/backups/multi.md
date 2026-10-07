@@ -51,9 +51,10 @@ By default **Backup Stack** captures each service independently and in parallel 
 
 Tick **App-consistent snapshot (quiesce during capture)** in the stack picker to capture the whole project as one coherent point-in-time instead:
 
-- The stack's **app services are quiesced** (paused, or stopped if you choose that mode) and, while they're frozen, every service's **database dump and volumes are captured together**.
+- First, while everything still runs, the bulk of every app service's volumes is copied.
+- Then the stack's **app services are quiesced** (paused, or stopped if you choose that mode) and, while they're frozen, every service's **database dump** and **what changed in its volumes during the first copy** are captured together. The result is the same snapshot as copying everything while frozen.
 - **Databases are still dumped live** and never paused — they must be running.
-- The apps are brought back up **as soon as the data is captured**; the slower compress/encrypt/store/verify work runs afterward, so downtime is just the copy, not the whole run.
+- The apps are brought back up **as soon as the data is captured**; the slower compress/encrypt/store/verify work runs afterward, so downtime is the database dumps and the changes, not the whole copy. Each service's log says how long it was held.
 - Every service's backup is tagged with a shared **consistency group** so you can see they belong to the same snapshot.
 
 The trade-off is **brief app downtime** during capture — that's the cost of a guaranteed-coherent snapshot. Leave it **off** for the normal concurrent behavior, and prefer it for tightly-coupled app+database stacks where a torn point-in-time would matter. Because it coordinates the whole project, it runs as one operation and won't overlap a stack restore.

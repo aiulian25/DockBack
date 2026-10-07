@@ -149,22 +149,53 @@ func (e *Engine) notify(kind, title, message string) {
 	}
 }
 
+// heldForPrecision is how finely the log states how long a container was held.
+const heldForPrecision = 100 * time.Millisecond
+
+// hold quiesces the container for the copy — stopped or paused as pm says —
+// and returns whether it is held and how to let it go. short says a live copy
+// already holds the bulk, so the hold lasts only as long as copying again what
+// changed meanwhile; otherwise it lasts the whole copy.
+func (e *Engine) hold(ctx context.Context, cli *client.Client, containerID, id, pm string, short bool) (bool, func()) {
+	purpose := "for the whole volume copy"
+	if short {
+		purpose = "to copy again what changed during the live copy"
+	}
+	heldAt := time.Now()
+	switch pm {
+	case PauseStop:
+		e.logf(id, "INFO", "Stopping container %s", purpose)
+		stopped := cli.ContainerStop(ctx, containerID, container.StopOptions{}) == nil
+		return stopped, func() { e.resumeContainer(cli, containerID, id, false, heldAt) }
+	case PausePause:
+		e.logf(id, "INFO", "Pausing container %s", purpose)
+		if err := cli.ContainerPause(ctx, containerID); err != nil {
+			e.logf(id, "WARN", "Pause failed (%v) — continuing with a live copy", err)
+			return false, nil
+		}
+		return true, func() { e.resumeContainer(cli, containerID, id, true, heldAt) }
+	}
+	return false, nil
+}
+
 // resumeContainer brings a quiesced container back after the volume snapshot —
 // unpause or start — confirms it actually came up, and LOGS the outcome so a
 // failed restart (or a crash loop) is visible instead of leaving the app
-// silently down (PLAN §4.2). Uses a fresh context so it runs even if the backup
-// context is near its deadline.
-func (e *Engine) resumeContainer(cli *client.Client, containerID, logID string, paused bool) {
+// silently down (PLAN §4.2). It says how long the container was held, the
+// number an operator actually feels. Uses a fresh context so it runs even if
+// the backup context is near its deadline.
+func (e *Engine) resumeContainer(cli *client.Client, containerID, logID string, paused bool, heldAt time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	heldFor := time.Since(heldAt).Round(heldForPrecision)
 	if paused {
-		e.logf(logID, "INFO", "Unpausing container")
+		e.logf(logID, "INFO", "Unpausing container — it was paused for %s", heldFor)
 		if err := cli.ContainerUnpause(ctx, containerID); err != nil {
 			e.logf(logID, "ERR", "Failed to unpause container: %v — unpause it manually", err)
 			return
 		}
 	} else {
-		e.logf(logID, "INFO", "Restarting container after volume snapshot")
+		e.logf(logID, "INFO", "Restarting container after volume snapshot — it was stopped for %s", heldFor)
 		if err := cli.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
 			e.logf(logID, "ERR", "Failed to restart container after backup: %v — start it manually", err)
 			return
@@ -944,7 +975,8 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 	// copy for a consistent snapshot — never a database (it's dumped live, §4.1)
 	// and only when there's volume data to capture. The container is brought back
 	// up as soon as the volume tar is captured — NOT held down through
-	// compress/encrypt/store/verify — so downtime is just the copy.
+	// compress/encrypt/store/verify — so downtime is just the copy, and with a
+	// short freeze only the copy of what changed while the bulk was copied live.
 	var resume func()
 	resumed := false
 	doResume := func() {
@@ -968,36 +1000,40 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 	// quiesced: nothing in the container can write while its volumes are
 	// copied — it is not running, or it was stopped or paused for the copy.
 	quiesced := !running
-	if shouldPause(pm, engineKind, running, len(volDests)) {
-		switch pm {
-		case PauseStop:
-			e.logf(id, "INFO", "Stopping container for a consistent volume snapshot")
-			quiesced = cli.ContainerStop(ctx, opts.ContainerID, container.StopOptions{}) == nil
-			resume = func() { e.resumeContainer(cli, opts.ContainerID, id, false) }
-		case PausePause:
-			e.logf(id, "INFO", "Pausing container for a consistent volume snapshot (brief freeze)")
-			if perr := cli.ContainerPause(ctx, opts.ContainerID); perr != nil {
-				e.logf(id, "WARN", "Pause failed (%v) — continuing with a live copy", perr)
-			} else {
-				quiesced = true
-				resume = func() { e.resumeContainer(cli, opts.ContainerID, id, true) }
-			}
-		}
+	holding := shouldPause(pm, engineKind, running, len(volDests))
+	// #40: the bulk transfer starts with the copies below, and everything this
+	// backup needs to know about the container was read above — the inspect,
+	// the image config, the mounts, the findings, the database dump, and the
+	// SQLite scan here. R5 §6 measured why the order matters: with a 58 GB
+	// stream running through the socket proxy "a plain `docker inspect` call
+	// timed out after 120 seconds… all API access to the source is effectively
+	// lost for the duration". A metadata read moved below the copy would not be
+	// slow, it would fail. Pinned by TestIntrospectionPrecedesBulkTransfer.
+	sqliteDBs := e.detectSQLite(ctx, cli, opts.ContainerID, volDests, id)
+	// A short freeze: the bulk is copied while the container runs, so the hold
+	// below lasts only as long as the changes take to copy again.
+	var live *liveCopy
+	if holding && e.shortFreezeFits(opts, name) {
+		live = e.copyLive(ctx, cli, opts.ContainerID, volDests, opts.excludeSubPaths(), work, id)
+	}
+	if holding {
+		quiesced, resume = e.hold(ctx, cli, opts.ContainerID, id, pm, live != nil)
 	}
 	// #25: what the tree looked like as the copy began. Compared against the walk
 	// the index already takes afterwards, it says what moved underneath the
-	// archive — the one thing a hot copy can be honest about.
-	driftBefore := e.driftBaseline(ctx, cli, opts.ContainerID, volDests, pm, man.Image, id)
+	// archive — the one thing a hot copy can be honest about. A short freeze
+	// copies again whatever moved, which leaves it nothing to report.
+	var driftBefore *VolIndex
+	if live == nil {
+		driftBefore = e.driftBaseline(ctx, cli, opts.ContainerID, volDests, pm, man.Image, id)
+	}
 	if len(volDests) > 0 {
-		// #40: the bulk transfer starts HERE, and everything this backup needs to
-		// know about the container was read above — the inspect, the image config,
-		// the mounts, the findings, the database dump. R5 §6 measured why the order
-		// matters: with a 58 GB stream running through the socket proxy "a plain
-		// `docker inspect` call timed out after 120 seconds… all API access to the
-		// source is effectively lost for the duration". A metadata read moved below
-		// this line would not be slow, it would fail. Pinned by
-		// TestIntrospectionPrecedesBulkTransfer.
-		if verr := e.captureVolumes(ctx, cli, opts, man, work, volDests, id, name, driftBefore); verr != nil {
+		live = e.copyFrozen(ctx, cli, opts.ContainerID, volDests, opts.excludeSubPaths(), work, id, live)
+		var verr error
+		if live == nil {
+			verr = e.captureVolumes(ctx, cli, opts, man, work, volDests, id, name, driftBefore)
+		}
+		if verr != nil {
 			return id, e.fail(b, fmt.Errorf("volume archive: %w", verr))
 		}
 		// F22: capture any SQLite databases under the selected mounts as CONSISTENT
@@ -1006,12 +1042,16 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 		// payload, so any snapshot failure just falls back to it. Runs on the
 		// changed-set only for a delta — a SQLite file that didn't change isn't
 		// re-snapshotted; the newest generation that touched it holds it.
-		sqliteCopies := e.captureSQLite(ctx, cli, opts.ContainerID, volDests, work, id, quiesced)
+		sqliteCopies := e.captureSQLite(ctx, cli, opts.ContainerID, sqliteDBs, work, id, quiesced)
 		// Copies taken — bring the app back up NOW; the rest of the pipeline
-		// (snapshot/compress/encrypt/store/verify) works from the spooled files. The
-		// resume happens BEFORE acting on a corruption verdict (F116): an app must
-		// never be left paused because its database turned out to be damaged.
+		// (merge/snapshot/compress/encrypt/store/verify) works from the spooled
+		// files. The resume happens BEFORE acting on a corruption verdict (F116):
+		// an app must never be left paused because its database turned out to be
+		// damaged.
 		doResume()
+		if verr := e.recordShortFreeze(man, opts, work, id, live); verr != nil {
+			return id, e.fail(b, verr)
+		}
 		if sqerr := e.recordSQLite(man, sqliteCopies, id); sqerr != nil {
 			return id, e.fail(b, sqerr)
 		}
@@ -2154,6 +2194,9 @@ const volumeIndexMember = "volumes-index.json.zst"
 // CHANGED-FILES-ONLY tar (F61). Present instead of volumes.tar on a delta.
 const volumeDeltaMember = "volumes-delta.tar"
 
+// volumesMember is the archive member holding a full capture's volumes.
+const volumesMember = "volumes.tar"
+
 // volPayloadMember returns the archive member that carries a backup's volume
 // payload — the delta member for an incremental backup, else the full volumes.tar
 // (F61). Shared by capture, verify, and restore so they agree on the member name.
@@ -2161,7 +2204,7 @@ func volPayloadMember(man *Manifest) string {
 	if man != nil && man.Incremental {
 		return volumeDeltaMember
 	}
-	return "volumes.tar"
+	return volumesMember
 }
 
 // captureVolumes captures the container's volume payload, choosing a FULL
@@ -2177,7 +2220,7 @@ func (e *Engine) captureVolumes(ctx context.Context, cli *client.Client, opts Op
 	if !inc || opts.ForceFull {
 		// Non-incremental: full volumes.tar as always.
 		e.logf(id, "INFO", "Archiving %d volume path(s) via sidecar", len(volDests))
-		sha, fileHashes, err := e.spoolVolumeTar(ctx, cli, id, opts.ContainerID, volDests, filepath.Join(work, "volumes.tar"), opts.excludeSubPaths()...)
+		sha, fileHashes, err := e.spoolVolumeTar(ctx, cli, id, opts.ContainerID, volDests, filepath.Join(work, volumesMember), opts.excludeSubPaths()...)
 		if err != nil {
 			return err
 		}
@@ -2194,11 +2237,7 @@ func (e *Engine) captureVolumes(ctx context.Context, cli *client.Client, opts Op
 				// The index walk is itself the "after" reading, so the drift
 				// report costs no walk of its own.
 				e.reportCopyDrift(man, id, driftBefore, idx, man.Image)
-				if werr := writeVolIndex(work, idx); werr == nil {
-					man.VolIndex = volumeIndexMember
-				} else {
-					e.logf(id, "WARN", "Could not write the file index (%v) — browsing this backup will stream the archive instead", werr)
-				}
+				e.storeVolIndex(man, work, id, idx)
 			} else {
 				e.logf(id, "WARN", "File indexing failed (%v) — browsing this backup will stream the archive instead", ierr)
 			}
@@ -2400,6 +2439,16 @@ func (e *Engine) buildVolIndex(ctx context.Context, cli *client.Client, containe
 	return idx, nil
 }
 
+// storeVolIndex writes a full capture's file index into the archive. A write
+// that fails costs only listing speed: browsing streams the archive instead.
+func (e *Engine) storeVolIndex(man *Manifest, work, id string, idx VolIndex) {
+	if err := writeVolIndex(work, idx); err != nil {
+		e.logf(id, "WARN", "Could not write the file index (%v) — browsing this backup will stream the archive instead", err)
+		return
+	}
+	man.VolIndex = volumeIndexMember
+}
+
 // indexAlways reports whether non-incremental backups also store the complete
 // file index (F70, default on). Incremental backups always store it — it IS
 // their diff base (F61).
@@ -2504,6 +2553,12 @@ func (e *Engine) spoolVolumeTarFiles(ctx context.Context, cli *client.Client, id
 	if err != nil {
 		return "", err
 	}
+	return spoolStream(ctx, rc, dst)
+}
+
+// spoolStream copies a sidecar's archive stream into dst, returning the SHA-256
+// of what it wrote.
+func spoolStream(ctx context.Context, rc io.ReadCloser, dst string) (string, error) {
 	defer rc.Close()
 	f, err := os.Create(dst)
 	if err != nil {
@@ -2632,22 +2687,33 @@ type sqliteCapture struct {
 	quiesced bool   // the copies were taken while the container could not write
 }
 
-// captureSQLite finds SQLite databases under the captured mounts and has the
-// sidecar copy each one out while the app is still held: a consistent snapshot
-// when the sidecar has sqlite3, the raw database and journal files when it does
-// not (F22). It is entirely best-effort and fail-safe: the raw file is always
-// already in volumes.tar, so any failure simply leaves the raw capture in place.
-// quiesced says the container could not write while its volumes were copied.
-func (e *Engine) captureSQLite(ctx context.Context, cli *client.Client, containerID string, volDests []string, work, id string, quiesced bool) sqliteCapture {
+// detectSQLite finds the SQLite databases under the captured mounts. It reads
+// one header per file — minutes on a large tree — and nothing about
+// consistency depends on it, so it runs before the container is held; only
+// the copies captureSQLite takes have to come from inside the hold. A scan
+// that fails means none are snapshotted: their raw files still travel.
+func (e *Engine) detectSQLite(ctx context.Context, cli *client.Client, containerID string, volDests []string, id string) []string {
 	dbs, err := dockercli.DetectSQLiteFiles(ctx, cli, containerID, volDests)
 	if err != nil {
 		e.logf(id, "INFO", "SQLite scan skipped (%v) — volumes captured as-is", err)
-		return sqliteCapture{}
+		return nil
 	}
+	if len(dbs) > 0 {
+		e.logf(id, "INFO", "Found %d SQLite database(s) under the captured volumes — snapshotting consistently", len(dbs))
+	}
+	return dbs
+}
+
+// captureSQLite has the sidecar copy each database detectSQLite found while
+// the app is still held: a consistent snapshot when the sidecar has sqlite3,
+// the raw database and journal files when it does not (F22). It is entirely
+// best-effort and fail-safe: the raw file is always already in volumes.tar, so
+// any failure simply leaves the raw capture in place. quiesced says the
+// container could not write while its volumes were copied.
+func (e *Engine) captureSQLite(ctx context.Context, cli *client.Client, containerID string, dbs []string, work, id string, quiesced bool) sqliteCapture {
 	if len(dbs) == 0 {
 		return sqliteCapture{}
 	}
-	e.logf(id, "INFO", "Found %d SQLite database(s) under the captured volumes — snapshotting consistently", len(dbs))
 	rc, err := dockercli.SnapshotSQLite(ctx, cli, containerID, dbs)
 	if err != nil {
 		e.logf(id, "WARN", "SQLite consistent snapshot unavailable (%v) — the raw file(s) are still captured", err)

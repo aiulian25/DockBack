@@ -26,11 +26,12 @@ func TestIntrospectionPrecedesBulkTransfer(t *testing.T) {
 	}
 	body := functionBody(t, string(src), "func (e *Engine) Run(")
 
-	// The markers: the container introspection Run does for itself, and the call
-	// that opens the volume stream.
+	// The markers: the container introspection Run does for itself, and the
+	// first call that can open the volume stream — the live copy of a short
+	// freeze, which runs before the whole-copy path below it.
 	const (
 		inspect = "cli.ContainerInspect(ctx, opts.ContainerID)"
-		stream  = "e.captureVolumes(ctx, cli, opts, man, work, volDests, id, name, driftBefore)"
+		stream  = "e.copyLive(ctx, cli, opts.ContainerID, volDests, opts.excludeSubPaths(), work, id)"
 	)
 	at := func(needle string) int {
 		i := strings.Index(body, needle)
@@ -52,6 +53,7 @@ func TestIntrospectionPrecedesBulkTransfer(t *testing.T) {
 		"e.reportTagDrift(",             // the registry peek
 		"hostRequirementsOf(insp)",      // what this container needs of its host
 		"e.dumpDatabaseWith(",           // the logical dump, which needs exec
+		"e.detectSQLite(",               // the SQLite scan, a sidecar of its own
 	} {
 		if i := strings.Index(body, read); i >= 0 && i >= at(stream) {
 			t.Errorf("%s happens after the bulk transfer begins — it will time out on a saturated proxy", read)
@@ -84,6 +86,45 @@ func TestSQLiteIsRecordedAfterTheAppResumes(t *testing.T) {
 		}
 		if !(capture < resume && resume < record) {
 			t.Errorf("%s must copy the databases inside the window and snapshot them after the app resumes", capturePath.name)
+		}
+	}
+}
+
+// A short freeze holds the application only for what changed during the live
+// copy, so in both capture paths the bulk is copied before the hold begins,
+// the second pass runs inside it, and the merge waits until the application
+// runs again. The stack copies live before its pre-hooks, so an application a
+// hook puts in maintenance mode stays there only for the window.
+func TestShortFreezeCopiesTheBulkBeforeTheHold(t *testing.T) {
+	engineSrc, err := os.ReadFile("engine.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stackSrc, err := os.ReadFile("consistent.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, capturePath := range []struct {
+		name, body string
+		order      []string
+	}{
+		{"Run", functionBody(t, string(engineSrc), "func (e *Engine) Run("), []string{
+			"e.detectSQLite(", "e.copyLive(", "e.hold(", "e.copyFrozen(", "e.captureSQLite(", "\n\t\tdoResume()\n", "e.recordShortFreeze(",
+		}},
+		{"BackupStackConsistent", functionBody(t, string(stackSrc), "func (e *Engine) BackupStackConsistent("), []string{
+			"e.detectSQLite(", "e.copyLive(", `"pre")`, `case "pause":`, "e.copyFrozen(", "e.captureSQLite(", "\n\tresumeAll()\n\trunPost()\n", "sc.settleLiveCopy()",
+		}},
+	} {
+		last := -1
+		for _, marker := range capturePath.order {
+			at := strings.Index(capturePath.body, marker)
+			if at < 0 {
+				t.Fatalf("%s: marker %q not found — this test needs updating alongside the code", capturePath.name, marker)
+			}
+			if at < last {
+				t.Errorf("%s: %q comes too early — the order is %q", capturePath.name, marker, capturePath.order)
+			}
+			last = at
 		}
 	}
 }

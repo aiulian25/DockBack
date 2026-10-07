@@ -247,15 +247,20 @@ case_sentinel() {
   POLICY="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$TARGET" 2>/dev/null || true)"
   [ "$POLICY" = "no" ] || [ -z "$POLICY" ] || fail "the capture must never change the restart policy (now '$POLICY')"
 
-  step "Assert the during-copy drift report ran"
-  # #25: this container is quiesced with a pause, not a stop, so the drift walk
-  # runs and must find nothing moved underneath the archive.
+  step "Assert the short freeze ran"
+  # This container is quiesced with a pause, so its volumes are copied while it
+  # runs and it is held only to copy again what changed meanwhile — which also
+  # leaves the #25 drift report nothing to say, so it does not run.
   local CAPLOG
   CAPLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID/log" || true)"
   case "$CAPLOG" in
-    *"Nothing changed underneath the copy"*) echo "  nothing drifted during the copy" ;;
-    *"changed while the archive was being written"*) echo "  drift reported (the container wrote during the copy)" ;;
-    *) fail "the during-copy drift report never ran" ;;
+    *"Nothing changed during the live copy"*) echo "  nothing changed during the live copy" ;;
+    *"that changed during the live copy"*) echo "  what changed during the live copy was copied again while held" ;;
+    *) fail "the short freeze never ran" ;;
+  esac
+  case "$CAPLOG" in
+    *"it was paused for"*) echo "  the log says how long the container was held" ;;
+    *) fail "the log must say how long the container was held" ;;
   esac
 
   step "Assert the file content check ran and passed pre-start"

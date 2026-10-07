@@ -179,6 +179,19 @@ func CaptureSidecarRO(ctx context.Context, c *client.Client, targetID string, cm
 // (leading slash stripped) so `tar -C /` restores them to the right place, exactly
 // like the full `volumes.tar`.
 func TarVolumesFromList(ctx context.Context, c *client.Client, targetID string, relPaths []string) (io.ReadCloser, error) {
+	return tarFromList(ctx, c, targetID, relPaths, "")
+}
+
+// TarVolumeEntries streams a tar of exactly the given volume-relative entries —
+// a directory as itself, never what is inside it — from a read-only sidecar:
+// the second pass of a short freeze, copying again only what changed while the
+// first pass ran with the application still up. A tar without --no-recursion
+// fails the stream rather than copying whole directories.
+func TarVolumeEntries(ctx context.Context, c *client.Client, targetID string, relPaths []string) (io.ReadCloser, error) {
+	return tarFromList(ctx, c, targetID, relPaths, " --no-recursion")
+}
+
+func tarFromList(ctx context.Context, c *client.Client, targetID string, relPaths []string, tarFlags string) (io.ReadCloser, error) {
 	if len(relPaths) == 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
@@ -187,7 +200,7 @@ func TarVolumesFromList(ctx context.Context, c *client.Client, targetID string, 
 	}
 	// cat the stdin list to a temp file, then tar strictly from that list. Using a
 	// file (not `-T -`) sidesteps BusyBox tar stdin-list quirks.
-	sh := "cat > /tmp/dback-inc.list && tar -cf - -C / -T /tmp/dback-inc.list"
+	sh := "cat > /tmp/dback-inc.list && tar -cf - -C /" + tarFlags + " -T /tmp/dback-inc.list"
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{
 			Image: sidecarRef(), Cmd: []string{"/bin/sh", "-c", sh},

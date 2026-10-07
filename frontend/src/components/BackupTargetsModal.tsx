@@ -159,9 +159,9 @@ export default function BackupTargetsModal({
           </div>
           <p className="mt-1 text-xs italic text-on-surface-variant">
             {pause === "stop"
-              ? "Each app service is stopped during its volume copy, then restarted — brief downtime, maximum consistency."
+              ? "Each app service's volumes are copied while it runs; it is stopped only to copy again what changed meanwhile, then restarted — short downtime, maximum consistency."
               : pause === "pause"
-                ? "Each app service is frozen during its volume copy — near-zero downtime, consistent snapshot."
+                ? "Each app service's volumes are copied while it runs; it is frozen only to copy again what changed meanwhile — seconds, consistent snapshot."
                 : pause === "none"
                   ? "Files are copied live — fast, but a busy app may produce an inconsistent snapshot."
                   : "Applies each service's own remembered pause setting (default). Pick a mode above to force it for this run."}

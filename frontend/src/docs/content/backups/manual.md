@@ -45,9 +45,10 @@ The local storage location for the archive (defaults to the app's backup volume,
 
 **Backup options**
 - **Consistency during volume backup** — how the app is quiesced while its volumes are copied. Choose one; the choice is **remembered per container**, so scheduled and bulk backups honor it too:
-  - *Pause during copy* — **the default**. The container is frozen (`docker pause`) only while the tar runs, then unpaused. Near-zero downtime and a consistent snapshot — the right choice for almost every stateful app (including apps backed by an embedded **SQLite** file, where freezing the app is exactly what makes the copy consistent).
+  - *Pause during copy* — **the default**. The volumes are copied while the container keeps running; it is then frozen (`docker pause`) only long enough to copy again what changed during that copy, and unpaused. The archive is the same one a copy taken entirely while frozen would produce, but the freeze lasts seconds even for a volume of tens of gigabytes. The right choice for almost every stateful app (including apps backed by an embedded **SQLite** file, where freezing the app is exactly what makes the copy consistent).
   - *Live copy (no pause)* — fastest, but a busy app may produce an inconsistent snapshot. Pick this only when even a brief freeze is unacceptable and the app tolerates live copies.
-  - *Stop during copy* — the container is stopped, copied, then restarted. Brief downtime, maximum consistency.
+  - *Stop during copy* — the same two passes, with the container stopped instead of frozen for the second one: downtime only while the changes are copied, maximum consistency.
+  - The run log says how long the container was held. It is held for the **whole** copy instead when the copy taken while it ran fails twice in a row (busybox `tar` gives up on a file that shrinks as it is read, so a failed copy is taken once more), when the container uses incremental backups (most copy only what changed, but their periodic full copy is held throughout), or when helper containers cannot run on its node.
   - **Databases are never paused or stopped** — a detected database server (PostgreSQL, MySQL/MariaDB, MongoDB) is dumped **live** with native tools and must stay running, so it is automatically excluded from pausing.
 - **Notify on completion** — send a notification when the run finishes (shown as *not configured* until notifications are set up).
 

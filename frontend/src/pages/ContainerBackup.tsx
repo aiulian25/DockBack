@@ -872,9 +872,9 @@ export default function ContainerBackup() {
                 </div>
                 <p className="mb-2 mt-0.5 text-xs italic text-on-surface-variant">
                   {pauseMode === "stop"
-                    ? "Container is stopped during the volume copy, then restarted — brief downtime, maximum consistency."
+                    ? "Volumes are copied while the container runs; it is stopped only to copy again what changed meanwhile, then restarted — short downtime, maximum consistency."
                     : pauseMode === "pause"
-                      ? "Container is frozen during the volume copy — near-zero downtime, consistent snapshot. Remembered for scheduled backups."
+                      ? "Volumes are copied while the container runs; it is frozen only to copy again what changed meanwhile — seconds, consistent snapshot. Remembered for scheduled backups."
                       : "Files are copied live — fast, but a busy app may produce an inconsistent snapshot."}
                 </p>
                 {/* F145: why this app's default differs from the shipped one.

@@ -148,11 +148,50 @@ type serviceCapture struct {
 	running      bool
 	opts         Options // per-service opts (ContainerID set)
 
+	sqliteDBs []string  // the SQLite databases found before the window
+	live      *liveCopy // the bulk of its volumes, copied before the window
+
 	// window state
 	paused     bool
 	pauseKind  string        // PausePause | PauseStop
+	heldAt     time.Time     // when the window paused or stopped it
 	sqlite     sqliteCapture // the SQLite copies the window took, recorded after it
 	captureErr error         // set if a window step failed => skip finalize, mark failed
+}
+
+// heldInWindow says the window pauses or stops this service — a running
+// application with volumes — so the bulk of its volumes can be copied live
+// beforehand.
+func (sc *serviceCapture) heldInWindow() bool {
+	return sc.engineKind == "" && sc.running && len(sc.volDests) > 0
+}
+
+// settleLiveCopy merges a service's two passes into its volumes archive once
+// the window is over. Nothing to do for a service copied whole inside it.
+func (sc *serviceCapture) settleLiveCopy() error {
+	if sc.live == nil {
+		return nil
+	}
+	sha, _, err := sc.live.settle(sc.work)
+	if err != nil {
+		return fmt.Errorf("volume archive: %w", err)
+	}
+	sc.man.VolumesSHA256 = sha
+	return nil
+}
+
+// spoolWholeService archives every selected volume of a service in one pass,
+// inside the window.
+func (e *Engine) spoolWholeService(ctx context.Context, cli *client.Client, sc *serviceCapture) error {
+	e.logf(sc.id, "INFO", "Archiving %d volume path(s) for %q via sidecar", len(sc.volDests), sc.name)
+	// The app-consistent path writes no file index, so the per-file hashes
+	// this returns have nowhere to be recorded.
+	volSHA, _, err := e.spoolVolumeTar(ctx, cli, sc.id, sc.containerID, sc.volDests, filepath.Join(sc.work, volumesMember))
+	if err != nil {
+		return err
+	}
+	sc.man.VolumesSHA256 = volSHA
+	return nil
 }
 
 // prepareServiceCapture does everything that does NOT require the app to be
@@ -481,6 +520,17 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 	}
 	plan := planConsistency(capsToMembers(caps))
 
+	// PHASE 1b — while every service still runs, and before any pre-hook: find
+	// each service's SQLite databases, and copy the bulk of every app service's
+	// volumes live, so the window below holds each one only for what changes
+	// meanwhile — a hook's own writes included.
+	for _, sc := range caps {
+		sc.sqliteDBs = e.detectSQLite(ctx, cli, sc.containerID, sc.volDests, sc.id)
+		if sc.heldInWindow() {
+			sc.live = e.copyLive(ctx, cli, sc.containerID, sc.volDests, nil, sc.work, sc.id)
+		}
+	}
+
 	// PHASE 2 — the quiesce window. Deferred safety nets always resume every app
 	// and run post-hooks, even on an early error/panic path.
 	resumed := map[string]bool{}
@@ -489,7 +539,7 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 			sc := caps[i]
 			if sc.paused && !resumed[sc.key] {
 				resumed[sc.key] = true
-				e.resumeContainer(cli, sc.containerID, sc.id, sc.pauseKind == PausePause)
+				e.resumeContainer(cli, sc.containerID, sc.id, sc.pauseKind == PausePause, sc.heldAt)
 			}
 		}
 	}
@@ -548,6 +598,7 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 			if mode == PauseNone {
 				mode = PausePause
 			}
+			sc.heldAt = time.Now()
 			if mode == PauseStop {
 				e.logf(sc.id, "INFO", "Stopping %q for the consistency window", sc.name)
 				if serr := cli.ContainerStop(ctx, sc.containerID, container.StopOptions{}); serr == nil {
@@ -556,7 +607,7 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 					e.logf(sc.id, "WARN", "Stop failed (%v) — capturing %q live", serr, sc.name)
 				}
 			} else {
-				e.logf(sc.id, "INFO", "Pausing %q for the consistency window (brief freeze)", sc.name)
+				e.logf(sc.id, "INFO", "Pausing %q for the consistency window", sc.name)
 				if perr := cli.ContainerPause(ctx, sc.containerID); perr == nil {
 					sc.paused, sc.pauseKind = true, PausePause
 				} else {
@@ -600,22 +651,21 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 			if len(sc.volDests) == 0 {
 				continue
 			}
-			e.logf(sc.id, "INFO", "Archiving %d volume path(s) for %q via sidecar", len(sc.volDests), sc.name)
-			volTar := filepath.Join(sc.work, "volumes.tar")
-			// The app-consistent path writes no file index, so the per-file hashes
-			// this returns have nowhere to be recorded.
-			volSHA, _, verr := e.spoolVolumeTar(ctx, cli, sc.id, sc.containerID, sc.volDests, volTar)
+			sc.live = e.copyFrozen(ctx, cli, sc.containerID, sc.volDests, nil, sc.work, sc.id, sc.live)
+			var verr error
+			if sc.live == nil {
+				verr = e.spoolWholeService(ctx, cli, sc)
+			}
 			if verr != nil {
 				sc.captureErr = fmt.Errorf("volume archive: %w", verr)
 				e.logf(sc.id, "ERR", "Volume archive failed for %q: %v", sc.name, verr)
 				continue
 			}
-			sc.man.VolumesSHA256 = volSHA
-			sc.sqlite = e.captureSQLite(ctx, cli, sc.containerID, sc.volDests, sc.work, sc.id, sc.paused || !sc.running)
+			sc.sqlite = e.captureSQLite(ctx, cli, sc.containerID, sc.sqliteDBs, sc.work, sc.id, sc.paused || !sc.running)
 		case "resume":
 			if sc.paused && !resumed[sc.key] {
 				resumed[sc.key] = true
-				e.resumeContainer(cli, sc.containerID, sc.id, sc.pauseKind == PausePause)
+				e.resumeContainer(cli, sc.containerID, sc.id, sc.pauseKind == PausePause, sc.heldAt)
 			}
 		}
 	}
@@ -628,6 +678,9 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 	// PHASE 3 — finalize each captured service OUTSIDE the pause window.
 	ok := 0
 	for _, sc := range caps {
+		if sc.captureErr == nil {
+			sc.captureErr = sc.settleLiveCopy()
+		}
 		// F116: a corruption verdict fails THIS service only. The group's other
 		// members are already captured and still form a coherent point-in-time;
 		// discarding them because a sibling's database is damaged would turn one

@@ -7,8 +7,8 @@ import "strings"
 // to non-DB containers with volumes.
 const (
 	PauseNone  = "none"  // live copy, no quiesce — fast, but a busy app may snapshot inconsistently
-	PausePause = "pause" // docker pause/unpause around the tar — brief freeze, near-zero downtime (default)
-	PauseStop  = "stop"  // docker stop/start around the tar — full quiesce, brief downtime
+	PausePause = "pause" // docker pause/unpause for what changed during a live copy — a short freeze (default)
+	PauseStop  = "stop"  // docker stop/start for what changed during a live copy — full quiesce, short downtime
 )
 
 func validPauseMode(m string) bool {

@@ -69,6 +69,11 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   and counted table by table by DockBack itself — no special sidecar image — and
   a restore lays the snapshot back with the file's own owner and mode, then
   proves it landed byte-for-byte.
+- **Seconds-long pauses** — volumes are copied while the app keeps running, and
+  it is paused (or stopped) only to copy again what changed meanwhile. The
+  archive is the one a copy taken entirely while paused would produce, but a
+  volume of tens of gigabytes no longer freezes its app for minutes, and the
+  run log says exactly how long it was held.
 - **Write-only backups (optional)** — seal every backup to an X25519 **public** key
   and keep the private half offline. DockBack can then create, mirror and
   integrity-check backups but **cannot read them** — so a break-in that owns the
