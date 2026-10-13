@@ -95,6 +95,19 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
+// embeddableAssets are the public brand images another site may show: a
+// dashboard such as Homepage uses the mark as DockBack's icon. Every other
+// response stays same-origin.
+var embeddableAssets = map[string]bool{"/dockback-mark.png": true, "/favicon.png": true}
+
+// resourcePolicy is the Cross-Origin-Resource-Policy for a path. Pure.
+func resourcePolicy(path string) string {
+	if embeddableAssets[path] {
+		return "cross-origin"
+	}
+	return "same-origin"
+}
+
 // securityHeaders applies hardening headers to every response (PLAN §2/§8.5,
 // §10.1). HSTS is sent only over real https; Cache-Control: no-store is scoped to
 // the API (so fingerprinted SPA assets stay cacheable).
@@ -105,7 +118,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
-		h.Set("Cross-Origin-Resource-Policy", "same-origin")
+		h.Set("Cross-Origin-Resource-Policy", resourcePolicy(r.URL.Path))
 		h.Set("Permissions-Policy",
 			"accelerometer=(), autoplay=(), camera=(), display-capture=(), "+
 				"encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), "+

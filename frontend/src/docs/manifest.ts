@@ -139,6 +139,7 @@ export const categories: DocCategory[] = [
       { slug: "path-confinement", title: "Destination path confinement", file: "security/path-confinement" },
       { slug: "egress", title: "Egress allow-list (outbound control)", file: "security/egress" },
       { slug: "api-tokens", title: "API tokens for automation", file: "security/api-tokens" },
+      { slug: "homepage-widget", title: "Homepage dashboard widget", file: "security/homepage-widget" },
       { slug: "audit", title: "Audit trail", file: "security/audit" },
       { slug: "logs", title: "Logs & live streaming", file: "security/logs" },
     ],

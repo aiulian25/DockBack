@@ -47,6 +47,16 @@ func TestTokenAllows(t *testing.T) {
 		// metrics: nothing under /api (it only authorizes the /metrics handler).
 		{"metrics cannot GET api", "metrics", "GET", "/api/backups", false},
 		{"metrics cannot POST", "metrics", "POST", "/api/backups", false},
+		{"metrics cannot GET widget", "metrics", "GET", "/api/widget", false},
+
+		// widget: the dashboard summary and nothing else — it sits in a config file.
+		{"widget GET summary", "widget", "GET", "/api/widget", true},
+		{"widget cannot GET backups", "widget", "GET", "/api/backups", false},
+		{"widget cannot GET coverage", "widget", "GET", "/api/coverage", false},
+		{"widget cannot GET settings", "widget", "GET", "/api/settings", false},
+		{"widget cannot POST", "widget", "POST", "/api/widget", false},
+		{"widget cannot list tokens", "widget", "GET", "/api/security/tokens", false},
+		{"read GET widget", "read", "GET", "/api/widget", true},
 
 		// combined scopes union their grants.
 		{"read+backup GET", "read,backup", "GET", "/api/nodes/n1/stacks", true},

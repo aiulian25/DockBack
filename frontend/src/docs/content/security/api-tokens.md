@@ -40,6 +40,7 @@ Pick the least privilege that does the job:
 | **Read-only** | Any `GET` — backup lists, status, node/stack inventory, insights. **Not** decrypted archive downloads or the app-backup export. |
 | **Trigger backups** | Everything Read-only can do, **plus** starting and re-verifying backups: `POST /api/backups`, `/api/backups/{id}/verify`, `/drill`, `/mirror`, and stack backups. No config changes, no restores. |
 | **Metrics only** | Only the Prometheus `/metrics` endpoint. |
+| **Homepage widget** | Only `GET /api/widget`, the summary a dashboard tile shows — see *Homepage dashboard widget*. |
 
 A token may hold more than one scope.
 
@@ -83,7 +84,7 @@ An **expired** metrics token no longer opens the gate — but its mere existence
 
 - **One token per consumer** (this CI job, that monitor), so you can revoke one without disturbing the others.
 - **Set an expiry** on tokens for anything short-lived (a migration script, a one-off audit) so a forgotten token dies on its own.
-- Prefer **Read-only** or **Metrics only** unless a job truly needs to start backups.
+- Prefer **Read-only** or **Metrics only** unless a job truly needs to start backups — and **Homepage widget** for a dashboard tile.
 - Put DockBack behind **HTTPS** (see *HTTPS & TLS*) so bearer tokens are never sent in clear text.
 - **Pin the source address** whenever the consumer has a stable one — a CI runner, a monitoring host, a LAN scraper. It is the difference between a leaked token being a problem and a leaked token being useless.
 - **Revoke** promptly when a token is no longer needed or may have leaked — revocation is instant.

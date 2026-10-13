@@ -72,7 +72,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(scopes) == 0 {
-		errJSON(w, http.StatusBadRequest, "select at least one scope (read, backup, metrics)")
+		errJSON(w, http.StatusBadRequest, "select at least one scope (read, backup, metrics, widget)")
 		return
 	}
 	sort.Strings(scopes)

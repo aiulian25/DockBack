@@ -1388,6 +1388,7 @@ function SettingsInner() {
                     { key: "read", label: "Read-only", desc: "GET status/inventory (never downloads decrypted backup data)" },
                     { key: "backup", label: "Trigger backups", desc: "Read, plus start/verify/mirror backups (no config or restore)" },
                     { key: "metrics", label: "Metrics only", desc: "Only /metrics — and, once one exists, /metrics requires it" },
+                    { key: "widget", label: "Homepage widget", desc: "Only /api/widget — the counts a dashboard such as Homepage shows (see Docs → Homepage widget)" },
                   ].map((sc) => (
                     <label key={sc.key} className="flex cursor-pointer items-start gap-2 rounded border border-outline-variant/60 px-3 py-2">
                       <input type="checkbox" className="mt-0.5" checked={tokScopes.has(sc.key)} onChange={() => toggleTokScope(sc.key)} />

@@ -1804,6 +1804,56 @@ func (s *Store) CountBackups() (int, error) {
 	return n, err
 }
 
+// BackupTally is the whole catalog counted for a status summary.
+type BackupTally struct {
+	Total       int   // every catalog entry, whatever its status — what the Backups page counts
+	Bytes       int64 // their combined size
+	FailedSince int   // entries that failed at or after the since TallyBackups was given
+	Running     int
+	LastSuccess int64 // created_at of the newest successful backup; 0 when there is none
+}
+
+// TallyBackups counts the catalog in a single aggregate query.
+func (s *Store) TallyBackups(since int64) (BackupTally, error) {
+	var t BackupTally
+	err := s.db.QueryRow(`SELECT count(*), COALESCE(SUM(size_bytes), 0),
+		COALESCE(SUM(status='failed' AND created_at >= ?), 0), COALESCE(SUM(status='running'), 0),
+		COALESCE(MAX(CASE WHEN status='success' THEN created_at END), 0) FROM backups`, since).
+		Scan(&t.Total, &t.Bytes, &t.FailedSince, &t.Running, &t.LastSuccess)
+	return t, err
+}
+
+// FailingTarget is a backup target whose newest failure came after its newest
+// success: a failure no backup has made good yet.
+type FailingTarget struct {
+	NodeID     string
+	Stack      string
+	TargetName string
+	FailedAt   int64
+}
+
+// FailingTargets lists the targets whose newest failure came after their
+// newest success, most recent failure first.
+func (s *Store) FailingTargets() ([]FailingTarget, error) {
+	rows, err := s.db.Query(`SELECT f.node_id, f.stack, f.target_name, MAX(f.created_at) FROM backups f
+		WHERE f.status='failed' AND f.created_at > COALESCE((SELECT MAX(ok.created_at) FROM backups ok
+			WHERE ok.node_id=f.node_id AND ok.target_name=f.target_name AND ok.status='success'), 0)
+		GROUP BY f.node_id, f.target_name ORDER BY MAX(f.created_at) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FailingTarget
+	for rows.Next() {
+		var t FailingTarget
+		if err := rows.Scan(&t.NodeID, &t.Stack, &t.TargetName, &t.FailedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ProtectedTargets returns, for a node, each container target_name that has at
 // least one SUCCESSFUL backup on record, mapped to the newest such backup's
 // created_at. Used by the coverage / "unprotected containers" view (B2). Cheap:

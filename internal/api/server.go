@@ -1373,6 +1373,7 @@ func (s *Server) Handler(uiFS fs.FS) http.Handler {
 
 	mux.Handle("GET /api/stats", s.auth(http.HandlerFunc(s.handleStats)))
 	mux.Handle("GET /api/coverage", s.auth(http.HandlerFunc(s.handleCoverage)))
+	mux.Handle("GET "+widgetPath, s.auth(http.HandlerFunc(s.handleWidget)))
 	mux.Handle("GET /api/insights", s.auth(http.HandlerFunc(s.handleInsights)))
 	mux.Handle("GET /api/runbook", s.auth(http.HandlerFunc(s.handleRunbook)))
 	// Signed, expiring runbook share links (F59) — mint / list / revoke.

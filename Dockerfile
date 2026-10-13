@@ -10,8 +10,12 @@
 # Get a fresh digest with:
 #   docker pull <img>:<tag> && docker inspect --format '{{index .RepoDigests 0}}' <img>:<tag>
 
+# The two build stages run on the machine doing the build: the UI is the same
+# files on every CPU, and Go cross-compiles. A multi-arch build then needs no
+# emulator, and only the final stage is per platform.
+
 # ---- Stage 1: build the React frontend -------------------------------------
-FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS frontend
+FROM --platform=$BUILDPLATFORM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS frontend
 WORKDIR /app/frontend
 # The lockfile is required, not optional: a missing one fails here with a clear
 # message rather than inside npm.
@@ -25,7 +29,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- Stage 2: build the Go binary (CGO off, embeds the React build) --------
-FROM golang:1.26-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS backend
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS backend
 WORKDIR /src
 RUN apk add --no-cache git
 COPY go.mod go.sum ./
@@ -36,7 +40,8 @@ COPY --from=frontend /app/internal/web/dist ./internal/web/dist
 # App version: pass --build-arg VERSION=v1.2.3 (e.g. from a git tag) when shipping;
 # defaults to "dev" so unstamped builds never show a fake number.
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOFLAGS=-mod=mod go build \
+ARG TARGETOS TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOFLAGS=-mod=mod go build \
     -ldflags="-s -w -X dockback/internal/version.Version=${VERSION}" \
     -trimpath \
     -o /out/dockback .

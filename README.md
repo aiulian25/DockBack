@@ -208,6 +208,9 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   a stack backup too. Run buttons read **Backup in progress…** whenever one is
   running, whoever started it.
   See **[Access control & account security](#access-control--account-security)** below.
+- **Homepage widget** — a [Homepage](https://gethomepage.dev) tile with nodes,
+  backups, failures and unprotected containers, read by its Custom API widget
+  from `/api/widget` with a token that can read nothing else.
 
 ---
 

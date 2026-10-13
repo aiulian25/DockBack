@@ -234,7 +234,7 @@ func scopeSet(csv string) map[string]bool {
 }
 
 // validScopes are the only scopes a token may hold.
-var validScopes = map[string]bool{"read": true, "backup": true, "metrics": true}
+var validScopes = map[string]bool{"read": true, "backup": true, "metrics": true, "widget": true}
 
 // tokenGETExfiltrates reports whether a GET path streams decrypted backup data or
 // the whole (encrypted) control-plane. These are denied to EVERY token scope — a
@@ -274,6 +274,7 @@ func backupPostAllowed(path string) bool {
 //   - read (also implied by backup): any GET, except the decrypted/secret exports;
 //   - backup: additionally the explicit backup POST allow-list;
 //   - metrics: nothing under /api (it authorizes only the separate /metrics handler);
+//   - widget: only GET of the dashboard summary;
 //   - everything else (settings/destinations/nodes/security mutations, DELETEs,
 //     login/2FA/key-rotate): denied by construction.
 func tokenAllows(scopesCSV, method, path string) bool {
@@ -283,6 +284,9 @@ func tokenAllows(scopesCSV, method, path string) bool {
 		return false
 	}
 	scopes := scopeSet(scopesCSV)
+	if scopes["widget"] && method == http.MethodGet && path == widgetPath {
+		return true
+	}
 	if (scopes["read"] || scopes["backup"]) && method == http.MethodGet {
 		return !tokenGETExfiltrates(path)
 	}

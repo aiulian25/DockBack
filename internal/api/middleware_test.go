@@ -134,6 +134,19 @@ func TestSecurityHeadersAlwaysPresent(t *testing.T) {
 	}
 }
 
+// A dashboard on another address shows DockBack's mark as its icon, so the
+// public brand images may be embedded; everything else stays same-origin.
+func TestOnlyBrandImagesMayBeEmbedded(t *testing.T) {
+	for path, want := range map[string]string{
+		"/dockback-mark.png": "cross-origin", "/favicon.png": "cross-origin",
+		"/index.html": "same-origin", widgetPath: "same-origin", "/assets/index.js": "same-origin",
+	} {
+		if got := runHeaders(t, headerServer(false), path, false).Get("Cross-Origin-Resource-Policy"); got != want {
+			t.Errorf("%s: Cross-Origin-Resource-Policy %q, want %q", path, got, want)
+		}
+	}
+}
+
 func TestCSPStyleSrcStrict(t *testing.T) {
 	csp := runHeaders(t, headerServer(false), "/index.html", false).Get("Content-Security-Policy")
 	// style-src itself must not carry 'unsafe-inline' — injected <style>/external
