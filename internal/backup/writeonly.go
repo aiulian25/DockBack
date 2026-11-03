@@ -120,6 +120,14 @@ func (e *Engine) drillSkipReason(man *Manifest) string {
 	if IsWriteOnly(man) && e.restorePrivFor() == "" {
 		return "write-only encrypted — a drill would need the offline private key, so restores must be rehearsed by hand"
 	}
+	// Nothing a drill can restore: an app-native export, or only configuration.
+	// Passing such a drill would claim a restore was proven when none was tried.
+	if len(man.Volumes) == 0 && len(man.Databases) == 0 {
+		if man.AppExport != nil {
+			return "this backup holds an app-native " + man.AppExport.Tool + " export, which a drill cannot restore — restore it into a copy to prove it"
+		}
+		return "this backup holds no volume data and no database, so a drill would have nothing to restore"
+	}
 	return ""
 }
 
@@ -206,7 +214,7 @@ func (e *Engine) VerifyRecoveryKey(ctx context.Context, b *store.Backup, privB64
 		if noData(loc.Status) {
 			continue
 		}
-		be, err := e.backendForLocation(loc)
+		be, err := e.backendForCopy(loc, b)
 		if err != nil {
 			lastErr = fmt.Errorf("%s: %w", loc.Name, err)
 			continue

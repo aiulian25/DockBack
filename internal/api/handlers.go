@@ -1980,9 +1980,12 @@ type restoreReq struct {
 	Volumes  bool   `json:"volumes"`
 	Database bool   `json:"database"`
 	Confirm  bool   `json:"confirm"`
-	Snapshot bool   `json:"snapshot"` // snapshot current state before overwrite (PLAN §3.7)
-	Recreate bool   `json:"recreate"` // "Revert update": recreate the container from the backup's image digest, rolling a bad upgrade back to this backup's version
-	Source   string `json:"source"`   // "" auto | "local" | destination ID
+	// ExecutionID is the console's own name for this run, so it can tell its verdict
+	// from another restore of the same backup. Optional; a malformed one is replaced.
+	ExecutionID string `json:"execution_id,omitempty"`
+	Snapshot    bool   `json:"snapshot"` // snapshot current state before overwrite (PLAN §3.7)
+	Recreate    bool   `json:"recreate"` // "Revert update": recreate the container from the backup's image digest, rolling a bad upgrade back to this backup's version
+	Source      string `json:"source"`   // "" auto | "local" | destination ID
 	// ConfirmIncompatible overrides the restore-time engine/extension compatibility
 	// gate (F10): set only after the user explicitly acknowledges a cross-family
 	// mismatch (e.g. a pgvecto.rs dump into a VectorChord image).
@@ -2158,7 +2161,11 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	// Restore as a copy (F10): validate the clone name. It must be a valid Docker
 	// container name AND must differ from the original — cloning into the original's
-	// name would overwrite it, defeating the whole point (and risking data loss).
+	// name would overwrite it, defeating the whole point (and risking data loss). It
+	// must be free, too: a copy creates a container and never takes over one, which
+	// is also why it needs no step-up below. The engine enforces both for every
+	// caller and Docker's create conflict closes the race; refused here, the operator
+	// gets the reason instead of a run that fails.
 	clone := req.AsName != ""
 	if clone {
 		if !validContainerName(req.AsName) {
@@ -2168,6 +2175,16 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		if req.AsName == b.TargetName {
 			errJSON(w, http.StatusBadRequest, "the copy's name must differ from the original container name")
 			return
+		}
+		if !req.Isolated {
+			errJSON(w, http.StatusBadRequest, "a copy must be isolated: without that it would write into the original's data")
+			return
+		}
+		if cli, cerr := s.reg.Get(req.NodeID); cerr == nil {
+			if _, taken := dockercli.FindContainerByName(r.Context(), cli, req.AsName); taken {
+				errJSON(w, http.StatusConflict, fmt.Sprintf("a container named %q already exists on this node, and a copy never replaces one — choose another name", req.AsName))
+				return
+			}
 		}
 	}
 
@@ -2558,7 +2575,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		defer s.releaseRestoreAndDispatch(lockKey)
 		// Registered as cancelable under the backup id — the same id the UI
 		// streams this restore's log on (see handleCancelRestore).
-		ctx, finish, ok := s.beginRestoreRun(context.Background(), id, b.TargetName, req.NodeID, 2*time.Hour)
+		ctx, finish, ok := s.beginRestoreRun(context.Background(), id, b.TargetName, req.NodeID, 2*time.Hour, req.ExecutionID)
 		if !ok {
 			s.logSink(id, "ERR", "Restore failed: another restore of this backup is already running")
 			return
@@ -2647,7 +2664,7 @@ func (s *Server) handleMirrorBackup(w http.ResponseWriter, r *http.Request) {
 		defer guardPanic("mirror", id, func() { s.logSink(id, "ERR", "Mirror failed: internal error (panic)") })
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 		defer cancel()
-		if err := s.engine.MirrorExisting(ctx, id, req.Destinations); err != nil {
+		if err := s.engine.MirrorExisting(ctx, id, req.Destinations, true); err != nil {
 			s.logSink(id, "ERR", "Mirror failed: "+err.Error())
 		}
 	}()

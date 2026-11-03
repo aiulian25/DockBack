@@ -47,6 +47,26 @@ type Immutabler interface {
 	LockDays() int
 }
 
+// Versioned is implemented by backends whose objects carry a provider version id:
+// S3, where the bucket keeps versions (versioning on, or Object Lock, which
+// requires it).
+//
+// On such a bucket a key is only a pointer. Deleting it adds a delete marker and
+// leaves the bytes stored, and Object Lock protects a version, not the key. A
+// read or delete by key therefore says nothing about the bytes a backup wrote,
+// so the version id the upload was given is what names them.
+type Versioned interface {
+	// PutVersion is Put, also returning the version id the provider gave the
+	// object: "" when the bucket keeps no versions.
+	PutVersion(ctx context.Context, key string, r io.Reader) (int64, string, error)
+	// GetVersion opens that exact version, even when a delete marker or a newer
+	// object at the same key hides it from Get.
+	GetVersion(ctx context.Context, key, versionID string) (io.ReadCloser, error)
+	// DeleteVersion removes that version permanently. The provider refuses while
+	// the version is under retention.
+	DeleteVersion(ctx context.Context, key, versionID string) error
+}
+
 // RetentionLocker is implemented by filesystem-like backends that can make an
 // object read-only AFTER it is written (F97): local disk, SMB and SFTP.
 //

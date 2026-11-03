@@ -277,7 +277,7 @@ func (s *Server) startConsistentStackBackup(nodeID, project string, dests []stri
 		defer forget()
 		end := s.beginOutsideQueueRun("stack:" + project)
 		defer end()
-		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
+		ctx, cancel := context.WithTimeout(s.rootContext(), 6*time.Hour)
 		defer cancel()
 		err := s.engine.BackupStackConsistent(ctx, nodeID, project, backup.Options{
 			NodeID: nodeID, Compression: "balanced",
@@ -967,13 +967,19 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 	//
 	// Placed before the locks below, so a declined prompt leaves nothing held.
 	// F213: which services this restore covers. Repeated `service=` params, in
-	// the query like every other selector on this handler. Empty is the default
-	// and means the whole stack, so an existing caller is unchanged.
+	// the query like every other selector on this handler. Absent is the default
+	// and means the whole stack, so an existing caller is unchanged. Present but
+	// naming nothing is a mistake, such as an empty variable in a script, and the
+	// whole stack is the opposite of what it asked for.
 	selectedServices := []string(nil)
 	for _, v := range q["service"] {
 		if v = strings.TrimSpace(v); v != "" {
 			selectedServices = append(selectedServices, v)
 		}
+	}
+	if q.Has("service") && len(selectedServices) == 0 {
+		errJSON(w, http.StatusBadRequest, "no services selected — nothing to restore")
+		return
 	}
 
 	// F214: which COPY every member is read from. Validated here, before the lock
@@ -1010,11 +1016,15 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, perr.Error())
 		return
 	}
+	// F213: every gate below follows the SELECTION. A service the operator left out
+	// is not touched, so it must not be what stops this restore or makes them prove
+	// their password — the gates exist for what this run destroys.
+	selected := selectedPlanEntries(planned, selectedServices)
 	// Step 27: the same for a shared network the target does not have.
 	if !filesOnly && q.Get("confirm_missing_networks") != "true" && q.Get("confirm_missing_networks") != "1" {
 		seen := map[string]bool{}
 		var lackingNets []string
-		for _, p := range planned {
+		for _, p := range selected {
 			if b, gerr := s.store.GetBackup(p.BackupID); gerr == nil {
 				for _, n := range s.sharedNetworksMissingOn(r.Context(), manifestOf(b), project, b.NodeID, targetID) {
 					if !seen[n] {
@@ -1036,7 +1046,7 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 	// any service is touched, unless the operator says it will be there.
 	if !filesOnly && q.Get("confirm_missing_devices") != "true" && q.Get("confirm_missing_devices") != "1" {
 		var lacking []string
-		for _, p := range planned {
+		for _, p := range selected {
 			if b, gerr := s.store.GetBackup(p.BackupID); gerr == nil {
 				for _, d := range s.missingDevicesOn(r.Context(), manifestOf(b), b.NodeID, targetID) {
 					lacking = append(lacking, p.Service+": "+d)
@@ -1051,18 +1061,8 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// F213: the protected-member check follows the SELECTION. A service the
-	// operator deselected is not overwritten, so it must not be what makes them
-	// prove their password — the gate exists for what this run destroys.
-	keep := map[string]bool{}
-	for _, name := range selectedServices {
-		keep[name] = true
-	}
-	memberNames := make([]string, 0, len(planned))
-	for _, p := range planned {
-		if len(keep) > 0 && !keep[p.Service] && !keep[p.TargetName] {
-			continue
-		}
+	memberNames := make([]string, 0, len(selected))
+	for _, p := range selected {
 		memberNames = append(memberNames, p.TargetName)
 	}
 	protected := s.protectedRestoreMembers(targetID, memberNames)
@@ -1136,7 +1136,7 @@ func (s *Server) handleRestoreStack(w http.ResponseWriter, r *http.Request) {
 		}
 		// Cancelable under the stack's own run id (what the UI streams).
 		runID := "stack:" + project
-		ctx, finish, ok := s.beginRestoreRun(context.Background(), runID, "stack "+project, targetID, 3*time.Hour)
+		ctx, finish, ok := s.beginRestoreRun(context.Background(), runID, "stack "+project, targetID, 3*time.Hour, "")
 		if !ok {
 			s.logSink(runID, "ERR", "Stack restore failed: another restore of this stack is already running")
 			return
@@ -1456,6 +1456,29 @@ func (s *Server) handleStackRestorePlan(w http.ResponseWriter, r *http.Request) 
 func stackRestoreSnapshotWanted(q url.Values) bool {
 	v := q.Get("snapshot")
 	return v != "false" && v != "0"
+}
+
+// selectedPlanEntries narrows a stack plan to the services a restore request
+// named, by service or container name; no names means the whole stack.
+//
+// An unknown name matches nothing rather than widening to the whole stack, as the
+// read-only panel below does: the engine refuses it before touching anything, so
+// no gate has anything to judge.
+func selectedPlanEntries(planned []backup.StackPlanEntry, names []string) []backup.StackPlanEntry {
+	if len(names) == 0 {
+		return planned
+	}
+	keep := make(map[string]bool, len(names))
+	for _, name := range names {
+		keep[name] = true
+	}
+	out := make([]backup.StackPlanEntry, 0, len(names))
+	for _, p := range planned {
+		if keep[p.Service] || keep[p.TargetName] {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // selectedEntries narrows a stack plan to the services the operator kept.

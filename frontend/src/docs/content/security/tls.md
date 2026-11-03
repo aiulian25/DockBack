@@ -2,9 +2,11 @@
 
 DockBack carries your session cookie and the encryption-key-entry form, so those must not travel in cleartext. You have two options.
 
-## Option 1 — Reverse proxy (recommended for public domains)
+DockBack is a control plane: it can restore and recreate containers on every node it manages. Keep it on a private network, as the README explains. TLS protects the connection, but it doesn't make a public address safe.
 
-By default DockBack serves **plain HTTP** bound to `127.0.0.1:28734` and lets your ingress terminate TLS — Cloudflare Tunnel, Tailscale, Pangolin, nginx/Caddy/Traefik, etc. This is the recommended setup for anything reachable on a real domain (automatic, renewing, trusted certificates).
+## Option 1 — Reverse proxy on a private path (recommended)
+
+By default DockBack serves **plain HTTP** bound to `127.0.0.1:28734` and lets a proxy in front of it terminate TLS. Use one only you can reach: Tailscale Serve, or nginx/Caddy/Traefik on a private interface or internal domain. A tunnel such as Cloudflare Tunnel or Pangolin is fine only with an identity or access policy in front of it, never as a plain public hostname. This gives you trusted, automatically renewed certificates.
 
 Tell DockBack it's behind a trusted proxy so it enables `Secure` + `__Host-` cookies, HSTS, and correct client IPs for the login lockout:
 
@@ -47,4 +49,4 @@ However TLS is provided (proxy or built-in), DockBack detects the secure connect
 
 Over plain HTTP these are deliberately *not* set (a `__Host-`/`Secure` cookie would be rejected by the browser and break login), so an HTTP→HTTPS switch never forces a logout.
 
-> For internet-facing deployments prefer Option 1 — a reverse proxy gives you trusted, auto-renewing certificates. Built-in TLS is ideal for isolated/LAN installs.
+> Prefer Option 1 when a proxy is already part of your private setup: it gives you trusted, auto-renewing certificates. Built-in TLS suits an isolated LAN install. Neither makes it safe to publish DockBack on the internet.

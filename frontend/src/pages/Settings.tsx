@@ -998,13 +998,14 @@ function SettingsInner() {
                     {preview.targets.filter((t) => t.prune > 0).map((t, i) => {
                       const pins = t.items.filter((it) => it.pinned).length;
                       const autoPruned = t.items.filter((it) => it.action === "prune" && (it.label || "").startsWith("auto:")).length;
+                      const keptAsFloor = t.items.some((it) => it.reason === "last_healthy");
                       return (
                         <div key={i} className="flex flex-wrap items-center justify-between gap-x-2 border-b border-outline-variant/30 py-1">
                           <span className="flex items-center gap-1.5 font-mono">
                             {t.node_name || t.node_id} · {t.target}
                             {autoPruned > 0 && <span className="rounded-full bg-secondary/15 px-1.5 py-0.5 font-sans text-[10px] font-semibold text-secondary" title="automatic pre-change, crash and pre-restore snapshots pruned by their own budget">{autoPruned} auto</span>}
                           </span>
-                          <span className="text-on-surface-variant">keep {t.keep}{pins > 0 ? ` (${pins} pinned)` : ""} · prune {t.prune} ({fmtBytes(t.prune_bytes)})</span>
+                          <span className="text-on-surface-variant">keep {t.keep}{pins > 0 ? ` (${pins} pinned)` : ""}{keptAsFloor ? " (including the last verified backup)" : ""} · prune {t.prune} ({fmtBytes(t.prune_bytes)}){t.no_known_good ? " · no verified backup to fall back on" : ""}</span>
                         </div>
                       );
                     })}

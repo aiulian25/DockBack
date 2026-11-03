@@ -22,7 +22,9 @@ package appbackup
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -90,7 +92,9 @@ func Create(w io.Writer, snapshotPath string, key []byte, m Manifest) error {
 	inner.WrappedKey = ""
 
 	pr, pw := io.Pipe()
+	written := make(chan struct{})
 	go func() {
+		defer close(written)
 		tw := tar.NewWriter(pw)
 		if werr := writeArchive(tw, snapshotPath, inner); werr != nil {
 			_ = tw.Close()
@@ -100,6 +104,10 @@ func Create(w io.Writer, snapshotPath string, key []byte, m Manifest) error {
 		pw.CloseWithError(tw.Close())
 	}()
 	_, err = crypto.Encrypt(w, pr, dek)
+	// A destination that failed stopped the reading, and the writer above is parked on
+	// a pipe write holding the snapshot open. Closing the read end ends it.
+	pr.CloseWithError(err)
+	<-written
 	return err
 }
 
@@ -212,44 +220,141 @@ type Entry struct {
 	SizeBytes      int64  `json:"size_bytes"`
 }
 
+const (
+	namePrefix      = "dockback-config-"
+	nameExtension   = ".dback"
+	nameTimeLayout  = "20060102-150405"
+	nameSuffixBytes = 8
+	metaSuffix      = ".meta.json"
+
+	// partialPrefix names a file a creator is still writing. It never matches
+	// nameRe, so List and every name check ignore it until it is published.
+	partialPrefix = ".dockback-config-partial-"
+)
+
 // nameRe is the only filename shape we create/accept — anchors path-traversal out.
-var nameRe = regexp.MustCompile(`^dockback-config-[0-9]{8}-[0-9]{6}\.dback$`)
+// The random suffix is optional: names from earlier versions have none.
+var nameRe = regexp.MustCompile(`^dockback-config-[0-9]{8}-[0-9]{6}(-[0-9a-f]{16})?\.dback$`)
 
 // ValidName reports whether name is a safe app-backup filename (basename only).
 func ValidName(name string) bool { return nameRe.MatchString(name) }
 
+// NewName returns a fresh app-backup filename for t. Its random suffix keeps
+// backups taken in the same second apart.
+func NewName(t time.Time) string {
+	suffix := make([]byte, nameSuffixBytes)
+	_, _ = rand.Read(suffix)
+	return namePrefix + t.UTC().Format(nameTimeLayout) + "-" + hex.EncodeToString(suffix) + nameExtension
+}
+
 // CreateFile writes a stored, encrypted application backup (+ a non-sensitive
 // sidecar .meta.json) into dir and returns the completed entry. e carries the
-// metadata to record (CreatedAt, counts, etc.); the filename is derived from
-// CreatedAt so it's stable and traversal-safe.
-func CreateFile(dir, snapshotPath string, key []byte, e Entry) (Entry, error) {
+// metadata to record (CreatedAt, counts, etc.). The archive is written to a
+// partial file, synced and proven to restore (decrypted into tmpDir) before it is
+// published under a fresh name, sidecar first, so List never shows a backup that
+// is half-written, unverified or missing its metadata. A failure removes only the
+// partial files this call made.
+func CreateFile(dir, snapshotPath string, key []byte, e Entry, tmpDir string) (Entry, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return e, err
 	}
-	e.File = fmt.Sprintf("dockback-config-%s.dback", time.Unix(e.CreatedAt, 0).UTC().Format("20060102-150405"))
-	archivePath := filepath.Join(dir, e.File)
-
-	f, err := os.Create(archivePath)
+	m := Manifest{Format: Format, Version: Version, CreatedAt: e.CreatedAt, AppVersion: e.AppVersion, KeyFingerprint: e.KeyFingerprint}
+	partialArchive, err := writePartial(dir, func(w io.Writer) error { return Create(w, snapshotPath, key, m) })
 	if err != nil {
 		return e, err
 	}
-	m := Manifest{Format: Format, Version: Version, CreatedAt: e.CreatedAt, AppVersion: e.AppVersion, KeyFingerprint: e.KeyFingerprint}
-	if err := Create(f, snapshotPath, key, m); err != nil {
-		f.Close()
-		os.Remove(archivePath)
+	published := false
+	defer func() {
+		if !published {
+			os.Remove(partialArchive)
+		}
+	}()
+	if err := verifyArchive(partialArchive, key, tmpDir); err != nil {
+		return e, fmt.Errorf("the new backup does not restore: %w", err)
+	}
+	fi, err := os.Stat(partialArchive)
+	if err != nil {
 		return e, err
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(archivePath)
+	e.SizeBytes = fi.Size()
+	e.File = NewName(time.Unix(e.CreatedAt, 0))
+	archivePath := filepath.Join(dir, e.File)
+
+	if err := publishMeta(dir, archivePath+metaSuffix, e); err != nil {
 		return e, err
 	}
-	if fi, err := os.Stat(archivePath); err == nil {
-		e.SizeBytes = fi.Size()
+	if err := os.Rename(partialArchive, archivePath); err != nil {
+		os.Remove(archivePath + metaSuffix)
+		return e, err
 	}
-	if mb, err := json.MarshalIndent(e, "", "  "); err == nil {
-		_ = os.WriteFile(archivePath+".meta.json", mb, 0o600)
-	}
+	published = true
+	syncDir(dir)
 	return e, nil
+}
+
+// publishMeta writes e as the sidecar at metaPath through a partial file.
+func publishMeta(dir, metaPath string, e Entry) error {
+	mb, err := json.MarshalIndent(e, "", "  ")
+	if err != nil {
+		return err
+	}
+	partialMeta, err := writePartial(dir, func(w io.Writer) error {
+		_, werr := w.Write(mb)
+		return werr
+	})
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(partialMeta, metaPath); err != nil {
+		os.Remove(partialMeta)
+		return err
+	}
+	return nil
+}
+
+// writePartial creates a new partial file in dir, fills it, syncs and closes it,
+// and returns its path. On failure it removes that file and nothing else.
+func writePartial(dir string, fill func(io.Writer) error) (string, error) {
+	f, err := os.CreateTemp(dir, partialPrefix+"*")
+	if err != nil {
+		return "", err
+	}
+	werr := fill(f)
+	if werr == nil {
+		werr = f.Sync()
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		os.Remove(f.Name())
+		return "", werr
+	}
+	return f.Name(), nil
+}
+
+// syncDir makes the renames into dir durable where the filesystem supports it.
+// Best-effort: the backup is already published either way.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	d.Close()
+}
+
+// RemovePartials deletes the partial files that creators interrupted by a crash
+// left in dir and returns how many it removed. Call it only while no creator runs.
+func RemovePartials(dir string) int {
+	leftovers, _ := filepath.Glob(filepath.Join(dir, partialPrefix+"*"))
+	removed := 0
+	for _, leftover := range leftovers {
+		if os.Remove(leftover) == nil {
+			removed++
+		}
+	}
+	return removed
 }
 
 // List returns stored backups in dir, newest first. A missing dir is empty.
@@ -267,7 +372,7 @@ func List(dir string) ([]Entry, error) {
 			continue
 		}
 		var e Entry
-		if mb, err := os.ReadFile(filepath.Join(dir, de.Name()+".meta.json")); err == nil {
+		if mb, err := os.ReadFile(filepath.Join(dir, de.Name()+metaSuffix)); err == nil {
 			_ = json.Unmarshal(mb, &e)
 		}
 		e.File = de.Name()
@@ -313,7 +418,11 @@ func VerifyFile(dir, name string, key []byte, tmpDir string) error {
 	if !ValidName(name) {
 		return fmt.Errorf("invalid backup name")
 	}
-	f, err := os.Open(filepath.Join(dir, name))
+	return verifyArchive(filepath.Join(dir, name), key, tmpDir)
+}
+
+func verifyArchive(path string, key []byte, tmpDir string) error {
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
@@ -390,7 +499,7 @@ func DeleteFile(dir, name string) error {
 	if err := os.Remove(filepath.Join(dir, name)); err != nil {
 		return err
 	}
-	_ = os.Remove(filepath.Join(dir, name+".meta.json"))
+	_ = os.Remove(filepath.Join(dir, name+metaSuffix))
 	return nil
 }
 
@@ -500,7 +609,7 @@ func RewrapFile(dir, name, newFP string, oldKey, newKey []byte) (bool, error) {
 // updateMetaFingerprint rewrites the KeyFingerprint in a backup's .meta.json sidecar
 // (best-effort; the sidecar holds only non-sensitive metadata).
 func updateMetaFingerprint(dir, name, fp string) {
-	metaPath := filepath.Join(dir, name+".meta.json")
+	metaPath := filepath.Join(dir, name+metaSuffix)
 	mb, err := os.ReadFile(metaPath)
 	if err != nil {
 		return

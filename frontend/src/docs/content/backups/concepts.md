@@ -50,6 +50,22 @@ Integrity checks prove the *bytes* are intact; a **restore drill** proves the ba
 
 A drill test-restores the backup into an **isolated sandbox** — for a **database** backup it spins up a throwaway engine and re-imports the dump; for a **volume/app** backup it extracts the captured volumes into a **fresh throwaway volume** and **boots an isolated copy of the container** from the backup's image and config to prove the app actually comes back. Either way it also checks the archive extracts and its recorded volume checksum matches. It **never touches your live stack**: the throwaway container runs with **no network** (`none`), no host mounts, no inherited privileges, and is removed — along with its throwaway volumes — automatically. Set a **Restore drills** cadence in *Settings → Encryption* (days; 0 = off) to auto-drill on a schedule. Two knobs tune what and how much is drilled: **Coverage** — *Newest backup only* (default) drills each container's latest backup, while *Newest of each week* also drills the newest of each ISO week so **older generations** are proven restorable too; and **Drills per cycle** (1–5) — how many overdue backups run each cycle, to tune throughput to your hardware. How long a drill waits for the throwaway app to come up before judging it (45s by default) is set by **Drill boot wait** in *Settings → Performance & tuning* — raise it for a slow-starting image. Runs are still spread across cycles so there's no load spike. A failed drill raises a high-priority alert, and external monitors can watch `dockback_oldest_restore_drill_age_seconds` and `dockback_restore_drills_failing`.
 
+What a drill reads and boots:
+
+- **Reads the copy a restore would use.** For a backup that lives only offsite, that is the offsite copy.
+- **Puts an incremental's chain together first.** It restores the delta's real state, so a missing or mismatched ancestor fails the drill and is named.
+- **Boots the image digest recorded at backup time.** If no digest was recorded, the result says the image was booted by tag and that the tag may have moved since.
+- **Runs one drill at a time per instance.** The throwaway containers are capped at 2 GiB of memory, two CPUs and 1024 processes.
+- **Ignores a second request for the same backup.** It is refused while the first drill is still running.
+
+Some backups can't be drilled, and they are reported as **not drillable** instead of passing:
+
+- **Write-only backups.** DockBack can't read them back by design.
+- **App-native exports.** Prove one with a restore into a copy.
+- **Backups with no volume data and no database.**
+
+The automatic sweep skips these and moves on to backups it can test. A drill that passed in an older version without testing anything no longer earns an **A**.
+
 > A restore drill proves your backup **reconstitutes**: a database re-imports and returns data; a volume/app backup extracts and its container **boots in isolation**. Because the sandbox is fully isolated, an app that needs other services (a database, another container) can't reach them — so a container that **starts and stays running** counts as a pass even if its healthcheck can't turn green without its dependencies. A container that **crashes on boot** fails the drill. Treat a passing drill as "this backup restores and the app starts", which is exactly the proof the original silent-failure problem needed.
 
 ## Configuration drift ("changes since last backup")
@@ -73,3 +89,5 @@ A standalone volume backup can't be **restored as a copy** under a different nam
 ## Locations
 
 Every backup records all the **locations** it lives in (local + each destination it was mirrored to). This is what powers offsite redundancy, restore fallback, and retention pruning across every copy. See *External Backup Destinations → Overview*.
+
+An offsite copy counts only once its archive **and** the manifest beside it are both on the destination and the manifest has been read back and checked. That manifest holds the wrapped key, so without it the archive can't be opened if DockBack's own database is ever lost. If the archive arrives but the manifest doesn't, the copy shows as **incomplete**: DockBack can still restore from it and retention still prunes it, but the backup is marked Degraded and the copy doesn't count as protection. **Send offsite now** repairs it by writing only what's missing, so a locked archive isn't touched. A scrub of an offsite copy applies the same check, which is how an older copy with a missing manifest gets found.

@@ -28,7 +28,7 @@ You don't need the whole archive to get back one config file or one photo. Open 
 
 ## Find a file across backups
 
-Don't know *which* backup holds the file? On the **Backups** page, open a node and press **Find a file**: type a name or path fragment (e.g. `config.xml`) and DockBack searches the stored file index of **every successful backup on that node** — returning every generation of every matching path with its size and date. From a result row you can download **that generation of that file** directly, write it straight back into its container (see below), or open its backup's drawer. Backups made before file indexing are skipped (the search tells you how many).
+Don't know *which* backup holds the file? On the **Backups** page, open a node and press **Find a file**: type a name or path fragment (e.g. `config.xml`) and DockBack searches the stored file index of **every successful backup on that node** — returning every generation of every matching path with its size and date. It reads the newest thousand backups first; if the node has more, the result says how many it searched and offers **Search older backups** to carry on, so a search that has not reached your oldest backups never reads as if it had. From a result row you can download **that generation of that file** directly, write it straight back into its container (see below), or open its backup's drawer. Backups made before file indexing are skipped (the search tells you how many).
 
 ## Put a recovered file back (one click)
 

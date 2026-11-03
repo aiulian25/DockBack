@@ -44,6 +44,8 @@ services:
       args:
         VERSION: ${VERSION:-e2e}
     image: dockback:latest
+    # Long enough for DockBack to drain on SIGTERM: Docker's default is 10 seconds.
+    stop_grace_period: 60s
     depends_on:
       socket-proxy:
         condition: service_started

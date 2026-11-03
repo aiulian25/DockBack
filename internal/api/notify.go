@@ -1,8 +1,11 @@
 package api
 
 import (
+	"cmp"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 
 	"dockback/internal/crypto"
@@ -48,47 +51,82 @@ func (s *Server) saveNotifyConfig(c notify.Config) error {
 	return s.store.SetSetting(notifyConfigKey, string(sealed))
 }
 
-// handleGetNotify returns the config with secrets MASKED (never sends the gotify
-// token or SMTP password back); `*_set` flags tell the UI a secret is stored.
+// Secrets a save can remove outright, since a blank field means "keep" for all of them.
+const (
+	clearWebhookURL   = "webhook_url"
+	clearHeartbeatURL = "heartbeat_url"
+)
+
+// notifySaveRequest is the config plus any stored URLs to remove.
+type notifySaveRequest struct {
+	notify.Config
+	ClearSecrets []string `json:"clear_secrets,omitempty"`
+}
+
+// urlHost is the part of a stored URL that is safe to show, so an operator can tell
+// what is configured. Everything else may be a credential. Pure.
+func urlHost(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.Host
+}
+
+// keepStoredSecrets fills every blank secret in c from what is stored, trimming first:
+// a field holding only whitespace is the user clearing it or a stray paste, not a new
+// secret, and a token with a trailing space or newline is the commonest cause of an
+// authentication failure that looks exactly like a wrong token. Pure.
+func keepStoredSecrets(c *notify.Config, stored notify.Config) {
+	c.Gotify.URL = strings.TrimSpace(c.Gotify.URL)
+	c.Gotify.Token = cmp.Or(strings.TrimSpace(c.Gotify.Token), stored.Gotify.Token)
+	c.Email.Password = cmp.Or(strings.TrimSpace(c.Email.Password), stored.Email.Password)
+	c.Webhook.URL = cmp.Or(strings.TrimSpace(c.Webhook.URL), stored.Webhook.URL)
+	c.Heartbeat.URL = cmp.Or(strings.TrimSpace(c.Heartbeat.URL), stored.Heartbeat.URL)
+}
+
+// handleGetNotify returns the config with every secret MASKED: the gotify token, the
+// SMTP password, and the webhook and heartbeat URLs, whose paths are bearer
+// credentials. Any GET-capable token reaches this. `*_set` flags tell the UI a secret
+// is stored, and `*_url_host` says where a URL points.
 func (s *Server) handleGetNotify(w http.ResponseWriter, r *http.Request) {
 	c, err := s.loadNotifyConfig()
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "could not read notification config")
 		return
 	}
-	tokenSet := c.Gotify.Token != ""
-	pwSet := c.Email.Password != ""
+	response := map[string]any{
+		"gotify_token_set":   c.Gotify.Token != "",
+		"email_password_set": c.Email.Password != "",
+		"webhook_url_set":    c.Webhook.URL != "",
+		"webhook_url_host":   urlHost(c.Webhook.URL),
+		"heartbeat_url_set":  c.Heartbeat.URL != "",
+		"heartbeat_url_host": urlHost(c.Heartbeat.URL),
+	}
 	c.Gotify.Token = ""
 	c.Email.Password = ""
-	writeJSON(w, http.StatusOK, map[string]any{
-		"config":             c,
-		"gotify_token_set":   tokenSet,
-		"email_password_set": pwSet,
-	})
+	c.Webhook.URL = ""
+	c.Heartbeat.URL = ""
+	response["config"] = c
+	writeJSON(w, http.StatusOK, response)
 }
 
-// handleSetNotify saves the config, keeping any existing secret when the
-// submitted secret field is blank (so the UI never has to re-enter it).
+// handleSetNotify saves the config, keeping any existing secret when the submitted
+// field is blank (so the UI never has to re-enter it). clear_secrets removes a URL.
 func (s *Server) handleSetNotify(w http.ResponseWriter, r *http.Request) {
-	var in notify.Config
-	if err := readJSON(r, &in); err != nil {
+	var req notifySaveRequest
+	if err := readJSON(r, &req); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	// Trim before the blank-means-keep check: a field holding only whitespace is
-	// the user clearing it or a stray paste, not a new secret — and a token with a
-	// trailing space or newline is the commonest cause of an authentication
-	// failure that looks exactly like a wrong token.
-	in.Gotify.URL = strings.TrimSpace(in.Gotify.URL)
-	in.Gotify.Token = strings.TrimSpace(in.Gotify.Token)
-	in.Email.Password = strings.TrimSpace(in.Email.Password)
-
+	in := req.Config
 	cur, _ := s.loadNotifyConfig()
-	if in.Gotify.Token == "" {
-		in.Gotify.Token = cur.Gotify.Token
+	keepStoredSecrets(&in, cur)
+	if slices.Contains(req.ClearSecrets, clearWebhookURL) {
+		in.Webhook.URL = ""
 	}
-	if in.Email.Password == "" {
-		in.Email.Password = cur.Email.Password
+	if slices.Contains(req.ClearSecrets, clearHeartbeatURL) {
+		in.Heartbeat.URL = ""
 	}
 	if err := s.saveNotifyConfig(in); err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
@@ -138,17 +176,8 @@ func (s *Server) handleTestNotify(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	req.Config.Gotify.URL = strings.TrimSpace(req.Config.Gotify.URL)
-	req.Config.Gotify.Token = strings.TrimSpace(req.Config.Gotify.Token)
-	req.Config.Email.Password = strings.TrimSpace(req.Config.Email.Password)
-
 	cur, _ := s.loadNotifyConfig()
-	if req.Config.Gotify.Token == "" {
-		req.Config.Gotify.Token = cur.Gotify.Token
-	}
-	if req.Config.Email.Password == "" {
-		req.Config.Email.Password = cur.Email.Password
-	}
+	keepStoredSecrets(&req.Config, cur)
 	if err := s.notifier.TestChannel(req.Config, req.Channel); err != nil {
 		errJSON(w, http.StatusBadGateway, err.Error())
 		return

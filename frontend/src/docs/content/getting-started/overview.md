@@ -1,6 +1,6 @@
 # What DockBack is & how it's secured
 
-DockBack backs up your Docker containers — their configuration, volumes/bind data, and databases — across one or many servers, verifies every backup by test-restore, mirrors copies to offsite destinations, enforces retention, and restores on demand (including recreating a container that was deleted entirely).
+DockBack backs up your Docker containers — their configuration, volumes/bind data, and databases — across one or many servers, integrity-checks every backup (with opt-in test restores on top), mirrors copies to offsite destinations, enforces retention, and restores on demand (including recreating a container that was deleted entirely).
 
 ## What it protects
 
@@ -16,7 +16,7 @@ DockBack is built to hold powerful credentials safely:
 - **Distroless, non-root, read-only container** — minimal attack surface, no shell.
 - **Docker socket is never exposed directly.** All Docker access goes through a hardened `docker-socket-proxy` sidecar that whitelists only the API calls DockBack needs. See *Security & Operations → Socket-proxy permissions*.
 - **Encryption at rest.** Every backup archive is encrypted with **AES-256-GCM** (chunked, `DBACKv1`) using your master key. Destination credentials are sealed with the same key.
-- **Always-on verification.** A backup is only trusted after it passes an integrity check.
+- **Always-on verification.** A backup is only marked verified after it is read back end to end: its stored hash, a full decrypt and decompress, a walk of the archive and a sanity check of each database dump. That proves the archive is intact; it is not a test restore. **Deep verification** (each database imported into a throwaway container) and **restore drills** (a whole container brought up in a sandbox) are opt-in and off by default.
 - **Least privilege on destinations.** DockBack only ever reads, writes, and deletes inside the backup folder you configure on each destination — never anywhere else.
 
 ## How the pieces fit together

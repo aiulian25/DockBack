@@ -278,16 +278,15 @@ type AppProfile struct {
 	//
 	// A clone is supposed to be a copy nobody notices — brought up beside the
 	// original to prove a backup restores, then deleted. For most applications
-	// it is: an isolated clone has fresh volumes, no published ports and a
-	// throwaway network, so nothing outside the host can find it.
+	// it is: an isolated clone has fresh volumes, no published ports and no
+	// network, so nothing outside the host can find it.
 	//
 	// That reasoning fails for an application that registers itself with a cloud
 	// service. Plex is the case: its server identity and account token live in a
 	// configuration file, and a restored copy will happily announce itself to
-	// Plex's servers as the SAME server the operator is still running — from a
-	// throwaway network, which is all the outbound access it needs. The rehearsal
-	// that was supposed to prove the backup works instead makes two servers
-	// contend for one identity.
+	// Plex's servers as the SAME server the operator is still running, the moment
+	// an operator gives that copy a network. The rehearsal that was supposed to
+	// prove the backup works instead makes two servers contend for one identity.
 	//
 	// So the clone's own copy of the file is edited before its first start.
 	// Never the original: this runs only on a clone, against data that is a

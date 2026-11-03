@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strings"
 
@@ -54,29 +55,54 @@ func (s *Server) currentUser(r *http.Request) (*store.User, bool) {
 }
 
 // verifyUserTOTP checks a login's second factor: a current TOTP code, or a
-// one-time recovery code (which is then consumed). Returns true on success.
+// one-time recovery code. Returns true only once the code's use is saved: a code that
+// cannot be marked as spent is one that could be used again, so it grants nothing.
 func (s *Server) verifyUserTOTP(u *store.User, code string) bool {
 	secret, err := s.openSecret(u.TOTPSecret)
 	if err != nil || secret == "" {
 		return false
 	}
-	// TOTP with a single-use guard (SEC-4): reject a code whose 30s step was
-	// already consumed, then record the step so it can't be replayed.
+	// TOTP with a single-use guard (SEC-4): u may be stale, so a code that passes
+	// here still has to win the step in the store.
 	if step, ok := crypto.VerifyTOTPStep(secret, code, u.TOTPLastStep); ok {
-		_ = s.store.SetTOTPLastStep(u.ID, step)
-		return true
+		consumed, cerr := s.store.ConsumeTOTPStep(u.ID, u.TOTPSecret, step)
+		if cerr != nil {
+			log.Printf("two-factor: could not save a used code for %s: %v", u.Username, cerr)
+			return false
+		}
+		return consumed
+	}
+	remainingCount := 0
+	_, consumed, err := s.store.ConsumeRecoveryCode(u.ID, func(current string) (string, bool) {
+		remaining, ok := remainingRecoveryCodes(current, code)
+		if !ok {
+			return "", false
+		}
+		encoded, merr := json.Marshal(remaining)
+		remainingCount = len(remaining)
+		return string(encoded), merr == nil
+	})
+	if err != nil {
+		log.Printf("two-factor: could not save a used recovery code for %s: %v", u.Username, err)
+		return false
+	}
+	if consumed {
+		_ = s.store.Audit(u.Username, "login.2fa_recovery", "", "remaining="+itoa(remainingCount))
+	}
+	return consumed
+}
+
+// remainingRecoveryCodes is the stored list without code, or false when code is not
+// in it. A list that cannot be read matches nothing. Pure.
+func remainingRecoveryCodes(stored, code string) ([]string, bool) {
+	if stored == "" {
+		return nil, false
 	}
 	var hashes []string
-	if u.TOTPRecovery != "" {
-		_ = json.Unmarshal([]byte(u.TOTPRecovery), &hashes)
+	if json.Unmarshal([]byte(stored), &hashes) != nil {
+		return nil, false
 	}
-	if remaining, ok := crypto.MatchRecoveryCode(hashes, code); ok {
-		b, _ := json.Marshal(remaining)
-		_ = s.store.UpdateRecovery(u.ID, string(b))
-		_ = s.store.Audit(u.Username, "login.2fa_recovery", "", "remaining="+itoa(len(remaining)))
-		return true
-	}
-	return false
+	return crypto.MatchRecoveryCode(hashes, code)
 }
 
 // handleTOTPStatus reports whether 2FA is on and how many recovery codes remain.
@@ -207,6 +233,7 @@ func (s *Server) handleTOTPDisable(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "could not disable two-factor")
 		return
 	}
+	s.guard.reset(ip, u.Username) // both factors proved: only now do the counters clear
 	_ = s.store.Audit(u.Username, "2fa.disabled", "", "ip="+s.clientIP(r))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

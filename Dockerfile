@@ -29,7 +29,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- Stage 2: build the Go binary (CGO off, embeds the React build) --------
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS backend
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine@sha256:a2012b4a1d1f9f7e9f44e0d39b805a901e856b1dd80b4e6ee4338db547050308 AS backend
 WORKDIR /src
 RUN apk add --no-cache git
 COPY go.mod go.sum ./

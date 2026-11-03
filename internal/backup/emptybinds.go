@@ -213,7 +213,7 @@ func (e *Engine) assertDataBindsFilled(ctx context.Context, cli *client.Client, 
 		// archive's size would refuse restores on a guess.
 		return nil
 	}
-	idx, err := e.loadVolIndex(ctx, b)
+	idx, err := e.loadVolIndex(ctx, b, opts.Source)
 	if err != nil {
 		e.logf(b.ID, "WARN", "Could not read this backup's file index (%v) — starting without checking that the restored data arrived", err)
 		return nil

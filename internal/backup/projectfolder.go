@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -209,9 +210,9 @@ func (e *Engine) captureProjectFolder(ctx context.Context, cli *client.Client, i
 // restoreProjectFolder puts the captured project folder back into dir, filling
 // in only what is missing. Best-effort and logged: the containers and their data
 // are back either way.
-func (e *Engine) restoreProjectFolder(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, source, logID, dir string) {
+func (e *Engine) restoreProjectFolder(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, source, logID, dir string) error {
 	if man == nil || man.ProjectFolder == nil || man.ProjectFolder.Entries == 0 {
-		return
+		return nil
 	}
 	var kept int
 	found := false
@@ -227,11 +228,14 @@ func (e *Engine) restoreProjectFolder(ctx context.Context, cli *client.Client, b
 	switch {
 	case err != nil:
 		e.logf(logID, "WARN", "The project folder's other files were not restored into %s: %v", dir, err)
+		return fmt.Errorf("the project folder's other files were not restored: %w", err)
 	case !found:
 		e.logf(logID, "WARN", "The backup records a project folder, but the archive holds none to restore into %s", dir)
+		return fmt.Errorf("the backup records a project folder, but the archive holds none")
 	case kept > 0:
 		e.logf(logID, "INFO", "Restored the project folder's other files into %s (scripts, READMEs, config). %d file(s) already there were kept as they are.", dir, kept)
 	default:
 		e.logf(logID, "INFO", "Restored the project folder's other files into %s (scripts, READMEs, config)", dir)
 	}
+	return nil
 }

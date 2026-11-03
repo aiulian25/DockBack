@@ -420,7 +420,7 @@ func runbookNotes(svc runbookService) []string {
 		}
 	}
 	for _, l := range svc.Locations {
-		if l.Status == "failed" {
+		if l.Status == "failed" || l.Status == backup.LocationIncomplete {
 			notes = append(notes, "Offsite copy to "+l.Name+" did not complete ("+l.Detail+") — this backup may exist only on the local disk.")
 		}
 	}

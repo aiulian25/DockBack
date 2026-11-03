@@ -113,7 +113,7 @@ Uptime Kuma has a **Push** monitor built for exactly this: it expects your servi
 - **Use the full Push URL, not Kuma's base address.** A bare `http://<kuma-host>:<port>` is the web UI — it redirects, so *Send test* can look like it passed while no monitor ever receives the ping. The URL must contain `/api/push/<token>`. Pasting the full Push URL into a browser should return `{"ok":true}`.
 - **Egress allow-list.** If you've set `DOCKBACK_EGRESS_ALLOW` (default-deny outbound), the heartbeat is refused unless Kuma's host is covered — add its hostname, IP, or a CIDR (e.g. `10.168.1.0/24`) to that list and recreate the container. If `DOCKBACK_EGRESS_ALLOW` is unset, any host is allowed. See *Security & Operations → Egress allow-list (outbound control)*.
 
-The `<token>` is effectively a secret — anyone who can reach the URL can send or spoof a heartbeat — so keep it private. DockBack stores it encrypted with the other notification settings.
+The `<token>` is effectively a secret — anyone who can reach the URL can send or spoof a heartbeat — so keep it private. DockBack stores it encrypted with the other notification settings and never sends it back: the webhook and heartbeat URLs show only their host once saved. Leave the box blank to keep the saved URL, paste a new one to replace it, or use **Remove saved URL**.
 
 ## Security & behaviour
 

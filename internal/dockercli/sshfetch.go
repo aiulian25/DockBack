@@ -4,11 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"regexp"
 	"strings"
-
-	"golang.org/x/crypto/ssh"
 )
 
 // MaxComposeFetchBytes caps a single host-file read over SSH (F57). The genuine
@@ -105,7 +102,7 @@ func (r *Registry) FetchNodeFile(ctx context.Context, nodeID, path string, maxBy
 		tunnel = t
 		throwaway = true
 	}
-	cli, err := tunnel.sshClient()
+	cli, err := tunnel.sshClient(ctx)
 	if err != nil {
 		if throwaway {
 			tunnel.close()
@@ -116,11 +113,13 @@ func (r *Registry) FetchNodeFile(ctx context.Context, nodeID, path string, maxBy
 		defer tunnel.close()
 	}
 
-	sess, err := cli.NewSession()
+	sess, err := tunnel.openSession(ctx, cli)
 	if err != nil {
 		return nil, err
 	}
 	defer sess.Close()
+	// A read from a server that goes quiet ends with the caller, not with the server.
+	defer context.AfterFunc(ctx, func() { sess.Close() })()
 
 	stdout, err := sess.StdoutPipe()
 	if err != nil {
@@ -153,25 +152,4 @@ func (r *Registry) FetchNodeFile(ctx context.Context, nodeID, path string, maxBy
 		return nil, fmt.Errorf("reading %s: %w (%s)", path, werr, msg)
 	}
 	return data, nil
-}
-
-// sshClient returns the tunnel's live *ssh.Client, connecting it if needed. Used to
-// open an ancillary session (F57 host-file read) over the same pinned connection.
-func (t *sshTunnel) sshClient() (*ssh.Client, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.client != nil {
-		return t.client, nil
-	}
-	tcp, err := (&net.Dialer{Timeout: dialTimeout, KeepAlive: tcpKeepAlive}).Dial("tcp", t.hostport)
-	if err != nil {
-		return nil, fmt.Errorf("ssh dial %s: %w", t.hostport, err)
-	}
-	sshConn, chans, reqs, err := ssh.NewClientConn(tcp, t.hostport, t.cfg)
-	if err != nil {
-		tcp.Close()
-		return nil, fmt.Errorf("ssh handshake %s: %w", t.hostport, err)
-	}
-	t.client = ssh.NewClient(sshConn, chans, reqs)
-	return t.client, nil
 }

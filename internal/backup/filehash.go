@@ -99,7 +99,7 @@ func (e *Engine) verifyRestoredFiles(ctx context.Context, cli *client.Client, b 
 	if opts.AsName != "" {
 		return nil // a clone's files are its own from the moment it is created
 	}
-	idx, err := e.loadVolIndex(ctx, b)
+	idx, err := e.loadVolIndex(ctx, b, opts.Source)
 	if err != nil || len(idx.Entries) == 0 {
 		return nil
 	}

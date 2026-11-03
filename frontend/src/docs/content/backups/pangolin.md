@@ -20,7 +20,7 @@ Use the stack's **app-consistent snapshot** rather than per-service backups. It 
 - **Restoring one service on its own is refused.** That is the case that looks most reasonable and is most damaging. The refusal names the other services, and happens before anything is stopped or overwritten.
 - **A stack restore must come from one complete snapshot.** "Latest backup of each service" is a fair convenience for an ordinary stack; here it silently mixes moments in time. A tunnel key from Tuesday and a database from Thursday are both real backups, and together they are not a deployment. The restore dialog says so — and disables the button — before you commit.
 
-**Inspecting a backup is always allowed.** Restore any member as an **isolated copy** and it comes up under a new name on a throwaway network, touching nothing. Looking inside an archive should never need permission.
+**Inspecting a backup is always allowed.** Restore any member as an **isolated copy** and it comes up under a new name with no network, touching nothing. Looking inside an archive should never need permission.
 
 Per-service backups of this stack are graded **F** with the reason spelled out. Not "partial" — partial means a restore missing some data, and these do not restore.
 

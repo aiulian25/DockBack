@@ -37,7 +37,7 @@ Pick the least privilege that does the job:
 
 | Scope | Grants |
 |---|---|
-| **Read-only** | Any `GET` — backup lists, status, node/stack inventory, insights. **Not** decrypted archive downloads or the app-backup export. |
+| **Read-only** | Any `GET` — backup lists, status, node/stack inventory, insights. **Not** decrypted archive downloads or the app-backup export. Notification settings come back with every secret blank, including the webhook and heartbeat URLs: `GET /api/notifications` gives `webhook_url_set` and `webhook_url_host` instead, and the same for the heartbeat. |
 | **Trigger backups** | Everything Read-only can do, **plus** starting and re-verifying backups: `POST /api/backups`, `/api/backups/{id}/verify`, `/drill`, `/mirror`, and stack backups. No config changes, no restores. |
 | **Metrics only** | Only the Prometheus `/metrics` endpoint. |
 | **Homepage widget** | Only `GET /api/widget`, the summary a dashboard tile shows — see *Homepage dashboard widget*. |

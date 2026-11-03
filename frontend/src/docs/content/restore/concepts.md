@@ -61,12 +61,16 @@ The check resolves against the node the restore **lands on**, because only what 
 
 After the data is back in place and the container is started, DockBack **waits for it to come up** — healthy according to its healthcheck, or simply running if it has none. If it never becomes healthy within the wait (a crash-loop), the restore is **not** reported as success:
 
-- **With the safety snapshot on** (the default), DockBack **automatically rolls back** to the pre-restore snapshot, returning the container to its prior state, marks the restore **failed** with *"restored data did not come up healthy — rolled back to the pre-restore snapshot"*, and sends a **critical notification**.
+- **With the safety snapshot on** (the default), DockBack **automatically rolls back** to the pre-restore snapshot, returning the container to its prior state (if the restore had replaced the container, its prior image and configuration come back too, not just its data), marks the restore **failed** with *"restored data did not come up healthy — rolled back to the pre-restore snapshot"*, and sends a **critical notification**.
 - **With the snapshot off**, there's nothing to roll back to, so the container is left as-is and the restore is reported as **not healthy** (rather than a silent success) so you can investigate.
 
 A container with no healthcheck that stays running is treated as healthy — a good restore is never rolled back just for lacking a healthcheck. Because the outcome now waits for the container to actually come up, a restore of a slow-starting app may take a little longer to report **complete**.
 
 **How long it waits (5 minutes by default) is configurable.** Set the global wait in *Settings → Performance & tuning* (**Restore health timeout**), and a **per-container override** on the container's page — so a heavy app whose first boot runs a long database migration isn't force-rolled-back mid-migration. The per-container value wins over the global one.
+
+## How a restore's result is decided
+
+The log tells you what happened along the way; the result comes from DockBack's own record of the run, so a warning or an error line partway through doesn't end the console early. A restore step can fail in a way that doesn't stop the restore, and the run still finishes. That record is saved as the run ends, so a browser that lost its connection or was reloaded while the run was still going picks up the same answer. A restore cut short by DockBack itself stopping shows as **interrupted**.
 
 ## Cancel a running restore
 
@@ -141,10 +145,12 @@ A normal restore puts a backup's **data** back into the container as it is now �
 Sometimes you don't want to overwrite the running app — you want to **look at** a backup: inspect old data, test whether an upgrade migrates cleanly, or pull one record out. Tick **Restore as a copy** in the restore drawer and give it a **new container name** (e.g. `paperless-restored`). DockBack brings the backup up as a **separate, isolated container**:
 
 - It gets its **own fresh volumes** filled from the backup — it never mounts the live container's data, so the original is **completely untouched**.
-- It **publishes no host ports** and joins a throwaway **`dockback-restore`** network, so it can't clash with the running app on a port or interfere with the live stack.
-- Because it's isolated from its usual dependencies (its database, other services), it may not go fully "healthy" — that's expected for a copy, so DockBack doesn't treat it as a failed restore.
+- It **publishes no host ports** and has **no network at all**, so it can't clash with the running app, interfere with the live stack, or use the original's credentials to reach anything: not the internet, your other services, or this host.
+- It gets **no host powers**: no privileged mode, no devices or GPU, no capabilities beyond Docker's defaults, and no shared host namespaces. The restore log names anything the original had that the copy does not.
+- It is **always a new container**. If the name you chose is already taken on that node, the restore is refused and the container holding that name is left exactly as it is. Choose another name.
+- Because it's cut off from its dependencies (its database, other services, the internet, a GPU), it may not go fully "healthy", and an app that needs one of those to start may not start at all. That's a limit of the sandbox rather than a verdict on the backup, so DockBack doesn't treat it as a failed restore. What a copy proves is that the data came back, not that the app works in production.
 
-Reach the copy with `docker exec`, or attach it to a network to browse it, then remove it when you're done. This is the safe way to migrate data or trial a restore without any risk to what's running.
+Reach the copy with `docker exec`, then remove it when you're done. If you do need to browse it, moving it onto a network is your own decision: `docker network disconnect none <copy>`, then `docker network connect <network> <copy>`. Remember that it holds the original's credentials from then on. This is the safe way to migrate data or trial a restore without any risk to what's running.
 
 ### Test restore — the one-click version that cleans up after itself
 

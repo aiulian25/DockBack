@@ -4,8 +4,8 @@ DockBack is deliberately small. This page covers what it needs, how it behaves u
 
 ## Footprint at a glance
 
-- **Image:** a single ~21 MB distroless binary (no shell, no package manager).
-- **Idle:** roughly **18 MB RAM total** (the app plus its socket-proxy sidecar) and near‑zero CPU — it's just watching for changes and waiting for the schedule.
+- **Image:** a single distroless binary of about 26 MB, in a 45 MB image (no shell, no package manager).
+- **Idle:** roughly **20 MB RAM total** (about 15 MB for the app and 5 MB for its socket-proxy sidecar) and near‑zero CPU — it's just watching for changes and waiting for the schedule. Measured on 2026-11-03 against a fresh instance with the local node only and no backups yet, once it had settled; more nodes and a longer history use more, so check yours with `docker stats`.
 
 ## What uses resources during a backup
 
@@ -32,7 +32,7 @@ A Raspberry Pi 4 (4 GB) or any small VPS runs it comfortably. The default contai
 RAM and CPU are modest; **disk is what you actually plan for**:
 
 - **Backup storage** — sized to *your data × how many copies you keep* (retention). zstd usually compresses well, so this is smaller than the raw data.
-- **Work scratch** (`DOCKBACK_WORK_DIR`, default `/app/backups/.work`) — needs room for the **largest single uncompressed payload** being processed at once (one volume or database dump), multiplied by how many backups run concurrently. Point it at a roomy, fast disk (SSD) if you back up large volumes:
+- **Work scratch** (`DOCKBACK_WORK_DIR`, default `/app/backups/.work`) — holds the captured data **unencrypted** until it is packed and encrypted, so keep it on a disk only DockBack can read. It needs room for the **largest single uncompressed payload** being processed at once (one volume or database dump), multiplied by how many backups run concurrently. Point it at a roomy, fast disk (SSD) if you back up large volumes:
 
 ```
 DOCKBACK_WORK_DIR=/mnt/fast-disk/dockback-work
@@ -137,3 +137,14 @@ So raise memory if you back up file-heavy volumes or run several backups at once
 Concurrency is a separate lever, in **Settings → Advanced**: how many backups run at once fleet-wide, and how many per node. More concurrency uses more memory and more CPU, so raise it alongside the limits above rather than on its own.
 
 Keep *some* limit in place. A ceiling is what stops a runaway backup taking the whole host down with it.
+
+## Stopping and upgrading DockBack
+
+When DockBack is asked to stop, it stops taking on work, cancels what is running, and lets go of any container it has paused or stopped for a backup before it exits. Give it the time to do that by adding this to its service in your compose file:
+
+```yaml
+stop_grace_period: 60s
+```
+
+Docker's default is 10 seconds, after which it kills the process. That's survivable: DockBack writes down what it is holding before it holds it, so on the next start it lets go of those containers and leaves everything else alone, including anything you stopped yourself. A backup that was cut short runs again. A restore that was cut short does not, and its container isn't started, because its data may be only partly restored: an alert names it and the safety snapshot that undoes it.
+

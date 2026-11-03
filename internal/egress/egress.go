@@ -163,7 +163,7 @@ func (p *Policy) Check(target string) error {
 	}
 	host := hostFrom(target)
 	if host == "" {
-		return fmt.Errorf("egress: could not determine host for %q", target)
+		return fmt.Errorf("egress: could not determine the host of this address")
 	}
 	if !p.AllowHost(host) {
 		return fmt.Errorf("egress denied: %q is not in the egress allow-list (DOCKBACK_EGRESS_ALLOW)", host)

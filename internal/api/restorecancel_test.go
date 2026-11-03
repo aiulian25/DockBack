@@ -18,7 +18,7 @@ func TestRestoreCancelRegistry(t *testing.T) {
 	st := testStore(t)
 	s := &Server{store: st}
 
-	ctx, finish, ok := s.beginRestoreRun(context.Background(), "b1", "nextcloud", "n1", time.Hour)
+	ctx, finish, ok := s.beginRestoreRun(context.Background(), "b1", "nextcloud", "n1", time.Hour, "")
 	if !ok || ctx == nil {
 		t.Fatal("first run must register")
 	}
@@ -31,7 +31,7 @@ func TestRestoreCancelRegistry(t *testing.T) {
 
 	// A second run under the same id is refused (the locks normally prevent
 	// this; the registry is the last-resort guard) and must NOT kill the first.
-	if _, _, dup := s.beginRestoreRun(context.Background(), "b1", "nextcloud", "n1", time.Hour); dup {
+	if _, _, dup := s.beginRestoreRun(context.Background(), "b1", "nextcloud", "n1", time.Hour, ""); dup {
 		t.Fatal("a duplicate run id must be refused")
 	}
 	if ctx.Err() != nil {
@@ -64,7 +64,7 @@ func TestRestoreCancelRegistry(t *testing.T) {
 	if _, ok := s.cancelRestoreRun("b1"); ok {
 		t.Fatal("cancelling a finished run must report not-found")
 	}
-	if _, _, ok := s.beginRestoreRun(context.Background(), "b1", "nextcloud", "n1", time.Hour); !ok {
+	if _, _, ok := s.beginRestoreRun(context.Background(), "b1", "nextcloud", "n1", time.Hour, ""); !ok {
 		t.Fatal("the id must be reusable after finish()")
 	}
 }
@@ -73,7 +73,7 @@ func TestRestoreCancelRegistry(t *testing.T) {
 // console must not claim the user stopped something they didn't.
 func TestRestoreDeadlineIsNotOperatorCancel(t *testing.T) {
 	s := &Server{store: testStore(t)}
-	ctx, finish, ok := s.beginRestoreRun(context.Background(), "b2", "app", "n1", 20*time.Millisecond)
+	ctx, finish, ok := s.beginRestoreRun(context.Background(), "b2", "app", "n1", 20*time.Millisecond, "")
 	if !ok {
 		t.Fatal("register")
 	}
@@ -96,7 +96,7 @@ func TestCancelRestoreEndpoint(t *testing.T) {
 		t.Fatalf("unknown run: code=%d, want 404", rec.Code)
 	}
 
-	ctx, finish, _ := s.beginRestoreRun(context.Background(), "stack:blog", "stack blog", "n1", time.Hour)
+	ctx, finish, _ := s.beginRestoreRun(context.Background(), "stack:blog", "stack blog", "n1", time.Hour, "")
 	defer finish()
 	rec = httptest.NewRecorder()
 	r = httptest.NewRequest("POST", "/api/restores/stack:blog/cancel", nil)
@@ -133,7 +133,7 @@ func TestCancelRestoreEndpoint(t *testing.T) {
 
 func TestRunningRestoresReportsIDLabelAndStart(t *testing.T) {
 	s := &Server{store: testStore(t)}
-	_, finish, ok := s.beginRestoreRun(context.Background(), "bk-1", "nextcloud", "n1", time.Minute)
+	_, finish, ok := s.beginRestoreRun(context.Background(), "bk-1", "nextcloud", "n1", time.Minute, "")
 	if !ok {
 		t.Fatal("the run must register")
 	}
@@ -158,7 +158,7 @@ func TestRunningRestoresReportsIDLabelAndStart(t *testing.T) {
 func TestRunningRestoresStableOrder(t *testing.T) {
 	s := &Server{store: testStore(t)}
 	for _, id := range []string{"zzz", "aaa", "mmm", "stack:blog"} {
-		_, finish, ok := s.beginRestoreRun(context.Background(), id, id, "n1", time.Minute)
+		_, finish, ok := s.beginRestoreRun(context.Background(), id, id, "n1", time.Minute, "")
 		if !ok {
 			t.Fatalf("%s must register", id)
 		}
@@ -183,7 +183,7 @@ func TestHandleListRestoresShape(t *testing.T) {
 		t.Fatalf("an empty list must serialize as []: %s", body)
 	}
 
-	_, finish, _ := s.beginRestoreRun(context.Background(), "stack:blog", "stack blog", "n1", time.Minute)
+	_, finish, _ := s.beginRestoreRun(context.Background(), "stack:blog", "stack blog", "n1", time.Minute, "")
 	defer finish()
 
 	body := listRestoresBody(t, s)

@@ -8,7 +8,7 @@
 # project, a localhost-only port, and throwaway volumes/containers, all removed
 # on exit. It only ever backs up the one throwaway container it creates.
 #
-# Five cases, selected with E2E_CASE:
+# Nineteen cases, selected with E2E_CASE:
 #
 #   sentinel (default) — the drill above: volume data lost and brought back.
 #   deleted-binds      — the recovery of 2026-10-04: a RUNNING container whose
@@ -16,6 +16,10 @@
 #                        host folder deleted, then is restored IN PLACE. Both must
 #                        come back — the secret as a real file, mode 600, not the
 #                        empty directory Docker invents for a missing file bind.
+#   moved-bind         — a secret-file bind moved by a redeploy after the backup,
+#                        then an in-place restore: the file must land where the
+#                        container mounts it now, and its old path must stay
+#                        unwritten.
 #   stack-folder       — the rest of that night: a Compose project's folder is
 #                        deleted while it runs, then the stack is restored with
 #                        "rebuild stack folder" on. Your own compose file and .env
@@ -27,6 +31,55 @@
 #                        compose file, .env, project files and the secret-file
 #                        bind without stopping or restarting anything, and names
 #                        the data folder only a full restore can bring back.
+#   stack-selection    — a restore that names one of a stack's two services and a
+#                        copy to read from. The named service gets its data back
+#                        from that copy alone; the other is not stopped, restarted
+#                        or written to. With that copy corrupted the restore still
+#                        works and warns that it fell back. A name the stack does
+#                        not have changes nothing.
+#   clone-ownership    — a copy asked to use a name another container holds is
+#                        refused and that container is unchanged; a free name
+#                        works; a standby rehearsal beside a container called
+#                        <target>-standby passes, leaves that container alone and
+#                        removes only its own clone.
+#   clone-sandbox      — a copy of a container holding a device, an extra capability
+#                        and the host's PID namespace gets none of them and no
+#                        network, the log names what it lost, and a PostgreSQL copy
+#                        still gets its data back with no network.
+#   revert-rollback    — a revert to an older image whose backup cannot pass the
+#                        health gate. The rollback must bring back the image, the
+#                        configuration and the data the container had before.
+#   shutdown-holds     — DockBack is stopped while it holds a container paused. On
+#                        SIGTERM it lets the container go before exiting; after
+#                        SIGKILL the restarted instance does. A container somebody
+#                        else paused is left paused throughout.
+#   hook-cleanup       — a pre-hook that changes state and then fails still gets its
+#                        post-hook; a good run ends its window before compressing;
+#                        DockBack killed inside a window runs the post-hook on return.
+#   hold-required      — the socket proxy refuses to stop containers. A backup that
+#                        asked for a stop fails rather than copy live and call it
+#                        consistent, and a stack is not reported as one point in
+#                        time. Pause and live modes still work, and say which they were.
+#   incremental-fidelity — a full then a delta, across a chmod, a chown, a same-size
+#                        write under a preserved mtime, a changed link, an empty
+#                        directory and both type changes, restored and compared.
+#   offsite-envelope   — an offsite copy loses the manifest beside its archive. A
+#                        scrub finds it, Send offsite repairs it without sending
+#                        the archive again, and the offline tool then opens it from
+#                        the destination's files alone, which it could not before.
+#   offsite-window     — a copy deferred by a closed upload window stays deferred
+#                        across a restart, then goes by itself once the window
+#                        opens, with no new backup and no one asking, and only once.
+#   restore-outcome    — a post-restore hook logs an error and the restore still
+#                        succeeds, and the record says so; a repeat restore keeps its
+#                        own record; a restore cut off by SIGKILL reads as interrupted.
+#   clone-redaction    — a copy of a Plex-profile image, which is a tagged alpine and
+#                        holds invented values, comes up with its account token gone
+#                        before its first start, and the original keeps its own.
+#   stack-parity       — a service's saved choices reach its app-consistent stack
+#                        snapshot: its image is bundled, its file index written, the
+#                        paths its profile never keeps left out, and what a group
+#                        cannot honour (export, incremental) recorded rather than dropped.
 #   pg-hash            — #18's content baseline: a PostgreSQL database with a
 #                        timestamptz column is backed up, restored into another
 #                        container, and the restored cluster is then put in a
@@ -36,9 +89,22 @@
 #
 #   ./scripts/e2e.sh
 #   E2E_CASE=pg-hash ./scripts/e2e.sh
+#   E2E_CASE=offsite-envelope ./scripts/e2e.sh
+#   E2E_CASE=offsite-window ./scripts/e2e.sh
+#   E2E_CASE=restore-outcome ./scripts/e2e.sh
+#   E2E_CASE=clone-redaction ./scripts/e2e.sh
+#   E2E_CASE=stack-parity ./scripts/e2e.sh
 #   E2E_CASE=deleted-binds ./scripts/e2e.sh
 #   E2E_CASE=stack-folder ./scripts/e2e.sh
 #   E2E_CASE=files-only ./scripts/e2e.sh
+#   E2E_CASE=stack-selection ./scripts/e2e.sh
+#   E2E_CASE=clone-ownership ./scripts/e2e.sh
+#   E2E_CASE=clone-sandbox ./scripts/e2e.sh
+#   E2E_CASE=revert-rollback ./scripts/e2e.sh
+#   E2E_CASE=shutdown-holds ./scripts/e2e.sh
+#   E2E_CASE=hook-cleanup ./scripts/e2e.sh
+#   E2E_CASE=hold-required ./scripts/e2e.sh
+#   E2E_CASE=incremental-fidelity ./scripts/e2e.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -118,11 +184,28 @@ cleanup() {
   # removable while something built on it still exists.
   assert_no_leaked_images || fail "the run left images on the host"
   rm -f "$JAR" "$IMG_BEFORE"
+  [ -z "$PROXY_OVERRIDE_DIR" ] || rm -rf "$PROXY_OVERRIDE_DIR"
 }
 trap cleanup EXIT
 
 # jget <json-path-python> — read stdin JSON and print an expression of `d`.
 jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
+
+# hold-required: a proxy that refuses to stop containers, the real permission failure.
+# Its ALLOW_STOP setting cannot do it: that only adds an allow, and CONTAINERS allows
+# stop anyway. So a deny goes ahead of every allow in the proxy's own config.
+PROXY_OVERRIDE_DIR=""
+if [ "$E2E_CASE" = "hold-required" ]; then
+  PROXY_OVERRIDE_DIR="$(mktemp -d)"
+  PROXY_TEMPLATE="/usr/local/etc/haproxy/haproxy.cfg.template"
+  PROXY_IMAGE="$(sed -n 's/^ *image: \(tecnativa.*\)$/\1/p' scripts/e2e.compose.yml)"
+  docker run --rm --entrypoint cat "$PROXY_IMAGE" "$PROXY_TEMPLATE" \
+    | sed '/^frontend dockerfrontend/,/bind /{/bind /a\    http-request deny if { path,url_dec -m reg -i ^(/v[\\d\\.]+)?/containers/[a-zA-Z0-9_.-]+/stop }
+}' > "$PROXY_OVERRIDE_DIR/haproxy.cfg.template"
+  grep -q 'http-request deny if' "$PROXY_OVERRIDE_DIR/haproxy.cfg.template" || fail "could not add the deny rule"
+  printf 'services:\n  socket-proxy:\n    volumes:\n      - %s:%s:ro\n' "$PROXY_OVERRIDE_DIR/haproxy.cfg.template" "$PROXY_TEMPLATE" > "$PROXY_OVERRIDE_DIR/override.yml"
+  COMPOSE+=(-f "$PROXY_OVERRIDE_DIR/override.yml")
+fi
 
 step "Build + start isolated stack on $BASE"
 "${COMPOSE[@]}" up -d --build
@@ -155,12 +238,12 @@ find_container() {
   printf '%s' "$cid"
 }
 
-# backup_and_verify <container-id> <target-name> — back up, wait for verified,
-# print the backup id.
+# backup_and_verify <container-id> <target-name> [destination-id] — back up, wait
+# for verified, print the backup id.
 backup_and_verify() {
-  local cid="$1" name="$2" row i
+  local cid="$1" name="$2" dest="${3:-}" row i
   curl -fsS "${auth[@]}" -X POST "$BASE/api/backups" \
-    -d "{\"node_id\":\"local\",\"container_id\":\"$cid\",\"compression\":\"balanced\",\"destinations\":[]}" >/dev/null
+    -d "{\"node_id\":\"local\",\"container_id\":\"$cid\",\"compression\":\"balanced\",\"destinations\":[${dest:+\"$dest\"}]}" >/dev/null
   for i in $(seq 1 60); do
     row="$(curl -fsS -b "$JAR" "$BASE/api/backups?node_id=local&page_size=20" \
       | jget '([b for b in d["items"] if b["target_name"]=="'"$name"'"] or [{}])[0].get("status","")+"/"+([b for b in d["items"] if b["target_name"]=="'"$name"'"] or [{}])[0].get("verified","")')"
@@ -174,6 +257,19 @@ backup_and_verify() {
   done
   curl -fsS -b "$JAR" "$BASE/api/backups?node_id=local&page_size=20" \
     | jget '[b for b in d["items"] if b["target_name"]=="'"$name"'"][0]["id"]'
+}
+
+# log_in — a restart signs everybody out.
+log_in() {
+  local i
+  for i in $(seq 1 60); do
+    curl -fsS "$BASE/healthz" >/dev/null 2>&1 && break
+    [ "$i" = 60 ] && fail "the app never came back"
+    sleep 1
+  done
+  CSRF="$(curl -fsS -c "$JAR" -X POST "$BASE/api/login" -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$DOCKBACK_ADMIN_USER\",\"password\":\"$DOCKBACK_ADMIN_PASSWORD\"}" | jget 'd["csrf"]')"
+  auth=(-b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json')
 }
 
 # table_hashes <backup-id> — the manifest's per-table content baseline, as
@@ -353,6 +449,56 @@ case_deleted_binds() {
   [ "$(tr -d '\n' < "$APP/config/settings.ini")" = "$CONF_CONTENT" ] || fail "the config folder came back with the wrong content"
   docker inspect -f '{{range .Mounts}}{{.RW}} {{end}}' "$TARGET" | grep -q true && fail "a read-only mount became writable"
   printf '\033[1;32mE2E PASSED (deleted-binds): a deleted host folder came back in place — folder and secret file, owner and mode intact.\033[0m\n'
+}
+
+# ── case: moved-bind ─────────────────────────────────────────────────────────
+
+case_moved_bind() {
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-moved-XXXXXX)"
+  local APP="$HOSTDIR/app" KEY_CONTENT="key-$SUFFIX"
+  mkdir -p "$APP"
+  printf '%s' "$KEY_CONTENT" > "$APP/secret.key"
+  chmod 600 "$APP/secret.key"
+
+  step "Create a running container with a secret-file bind, and back it up"
+  docker run -d --name "$TARGET" -v "$APP/secret.key":/run/secrets/app.key:ro alpine sleep 600 >/dev/null
+  local CID BID
+  CID="$(find_container "$TARGET")"
+  BID="$(backup_and_verify "$CID" "$TARGET")"
+  echo "  backup id: $BID"
+
+  step "Redeploy it with the secret moved into a secrets folder, and the file there damaged"
+  docker rm -f "$TARGET" >/dev/null
+  mkdir -p "$APP/secrets"
+  mv "$APP/secret.key" "$APP/secrets/secret.key"
+  printf 'damaged' > "$APP/secrets/secret.key"
+  docker run -d --name "$TARGET" -v "$APP/secrets/secret.key":/run/secrets/app.key:ro alpine sleep 600 >/dev/null
+  CID="$(find_container "$TARGET")"
+
+  step "Restore IN PLACE into the redeployed container"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$BID/restore" \
+    -d "{\"node_id\":\"local\",\"target_id\":\"$CID\",\"volumes\":true,\"database\":false,\"snapshot\":true,\"confirm\":true}" >/dev/null
+
+  step "Wait for the restore to finish"
+  local RLOG="" i finished=""
+  for i in $(seq 1 100); do
+    RLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID/log" || true)"
+    case "$RLOG" in
+      *"Restored container is healthy"*) finished=1; break ;;
+      *"Restore failed"*|*"Restore refused"*|*"rolling back"*|*"did not become healthy"*)
+        printf '%s\n' "$RLOG" | python3 -c "import sys,json;print(chr(10).join('    '+l['level']+' '+l['msg'] for l in json.load(sys.stdin).get('lines',[])[-25:]))" >&2
+        fail "the in-place restore did not succeed" ;;
+    esac
+    echo "  [$i] restoring"
+    sleep 3
+  done
+  [ -n "$finished" ] || fail "the restore did not finish in time"
+
+  step "Assert the secret landed where the container reads it, and nowhere else"
+  [ "$(cat "$APP/secrets/secret.key")" = "$KEY_CONTENT" ] || fail "the file the container mounts was not restored: $(cat "$APP/secrets/secret.key")"
+  [ ! -e "$APP/secret.key" ] || fail "the backup's old path was written instead"
+  [ "$(docker exec "$TARGET" cat /run/secrets/app.key)" = "$KEY_CONTENT" ] || fail "the running container does not see the restored secret"
+  printf '\033[1;32mE2E PASSED (moved-bind): a moved secret-file bind was restored where the container mounts it now, and its old path was left alone.\033[0m\n'
 }
 
 # ── case: stack-folder ───────────────────────────────────────────────────────
@@ -575,7 +721,1051 @@ EOF
     *) fail "the files-only restore did not check the compose file with Docker Compose" ;;
   esac
 
-  printf '\033[1;32mE2E PASSED (files-only): the files came back with the container never stopped, and the missing data was named.\033[0m\n'
+  step "Edit the compose file and .env, then restore the files only again"
+  printf '# edited after the backup\n' >> "$DIR/docker-compose.yml"
+  printf 'APP_MODE=staging\n' > "$DIR/.env"
+  local compose_sum env_sum
+  compose_sum="$(sha256sum < "$DIR/docker-compose.yml")"
+  env_sum="$(sha256sum < "$DIR/.env")"
+  files_only_rerun "$PROJ" "files restored — no service was stopped or changed"
+  [ "$(sha256sum < "$DIR/docker-compose.yml")" = "$compose_sum" ] || fail "files-only replaced the edited compose file"
+  [ "$(sha256sum < "$DIR/.env")" = "$env_sum" ] || fail "files-only replaced the edited .env"
+  ! ls -A "$DIR" | grep -q 'pre-dockback-restore' || fail "files-only renamed an existing file aside: $(ls -A "$DIR" | tr '\n' ' ')"
+  case "$SLOG" in
+    *"kept exactly as they are"*) echo "  the edited files were kept, and the log says so" ;;
+    *) fail "the log does not say the existing files were kept" ;;
+  esac
+
+  step "A stack folder that cannot be written fails the files-only restore"
+  rm -rf "$DIR"
+  : > "$DIR"
+  files_only_rerun "$PROJ" "did not put back every file"
+  rm -f "$DIR"
+  echo "  the restore failed and named what it could not write"
+
+  printf '\033[1;32mE2E PASSED (files-only): the files came back with the container never stopped, existing files were kept, a failed write failed the restore, and the missing data was named.\033[0m\n'
+}
+
+# files_only_rerun starts another files-only restore of a stack and waits until
+# its log says want once more than it did before, leaving the log in SLOG. The
+# stack's log is shared across runs, so earlier lines are counted out.
+files_only_rerun() {
+  local project="$1" want="$2" before i
+  before="$(curl -fsS -b "$JAR" "$BASE/api/backups/stack:$project/log" | { grep -o "$want" || true; } | wc -l)"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/nodes/local/stacks/$project/restore?files_only=true" >/dev/null
+  for i in $(seq 1 60); do
+    SLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/stack:$project/log" || true)"
+    [ "$(printf '%s' "$SLOG" | { grep -o "$want" || true; } | wc -l)" -gt "$before" ] && return 0
+    echo "  [$i] restoring"
+    sleep 3
+  done
+  fail "the files-only restore never logged: $want"
+}
+
+# ── case: stack-selection ────────────────────────────────────────────────────
+
+case_stack_selection() {
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-select-XXXXXX)"
+  local PROJ="dback-e2e-select-$SUFFIX"
+  local DIR="$HOSTDIR/$PROJ"
+  local KEPT="$PROJ-kept-1" LEFT_OUT="$PROJ-left-out-1"
+  local ORIGINAL="original-$SUFFIX" TAMPERED="tampered-$SUFFIX" DEST_NAME="e2e-offsite"
+  EXTRA_PROJECTS+=("$PROJ")
+  local compose_in_dir=(docker compose -p "$PROJ" --project-directory "$DIR" -f "$DIR/docker-compose.yml")
+  marker() { docker exec "$1" cat /data/marker | tr -d '[:space:]'; }
+  write_markers() {
+    local c
+    for c in "$KEPT" "$LEFT_OUT"; do docker exec "$c" sh -c "echo '$1' > /data/marker"; done
+  }
+  # wait_for_stack_restores <count> — until that many restores of the stack finished.
+  wait_for_stack_restores() {
+    local i
+    for i in $(seq 1 100); do
+      SLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/stack:$PROJ/log" || true)"
+      case "$SLOG" in
+        *'"level":"ERR"'*|*"Stack restore CANCELED"*|*"What happened to each service"*)
+          printf '%s\n' "$SLOG" | python3 -c "import sys,json;print(chr(10).join('    '+l['level']+' '+l['msg'] for l in json.load(sys.stdin).get('lines',[])[-30:]))" >&2
+          fail "the stack restore did not succeed" ;;
+      esac
+      [ "$(printf '%s' "$SLOG" | jget 'sum("restored — all" in l["msg"] for l in d.get("lines",[]))')" = "$1" ] && return 0
+      echo "  [$i] restoring"
+      sleep 3
+    done
+    fail "the stack restore did not finish in time"
+  }
+
+  step "Stand up a two-service Compose project, each service with its own volume"
+  mkdir -p "$DIR"
+  cat > "$DIR/docker-compose.yml" <<EOF
+services:
+  kept:
+    image: alpine
+    command: ["sleep", "600"]
+    volumes:
+      - kept-data:/data
+  left-out:
+    image: alpine
+    command: ["sleep", "600"]
+    volumes:
+      - left-out-data:/data
+volumes:
+  kept-data:
+  left-out-data:
+EOF
+  "${compose_in_dir[@]}" up -d --quiet-pull >/dev/null 2>&1 || fail "the test stack did not come up"
+  write_markers "$ORIGINAL"
+
+  step "Add a second copy for the restore to read from"
+  local DEST_ID
+  DEST_ID="$(curl -fsS "${auth[@]}" -X POST "$BASE/api/destinations" \
+    -d "{\"name\":\"$DEST_NAME\",\"type\":\"local\",\"config\":{\"path\":\"/app/backups/$DEST_NAME\"}}" | jget 'd["id"]')"
+  [ -n "$DEST_ID" ] || fail "could not add the destination"
+
+  step "Back up both services to it"
+  local KEPT_BID LEFT_OUT_BID
+  KEPT_BID="$(backup_and_verify "$(find_container "$KEPT")" "$KEPT" "$DEST_ID")"
+  LEFT_OUT_BID="$(backup_and_verify "$(find_container "$LEFT_OUT")" "$LEFT_OUT" "$DEST_ID")"
+  echo "  backup ids: $KEPT_BID $LEFT_OUT_BID"
+
+  step "Assert the plan offers that copy for both services"
+  local OFFERED="" i
+  for i in $(seq 1 30); do
+    OFFERED="$(curl -fsS -b "$JAR" "$BASE/api/nodes/local/stacks/$PROJ/restore-plan" \
+      | jget '[c["services"] for c in d.get("source_copies") or [] if c["id"]=="'"$DEST_ID"'"]')"
+    [ "$OFFERED" = "[2]" ] && break
+    [ "$i" = 30 ] && fail "the plan does not offer the copy for both services (got $OFFERED)"
+    sleep 2
+  done
+
+  step "The damage: both services' data changes"
+  write_markers "$TAMPERED"
+  local LEFT_OUT_ID LEFT_OUT_STARTED
+  LEFT_OUT_ID="$(docker inspect -f '{{.Id}}' "$LEFT_OUT")"
+  LEFT_OUT_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$LEFT_OUT")"
+
+  # No safety snapshot: it would be the service's newest backup for the second
+  # restore below, which has to read this same backup again.
+  local RESTORE_URL="$BASE/api/nodes/local/stacks/$PROJ/restore?service=kept&source=$DEST_ID&snapshot=false"
+
+  step "Restore one service, from the chosen copy"
+  curl -fsS "${auth[@]}" -X POST "$RESTORE_URL" >/dev/null
+  local SLOG=""
+  wait_for_stack_restores 1
+
+  step "Assert only the named service changed"
+  [ "$(marker "$KEPT")" = "$ORIGINAL" ] || fail "the named service did not get its data back (got '$(marker "$KEPT")')"
+  [ "$(marker "$LEFT_OUT")" = "$TAMPERED" ] || fail "the service left out was overwritten"
+  [ "$(docker inspect -f '{{.Id}}' "$LEFT_OUT")" = "$LEFT_OUT_ID" ] || fail "the service left out was recreated"
+  [ "$(docker inspect -f '{{.State.StartedAt}}' "$LEFT_OUT")" = "$LEFT_OUT_STARTED" ] || fail "the service left out was restarted"
+  case "$SLOG" in
+    *"Restoring 1 of the stack's services"*) echo "  the run says it covered one service" ;;
+    *) fail "the run log does not say the restore was narrowed" ;;
+  esac
+
+  step "Assert the named service was read from the chosen copy alone"
+  local RESTORE_LOG
+  RESTORE_LOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/$KEPT_BID/log" || true)"
+  case "$RESTORE_LOG" in
+    *"Restoring from local"*) fail "the chosen copy was not the only one read: the local copy was too" ;;
+    *"Restoring from $DEST_NAME (dest)"*) echo "  read from $DEST_NAME" ;;
+    *) fail "the log does not name the copy the service was read from" ;;
+  esac
+  case "$SLOG" in
+    *"no readable copy on the chosen source"*) fail "the console warned of a fallback that did not happen" ;;
+  esac
+
+  step "Corrupt the chosen copy: the restore must still work, and say it fell back"
+  local KEPT_KEY
+  KEPT_KEY="$(curl -fsS -b "$JAR" "$BASE/api/backups/$KEPT_BID" | jget 'd["storage_key"]')"
+  docker run --rm -v "${PROJECT}_e2e-backups":/b alpine sh -c "printf corrupted >> '/b/$DEST_NAME/$KEPT_KEY'" \
+    || fail "could not corrupt the chosen copy"
+  write_markers "$TAMPERED"
+  curl -fsS "${auth[@]}" -X POST "$RESTORE_URL" >/dev/null
+  wait_for_stack_restores 2
+  [ "$(marker "$KEPT")" = "$ORIGINAL" ] || fail "the restore did not fall back to a good copy (got '$(marker "$KEPT")')"
+  case "$SLOG" in
+    *"$KEPT: no readable copy on the chosen source — restoring from local (local) instead"*) echo "  the console says it fell back" ;;
+    *) fail "the restore read another copy than the chosen one without saying so" ;;
+  esac
+
+  step "A name the stack does not have is refused, and nothing is touched"
+  write_markers "$TAMPERED"
+  local KEPT_STARTED refused=""
+  KEPT_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$KEPT")"
+  # The finished run's lock is released just after its last log line.
+  for i in $(seq 1 10); do
+    curl -fsS "${auth[@]}" -X POST "$BASE/api/nodes/local/stacks/$PROJ/restore?service=ghost" >/dev/null 2>&1 && break
+    [ "$i" = 10 ] && fail "the stack stayed locked after the restore finished"
+    sleep 1
+  done
+  for i in $(seq 1 20); do
+    case "$(curl -fsS -b "$JAR" "$BASE/api/backups/stack:$PROJ/log" || true)" in
+      *"no service named ghost"*) refused=1; break ;;
+    esac
+    sleep 1
+  done
+  [ -n "$refused" ] || fail "an unknown service was not refused"
+  [ "$(marker "$KEPT")" = "$TAMPERED" ] || fail "a refused restore changed the data"
+  [ "$(marker "$LEFT_OUT")" = "$TAMPERED" ] || fail "a refused restore changed the data"
+  [ "$(docker inspect -f '{{.State.StartedAt}}' "$KEPT")" = "$KEPT_STARTED" ] || fail "a refused restore restarted a service"
+  [ "$(docker inspect -f '{{.State.StartedAt}}' "$LEFT_OUT")" = "$LEFT_OUT_STARTED" ] || fail "a refused restore restarted a service"
+
+  printf '\033[1;32mE2E PASSED (stack-selection): the named service came back from the chosen copy, and the other was never touched.\033[0m\n'
+}
+
+# ── case: clone-ownership ────────────────────────────────────────────────────
+
+case_clone_ownership() {
+  local SENTINEL_NAME="$TARGET-sentinel" STANDBY_NEIGHBOUR="$TARGET-standby"
+  local COPY="$TARGET-copy" SECOND_NODE="e2e-second-node"
+  EXTRA_CONTAINERS+=("$SENTINEL_NAME" "$STANDBY_NEIGHBOUR" "$COPY")
+  # state <container> — everything a copy or a rehearsal must leave alone.
+  state() { docker inspect -f '{{.Id}} {{.State.Running}} {{.State.StartedAt}}' "$1"; docker exec "$1" cat /marker; }
+
+  step "Create a target to back up, and two unrelated containers"
+  docker run -d --name "$TARGET" -e APP_MARKER="$SENTINEL" alpine sleep 600 >/dev/null
+  local c
+  for c in "$SENTINEL_NAME" "$STANDBY_NEIGHBOUR"; do
+    docker run -d --name "$c" alpine sh -c "echo '$SENTINEL' > /marker; exec sleep 600" >/dev/null
+  done
+  local CID BID SENTINEL_BEFORE NEIGHBOUR_BEFORE i
+  CID="$(find_container "$TARGET")"
+  BID="$(backup_and_verify "$CID" "$TARGET")"
+  for i in $(seq 1 10); do
+    SENTINEL_BEFORE="$(state "$SENTINEL_NAME" 2>/dev/null || true)"
+    case "$SENTINEL_BEFORE" in *"$SENTINEL"*) break ;; esac
+    sleep 1
+  done
+  NEIGHBOUR_BEFORE="$(state "$STANDBY_NEIGHBOUR")"
+
+  # copy_status <name> <recreate> — the HTTP status of a restore-as-a-copy request.
+  copy_status() {
+    curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" -X POST "$BASE/api/backups/$BID/restore" \
+      -d "{\"node_id\":\"local\",\"target_id\":\"$CID\",\"volumes\":true,\"confirm\":true,\"as_name\":\"$1\",\"isolated\":true,\"recreate\":$2}"
+  }
+
+  step "A copy under a name in use is refused, with or without recreate"
+  [ "$(copy_status "$SENTINEL_NAME" false)" = "409" ] || fail "a copy under a name in use was not refused"
+  [ "$(copy_status "$SENTINEL_NAME" true)" = "409" ] || fail "a recreating copy under a name in use was not refused"
+  [ "$(state "$SENTINEL_NAME")" = "$SENTINEL_BEFORE" ] || fail "the container holding the name changed"
+
+  step "A copy that is not isolated is refused"
+  [ "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" -X POST "$BASE/api/backups/$BID/restore" \
+    -d "{\"node_id\":\"local\",\"target_id\":\"$CID\",\"volumes\":true,\"confirm\":true,\"as_name\":\"$COPY\"}")" = "400" ] \
+    || fail "a copy that is not isolated was not refused"
+
+  step "A free name still works"
+  [ "$(copy_status "$COPY" false)" = "202" ] || fail "a copy under a free name was not accepted"
+  for i in $(seq 1 40); do
+    [ "$(docker inspect -f '{{.State.Running}}' "$COPY" 2>/dev/null || true)" = "true" ] && break
+    [ "$i" = 40 ] && fail "the copy never came up"
+    sleep 3
+  done
+  echo "  copy is up beside the original"
+
+  step "Rehearse standby onto a second node, beside a container called <target>-standby"
+  local SECOND_ID
+  SECOND_ID="$(curl -fsS "${auth[@]}" -X POST "$BASE/api/nodes" \
+    -d "{\"name\":\"$SECOND_NODE\",\"transport\":\"tcp-proxy\",\"address\":\"tcp://socket-proxy:2375\"}" | jget 'd["id"]')"
+  [ -n "$SECOND_ID" ] || fail "could not add the second node"
+  curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/standby" \
+    -d "{\"standby_node\":\"$SECOND_ID\",\"interval_days\":30}" >/dev/null
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/nodes/local/containers/$CID/standby/run" >/dev/null
+  local RESULT=""
+  for i in $(seq 1 60); do
+    RESULT="$(curl -fsS -b "$JAR" "$BASE/api/nodes/local/containers/$CID/standby" || true)"
+    # A rehearsal that has not run yet also reads last_ok false; last_run says it ran.
+    case "$RESULT" in
+      *'"last_run":0'*|*'"last_run":null'*) ;;
+      *'"last_ok":true'*) break ;;
+      *'"last_ok":false'*) fail "the standby rehearsal failed: $RESULT" ;;
+    esac
+    [ "$i" = 60 ] && fail "the standby rehearsal did not finish: $RESULT"
+    sleep 3
+  done
+  echo "  rehearsal passed"
+
+  step "Assert the neighbour is unchanged and the rehearsal left nothing"
+  [ "$(state "$STANDBY_NEIGHBOUR")" = "$NEIGHBOUR_BEFORE" ] || fail "the rehearsal touched a container it did not create"
+  [ -z "$(docker ps -a --format '{{.Names}}' | grep -F "$STANDBY_NEIGHBOUR-" || true)" ] || fail "the rehearsal left its clone behind"
+  [ "$(state "$SENTINEL_NAME")" = "$SENTINEL_BEFORE" ] || fail "the container holding the name changed"
+
+  printf '\033[1;32mE2E PASSED (clone-ownership): copies and rehearsals created their own containers and touched nothing else.\033[0m\n'
+}
+
+# ── case: clone-sandbox ──────────────────────────────────────────────────────
+
+case_clone_sandbox() {
+  local COPY="$TARGET-copy" LISTENER="$TARGET-listener" PG="$TARGET-pg" PG_COPY="$TARGET-pg-copy"
+  EXTRA_CONTAINERS+=("$COPY" "$LISTENER" "$PG" "$PG_COPY")
+
+  # copy_of <backup-id> <container-id> <name> — request a copy, wait until it runs.
+  copy_of() {
+    curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$1/restore" \
+      -d "{\"node_id\":\"local\",\"target_id\":\"$2\",\"volumes\":true,\"database\":true,\"confirm\":true,\"as_name\":\"$3\",\"isolated\":true}" >/dev/null
+    local i
+    for i in $(seq 1 40); do
+      [ "$(docker inspect -f '{{.State.Running}}' "$3" 2>/dev/null || true)" = "true" ] && return 0
+      sleep 3
+    done
+    fail "the copy $3 never came up"
+  }
+
+  step "Back up a source holding a device, an extra capability and the host's PID namespace"
+  docker run -d --name "$TARGET" --cap-add NET_ADMIN --pid host \
+    --device /dev/null:/dev/sentinel-device alpine sleep 600 >/dev/null
+  local CID BID
+  CID="$(find_container "$TARGET")"
+  BID="$(backup_and_verify "$CID" "$TARGET")"
+
+  step "Start a listener the source's bridge can reach"
+  docker run -d --name "$LISTENER" alpine sh -c 'while true; do echo reached | nc -l -p 8080; done' >/dev/null
+  local LISTENER_IP
+  LISTENER_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$LISTENER")"
+
+  step "Bring up a copy"
+  copy_of "$BID" "$CID" "$COPY"
+
+  step "Assert the copy has none of it"
+  [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$COPY")" = "none" ] || fail "the copy has a network"
+  [ "$(docker inspect -f '{{len .HostConfig.CapAdd}} {{len .HostConfig.Devices}} {{.HostConfig.PidMode}}' "$COPY")" = "0 0 " ] \
+    || fail "the copy kept a host power: $(docker inspect -f '{{.HostConfig.CapAdd}} {{.HostConfig.Devices}} {{.HostConfig.PidMode}}' "$COPY")"
+  docker exec "$COPY" test ! -e /dev/sentinel-device || fail "the copy has the source's device"
+  docker exec "$COPY" nc -w 2 "$LISTENER_IP" 8080 >/dev/null 2>&1 && fail "the copy reached a listener on the bridge"
+  docker exec "$COPY" nc -w 2 1.1.1.1 53 </dev/null >/dev/null 2>&1 && fail "the copy reached the internet"
+  [ "$(docker exec "$TARGET" nc -w 2 "$LISTENER_IP" 8080 2>/dev/null | tr -d '[:space:]')" = "reached" ] \
+    || fail "the source cannot reach the listener either, so this proved nothing"
+  echo "  no network, no device, no capability, no host namespace"
+
+  step "Assert the log names what the copy lost"
+  case "$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID/log" || true)" in
+    *"capabilities NET_ADMIN"*"device /dev/null"*"shared PID namespace"*) echo "  named" ;;
+    *) fail "the log does not name what the sandbox removed" ;;
+  esac
+
+  step "The documented way out: an operator can still put a copy on a network"
+  docker network disconnect none "$COPY" || fail "could not take the copy off 'none'"
+  docker network connect bridge "$COPY" || fail "could not attach the copy to a network"
+  [ "$(docker exec "$COPY" nc -w 2 "$LISTENER_IP" 8080 2>/dev/null | tr -d '[:space:]')" = "reached" ] || fail "the attached copy cannot reach the listener"
+
+  step "A database copy still gets its data back with no network"
+  docker run -d --name "$PG" -e POSTGRES_PASSWORD=e2e postgres:16-alpine >/dev/null
+  # Retried, not gated on pg_isready: the image's init server answers it too, and
+  # then shuts down under the first connection.
+  local i
+  for i in $(seq 1 60); do
+    docker exec "$PG" psql -U postgres -q -c "create table marker(v text); insert into marker values ('$SENTINEL');" >/dev/null 2>&1 && break
+    [ "$i" = 60 ] && fail "seeding failed"
+    sleep 1
+  done
+  local PG_CID PG_BID
+  PG_CID="$(find_container "$PG")"
+  PG_BID="$(backup_and_verify "$PG_CID" "$PG")"
+  copy_of "$PG_BID" "$PG_CID" "$PG_COPY"
+  for i in $(seq 1 40); do
+    [ "$(docker exec "$PG_COPY" psql -U postgres -Atqc 'select v from marker' 2>/dev/null || true)" = "$SENTINEL" ] && break
+    [ "$i" = 40 ] && fail "the database copy never got its data"
+    sleep 3
+  done
+  [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$PG_COPY")" = "none" ] || fail "the database copy has a network"
+  echo "  the database copy has its rows"
+
+  printf '\033[1;32mE2E PASSED (clone-sandbox): copies came up with no network and no host powers, and a database copy still got its data.\033[0m\n'
+}
+
+# ── case: revert-rollback ────────────────────────────────────────────────────
+
+case_revert_rollback() {
+  local OLD_IMAGE="alpine:3.20" NEW_IMAGE="alpine:latest" HEALTH_TIMEOUT_SECONDS=30
+  local OLD_MARKER="old-$SUFFIX" NEW_MARKER="new-$SUFFIX"
+  docker volume create "$VOL" >/dev/null
+  marker() { docker run --rm -v "$VOL":/d:ro alpine cat /d/marker | tr -d '[:space:]'; }
+  image_of() { docker inspect -f '{{.Config.Image}}' "$TARGET"; }
+
+  step "Back up the container on the older image, with a health check that always fails"
+  docker run -d --name "$TARGET" -v "$VOL":/data --health-cmd false --health-interval 2s --health-retries 1 \
+    "$OLD_IMAGE" sh -c "echo '$OLD_MARKER' > /data/marker; exec sleep 600" >/dev/null
+  local BID
+  BID="$(backup_and_verify "$(find_container "$TARGET")" "$TARGET")"
+
+  step "Upgrade it: a newer image, no health check, newer data"
+  docker rm -f "$TARGET" >/dev/null
+  docker run -d --name "$TARGET" -v "$VOL":/data "$NEW_IMAGE" sh -c "echo '$NEW_MARKER' > /data/marker; exec sleep 600" >/dev/null
+  local NEW_CID="" i
+  for i in $(seq 1 30); do
+    NEW_CID="$(curl -fsS -b "$JAR" "$BASE/api/nodes/local/containers?q=$TARGET&page_size=5" \
+      | jget '[c["id"] for c in d["containers"] if c["image"]=="'"$NEW_IMAGE"'"][0] if [c for c in d["containers"] if c["image"]=="'"$NEW_IMAGE"'"] else ""' 2>/dev/null || true)"
+    [ -n "$NEW_CID" ] && break
+    sleep 2
+  done
+  [ -n "$NEW_CID" ] || fail "the upgraded container was not discovered"
+
+  step "Shorten the health gate, then revert"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/settings" -d "{\"restore.health_timeout_seconds\":\"$HEALTH_TIMEOUT_SECONDS\"}" >/dev/null \
+    || fail "could not shorten the health gate"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$BID/restore" \
+    -d "{\"node_id\":\"local\",\"target_id\":\"$NEW_CID\",\"volumes\":true,\"database\":true,\"snapshot\":true,\"recreate\":true,\"confirm\":true}" >/dev/null
+
+  step "Wait for the rollback"
+  local RLOG="" rolled=""
+  for i in $(seq 1 80); do
+    RLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID/log" || true)"
+    case "$RLOG" in
+      *"Rolled back to the pre-restore snapshot"*) rolled=1; break ;;
+      *"Rollback to the safety snapshot FAILED"*) fail "the rollback failed" ;;
+    esac
+    sleep 3
+  done
+  [ -n "$rolled" ] || fail "the restore never rolled back"
+
+  step "Assert the image, the configuration and the data are what they were"
+  [ "$(image_of)" = "$NEW_IMAGE" ] || fail "rolled back into the wrong image: $(image_of), with $NEW_IMAGE's data"
+  [ "$(docker inspect -f '{{if .Config.Healthcheck}}{{.Config.Healthcheck.Test}}{{end}}' "$TARGET")" = "" ] || fail "the failed revert's health check survived the rollback"
+  [ "$(marker)" = "$NEW_MARKER" ] || fail "the data is not what it was (got '$(marker)')"
+  [ "$(docker inspect -f '{{.State.Running}}' "$TARGET")" = "true" ] || fail "the container is not running after the rollback"
+
+  printf '\033[1;32mE2E PASSED (revert-rollback): the rollback brought back the image, configuration and data.\033[0m\n'
+}
+
+# ── case: shutdown-holds ─────────────────────────────────────────────────────
+
+case_shutdown_holds() {
+  local OPERATOR_PAUSED="$TARGET-operator" APP="$PROJECT-backup-app-1" LARGE_FILE_MB=400 i
+  EXTRA_CONTAINERS+=("$OPERATOR_PAUSED")
+  is_paused() { [ "$(docker inspect -f '{{.State.Paused}}' "$1")" = "true" ]; }
+
+  # A file rewritten for as long as the container runs, so the copy made while it
+  # is held takes long enough to stop DockBack during it.
+  step "Create a container that keeps rewriting a large file, and one somebody else paused"
+  docker volume create "$VOL" >/dev/null
+  docker run -d --name "$TARGET" -v "$VOL":/data alpine sh -c \
+    "while true; do dd if=/dev/zero of=/data/large bs=1M count=$LARGE_FILE_MB 2>/dev/null; done" >/dev/null
+  docker run -d --name "$OPERATOR_PAUSED" alpine sleep 600 >/dev/null
+  docker pause "$OPERATOR_PAUSED" >/dev/null
+  local CID
+  CID="$(find_container "$TARGET")"
+
+  # stop_during_hold <signal> — start a backup, wait for its pause, send the signal.
+  stop_during_hold() {
+    curl -fsS "${auth[@]}" -X POST "$BASE/api/backups" \
+      -d "{\"node_id\":\"local\",\"container_id\":\"$CID\",\"compression\":\"balanced\",\"destinations\":[]}" >/dev/null
+    for i in $(seq 1 1500); do
+      is_paused "$TARGET" && break
+      [ "$i" = 1500 ] && fail "the backup never paused the container"
+      sleep 0.1
+    done
+    docker kill -s "$1" "$APP" >/dev/null
+    for i in $(seq 1 90); do
+      [ "$(docker inspect -f '{{.State.Running}}' "$APP")" = "false" ] && return 0
+      sleep 1
+    done
+    fail "DockBack did not exit after $1"
+  }
+
+  step "SIGTERM during the hold: the container is released before DockBack exits"
+  stop_during_hold TERM
+  is_paused "$TARGET" && fail "DockBack exited on SIGTERM and left the container paused"
+  [ "$(docker inspect -f '{{.State.ExitCode}}' "$APP")" = "0" ] || fail "a clean drain should exit 0, got $(docker inspect -f '{{.State.ExitCode}}' "$APP")"
+  echo "  released, and DockBack exited cleanly"
+
+  step "Bring DockBack back; the interrupted backup runs again and pauses again"
+  docker start "$APP" >/dev/null
+  log_in
+  for i in $(seq 1 1500); do
+    is_paused "$TARGET" && break
+    sleep 0.1
+  done
+  for i in $(seq 1 300); do
+    is_paused "$TARGET" || break
+    sleep 1
+  done
+  is_paused "$TARGET" && fail "the re-run backup never let the container go"
+  # Released is not finished: a backup requested before it finishes would join it.
+  for i in $(seq 1 120); do
+    [ "$(curl -fsS -b "$JAR" "$BASE/api/backups?node_id=local&page_size=5" | jget 'sum(b["status"]=="running" for b in d["items"])')" = "0" ] && break
+    [ "$i" = 120 ] && fail "the re-run backup never finished"
+    sleep 2
+  done
+  sleep 3
+
+  step "SIGKILL during the hold: nothing can release it until DockBack is back"
+  stop_during_hold KILL
+  is_paused "$TARGET" || fail "the container was not left paused, so this proves nothing"
+  docker start "$APP" >/dev/null
+  log_in
+  for i in $(seq 1 30); do
+    is_paused "$TARGET" || break
+    sleep 1
+  done
+  is_paused "$TARGET" && fail "the restarted DockBack did not release the hold it owned"
+  echo "  released by the restarted instance"
+
+  step "Assert the container somebody else paused is still paused"
+  is_paused "$OPERATOR_PAUSED" || fail "DockBack unpaused a container it did not pause"
+
+  printf '\033[1;32mE2E PASSED (shutdown-holds): holds were released on SIGTERM and after SIGKILL, and only those.\033[0m\n'
+}
+
+# ── case: hook-cleanup ───────────────────────────────────────────────────────
+
+case_hook_cleanup() {
+  local APP="$PROJECT-backup-app-1" HOOK_LOG="/tmp/hooks.log" i
+  docker run -d --name "$TARGET" alpine sleep 900 >/dev/null
+  local CID
+  CID="$(find_container "$TARGET")"
+  # set_hooks <pre-line> — the post-hook is always the same line.
+  set_hooks() {
+    curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/hooks" \
+      -d "{\"pre\":[\"$1\"],\"post\":[\"echo off >> $HOOK_LOG\"]}" >/dev/null
+    docker exec "$TARGET" sh -c ": > $HOOK_LOG"
+  }
+  hook_log() { docker exec "$TARGET" cat "$HOOK_LOG" | tr '\n' ' '; }
+  start_backup() {
+    curl -fsS "${auth[@]}" -X POST "$BASE/api/backups" \
+      -d "{\"node_id\":\"local\",\"container_id\":\"$CID\",\"compression\":\"balanced\",\"destinations\":[]}" | jget 'd.get("backup_id") or d.get("id") or ""'
+  }
+  wait_for_hook_log() {
+    for i in $(seq 1 60); do
+      [ "$(hook_log)" = "$1" ] && return 0
+      sleep 1
+    done
+    fail "$2 (hook log: '$(hook_log)')"
+  }
+
+  step "A pre-hook that changes state and then fails still gets its post-hook"
+  set_hooks "echo on >> $HOOK_LOG; exit 1"
+  start_backup >/dev/null
+  wait_for_hook_log "on off " "the post-hook did not run after a failed pre-hook"
+  echo "  undone"
+
+  step "A good run ends its window before it compresses"
+  set_hooks "echo on >> $HOOK_LOG"
+  local BID
+  BID="$(backup_and_verify "$CID" "$TARGET")"
+  [ "$(hook_log)" = "on off " ] || fail "the hooks did not pair (hook log: '$(hook_log)')"
+  curl -fsS -b "$JAR" "$BASE/api/backups/$BID/log" | python3 -c '
+import json, sys
+msgs = [l["msg"] for l in json.load(sys.stdin)["lines"]]
+post = next(i for i, m in enumerate(msgs) if m.startswith("post-hook"))
+tail = next(i for i, m in enumerate(msgs) if m.startswith("Compressing"))
+assert post < tail, "the post-hook ran at line %d, after compression began at line %d" % (post, tail)
+print("  post-hook ran before compression")
+' || fail "the window lasted into the upload"
+
+  step "DockBack killed inside a window runs the post-hook when it returns"
+  set_hooks "echo on >> $HOOK_LOG; sleep 300"
+  start_backup >/dev/null
+  wait_for_hook_log "on " "the pre-hook never started"
+  docker kill -s KILL "$APP" >/dev/null
+  docker start "$APP" >/dev/null
+  # The interrupted backup then runs again and opens a new window, so only the
+  # start of the log is this one's.
+  for i in $(seq 1 60); do
+    case "$(hook_log)" in "on off "*) break ;; esac
+    [ "$i" = 60 ] && fail "the restarted DockBack did not run the post-hook (hook log: '$(hook_log)')"
+    sleep 1
+  done
+
+  printf '\033[1;32mE2E PASSED (hook-cleanup): every pre-hook got its post-hook once, before the upload and across a crash.\033[0m\n'
+}
+
+# ── case: hold-required ──────────────────────────────────────────────────────
+
+case_hold_required() {
+  local PROJ="dback-e2e-hold-$SUFFIX" i
+  EXTRA_PROJECTS+=("$PROJ")
+  docker volume create "$VOL" >/dev/null
+  docker run -d --name "$TARGET" -v "$VOL":/data alpine sh -c "echo x > /data/f; exec sleep 600" >/dev/null
+  local CID STARTED
+  CID="$(find_container "$TARGET")"
+  STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$TARGET")"
+
+  # backup_with <pause-mode> — run a backup; print "<status>|<achieved>|<error>".
+  backup_with() {
+    local id="" status=""
+    id="$(curl -fsS "${auth[@]}" -X POST "$BASE/api/backups" \
+      -d "{\"node_id\":\"local\",\"container_id\":\"$CID\",\"compression\":\"balanced\",\"destinations\":[],\"pause_mode\":\"$1\"}" | jget 'd["backup_id"]')"
+    for i in $(seq 1 60); do
+      status="$(curl -fsS -b "$JAR" "$BASE/api/backups/$id" | jget 'd["status"]+"/"+d.get("verified","")')"
+      case "$status" in failed/*|success/verified|success/failed) break ;; esac
+      sleep 2
+    done
+    curl -fsS -b "$JAR" "$BASE/api/backups/$id" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+man = json.loads(d.get("manifest_json") or "{}")
+print("|".join([d["status"], man.get("quiesce_achieved", ""), d.get("error", "")]))'
+  }
+
+  step "A backup that asked for a stop, which the proxy refuses, fails"
+  local RESULT
+  RESULT="$(backup_with stop)"
+  echo "  $RESULT" | cut -c1-160
+  case "$RESULT" in failed\|*) ;; *) fail "a backup succeeded without the stop it asked for: $RESULT" ;; esac
+  case "$RESULT" in *"could not stop"*) ;; *) fail "the failure does not say what happened: $RESULT" ;; esac
+  [ "$(docker inspect -f '{{.State.StartedAt}} {{.State.Running}}' "$TARGET")" = "$STARTED true" ] || fail "the container was disturbed"
+
+  step "Pause and live modes still work, and say what they were"
+  RESULT="$(backup_with pause)"
+  case "$RESULT" in success\|pause\|*) echo "  pause: achieved pause" ;; *) fail "pause mode: $RESULT" ;; esac
+  RESULT="$(backup_with none)"
+  case "$RESULT" in success\|live\|*) echo "  none: recorded as live" ;; *) fail "live mode: $RESULT" ;; esac
+
+  step "A stack whose stop is refused is not reported as one point in time"
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-hold-XXXXXX)"
+  cat > "$HOSTDIR/docker-compose.yml" <<EOF
+services:
+  one:
+    image: alpine
+    command: ["sleep", "600"]
+    volumes: [one-data:/data]
+  two:
+    image: alpine
+    command: ["sleep", "600"]
+    volumes: [two-data:/data]
+volumes:
+  one-data:
+  two-data:
+EOF
+  docker compose -p "$PROJ" --project-directory "$HOSTDIR" -f "$HOSTDIR/docker-compose.yml" up -d --quiet-pull >/dev/null 2>&1 || fail "the test stack did not come up"
+  find_container "$PROJ-one-1" >/dev/null
+  find_container "$PROJ-two-1" >/dev/null
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/nodes/local/stacks/$PROJ/backup" -d '{"consistent":true,"pause_mode":"stop"}' >/dev/null
+  local SLOG="" finished=""
+  for i in $(seq 1 60); do
+    SLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/stack:$PROJ/log" || true)"
+    case "$SLOG" in
+      *"App-consistent snapshot complete"*) fail "the stack claimed one point in time without its holds" ;;
+      *"App-consistent snapshot failed"*) finished=1; break ;;
+    esac
+    sleep 2
+  done
+  [ -n "$finished" ] || fail "the stack backup never finished"
+  [ "$(curl -fsS -b "$JAR" "$BASE/api/nodes/local/stacks/$PROJ/groups" | jget 'sum(1 for g in (d or []) if g["complete"])')" = "0" ] \
+    || fail "the group is offered as a complete snapshot"
+  for s in one two; do
+    [ "$(docker inspect -f '{{.State.Running}}' "$PROJ-$s-1")" = "true" ] || fail "service $s was left down"
+  done
+  echo "  failed, not offered as a snapshot, and both services still run"
+
+  printf '\033[1;32mE2E PASSED (hold-required): a refused hold failed the backup instead of being called consistent.\033[0m\n'
+}
+
+# ── case: incremental-fidelity ───────────────────────────────────────────────
+
+case_incremental_fidelity() {
+  local i MARK_MTIME="202001010000.00"
+  docker volume create "$VOL" >/dev/null
+  docker run -d --name "$TARGET" -v "$VOL":/data alpine sleep 900 >/dev/null
+  # in_volume <script> — run a script against the volume, as root, from outside.
+  in_volume() { docker exec "$TARGET" sh -c "cd /data && $1"; }
+  # tree — everything a restore has to bring back, one sorted line per entry.
+  tree() {
+    in_volume 'find . -mindepth 1 -exec stat -c "%n|%F|%a|%u|%g|%s" {} + | sort; for f in chmodded rewritten link-target/child "newline
+name"; do [ -e "$f" ] && echo "$f=$(cat "$f")"; done; [ -L link ] && readlink link; true'
+  }
+
+  in_volume 'echo a > chmodded; chmod 644 chmodded; echo a > chowned; echo one > rewritten; touch -t '"$MARK_MTIME"' rewritten
+    ln -s old-target link; echo f > file-to-dir; mkdir dir-to-file; echo x > dir-to-file/inner; echo gone > deleted; mkdir emptied-dir
+    mkdir dir-to-link link-target; echo old > dir-to-link/child; echo keep > link-target/child'
+  local CID BID_FULL BID_DELTA
+  CID="$(find_container "$TARGET")"
+
+  step "Turn incremental on, and take the full baseline"
+  curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/backup-options" \
+    -d '{"incremental":true,"incremental_full_every":5,"compression":"balanced"}' >/dev/null \
+    || fail "could not turn incremental on"
+  BID_FULL="$(backup_and_verify "$CID" "$TARGET")"
+  sleep 2
+
+  step "Change everything a size and mtime cannot see"
+  in_volume 'chmod 600 chmodded; chown 1234:1234 chowned; echo two > rewritten; touch -t '"$MARK_MTIME"' rewritten
+    rm link; ln -s new-target link; rm file-to-dir; mkdir file-to-dir; echo y > file-to-dir/inner
+    rm -r dir-to-file; echo z > dir-to-file; rm deleted; mkdir new-empty-dir; rmdir emptied-dir
+    rm -r dir-to-link; ln -s link-target dir-to-link'
+  local WANT
+  WANT="$(tree)"
+
+  step "Take the delta"
+  # backup_and_verify reads the newest row of this target, which is this run's.
+  BID_DELTA="$(backup_and_verify "$CID" "$TARGET")"
+  [ "$BID_DELTA" != "$BID_FULL" ] || fail "no new backup was taken"
+  curl -fsS -b "$JAR" "$BASE/api/backups/$BID_DELTA" | jget 'json.loads(d["manifest_json"]).get("incremental", False)' | grep -q True \
+    || fail "the second backup was not a delta, so this proves nothing"
+
+  step "Damage the volume, restore the delta, and compare"
+  in_volume 'find . -mindepth 1 -delete'
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$BID_DELTA/restore" \
+    -d "{\"node_id\":\"local\",\"target_id\":\"$CID\",\"volumes\":true,\"database\":false,\"confirm\":true}" >/dev/null
+  for i in $(seq 1 60); do
+    case "$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID_DELTA/log" || true)" in
+      *"Restored container is healthy"*) break ;;
+      *"Restore failed"*|*"Restore refused"*) fail "the restore failed" ;;
+    esac
+    [ "$i" = 60 ] && fail "the restore never finished"
+    sleep 3
+  done
+  local GOT
+  GOT="$(tree)"
+  if [ "$GOT" != "$WANT" ]; then
+    printf '  wanted:\n%s\n  got:\n%s\n' "$WANT" "$GOT" >&2
+    fail "the restored tree is not what the delta captured"
+  fi
+  echo "  mode, owner, same-size write, link, empty directory, both type changes and the delete all came back"
+
+  step "Rebuild the same tree from the archives alone, with the offline tool"
+  local OFFLINE ARCHIVE
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-offline-XXXXXX)"
+  OFFLINE="$HOSTDIR"
+  docker cp "$("${COMPOSE[@]}" ps -q backup-app):/app/backups" "$OFFLINE/backups" >/dev/null 2>&1 || fail "could not copy the archives out"
+  ARCHIVE="$OFFLINE/backups/$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID_DELTA" | jget 'd["storage_key"]')"
+  [ -f "$ARCHIVE" ] || fail "the delta's archive was not found at $ARCHIVE"
+  python3 scripts/dockback-recover.py --key "$DOCKBACK_ENCRYPTION_KEY" --in "$ARCHIVE" \
+    --apply-chain "$(dirname "$ARCHIVE")" --out "$OFFLINE/chain" >/dev/null || fail "--apply-chain failed"
+  mkdir "$OFFLINE/chain/RESTORE_DIR"
+  (cd "$OFFLINE/chain" && grep -E '^     (\(cd|tar) ' APPLY_ORDER.txt | sh) || fail "APPLY_ORDER.txt did not run"
+  # Types, names and modes: only a root shell would bring the owners back.
+  local OFFLINE_TREE
+  OFFLINE_TREE="$(cd "$OFFLINE/chain/RESTORE_DIR/data" && find . -mindepth 1 -exec stat -c '%n|%F|%a' {} + | LC_ALL=C sort)"
+  if [ "$OFFLINE_TREE" != "$(printf '%s\n' "$WANT" | grep '^\./' | cut -d'|' -f1-3 | LC_ALL=C sort)" ]; then
+    printf '  got:\n%s\n' "$OFFLINE_TREE" >&2
+    fail "the offline tree is not what the delta captured"
+  fi
+  [ "$(cat "$OFFLINE/chain/RESTORE_DIR/data/rewritten")" = two ] || fail "the offline tree has the old bytes"
+  echo "  the offline tool rebuilt the same names, types and modes, and the same-size write"
+
+  step "A name with a newline in it forces a true full, and comes back"
+  in_volume 'printf nl > "$(printf "newline\nname")"'
+  sleep 2
+  local BID_NL
+  BID_NL="$(backup_and_verify "$CID" "$TARGET")"
+  curl -fsS -b "$JAR" "$BASE/api/backups/$BID_NL" | jget 'json.loads(d["manifest_json"]).get("incremental", False)' | grep -q False \
+    || fail "a name a delta cannot carry must force a full"
+  WANT="$(tree)"
+  in_volume 'find . -mindepth 1 -delete'
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$BID_NL/restore" \
+    -d "{\"node_id\":\"local\",\"target_id\":\"$CID\",\"volumes\":true,\"database\":false,\"confirm\":true}" >/dev/null
+  for i in $(seq 1 60); do
+    case "$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID_NL/log" || true)" in
+      *"Restored container is healthy"*) break ;;
+    esac
+    [ "$i" = 60 ] && fail "the restore never finished"
+    sleep 3
+  done
+  [ "$(tree)" = "$WANT" ] || fail "the newline-named file did not come back"
+
+  printf '\033[1;32mE2E PASSED (incremental-fidelity): full then delta restored everything size and mtime cannot see.\033[0m\n'
+}
+
+# ── case: offsite-envelope ───────────────────────────────────────────────────
+
+case_offsite_envelope() {
+  local DEST_ROOT="/app/backups/e2e-offsite" APP_ID DEST_ID CID BID KEY i
+  docker volume create "$VOL" >/dev/null
+  docker run -d --name "$TARGET" -v "$VOL":/data alpine sleep 900 >/dev/null
+  docker exec "$TARGET" sh -c 'echo offsite-data > /data/file'
+  APP_ID="$("${COMPOSE[@]}" ps -q backup-app)"
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-offsite-XXXXXX)"
+  # location_field <field> — this destination's entry on the backup, as the catalog has it.
+  location_field() {
+    curl -fsS -b "$JAR" "$BASE/api/backups/$BID" \
+      | jget '[l for l in json.loads(d["locations"]) if l.get("dest_id")=="'"$DEST_ID"'"][0].get("'"$1"'","")'
+  }
+  # offline_open — try to open the destination's copy with nothing but its own files.
+  offline_open() {
+    rm -rf "$HOSTDIR/remote" "$HOSTDIR/opened.tar"
+    docker cp "$APP_ID:$DEST_ROOT" "$HOSTDIR/remote" >/dev/null 2>&1 || fail "could not copy the destination's files out"
+    python3 scripts/dockback-recover.py --key "$DOCKBACK_ENCRYPTION_KEY" --in "$HOSTDIR/remote/$KEY" \
+      --out "$HOSTDIR/opened.tar" >/dev/null 2>&1
+  }
+
+  step "Back up to an offsite destination"
+  DEST_ID="$(curl -fsS "${auth[@]}" -X POST "$BASE/api/destinations" \
+    -d "{\"name\":\"e2e-offsite\",\"type\":\"local\",\"config\":{\"path\":\"$DEST_ROOT\"}}" | jget 'd["id"]')" \
+    || fail "could not add the destination"
+  CID="$(find_container "$TARGET")"
+  BID="$(backup_and_verify "$CID" "$TARGET" "$DEST_ID")"
+  KEY="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID" | jget 'd["storage_key"]')"
+  [ -z "$(location_field status)" ] || fail "the offsite copy should be good: $(location_field detail)"
+  offline_open || fail "a complete offsite copy must open from its own files"
+  tar -tf "$HOSTDIR/opened.tar" | grep -q '^manifest.json$' || fail "the opened copy holds no manifest"
+  echo "  a complete copy opens from the destination's files alone"
+
+  step "Lose the envelope, and show the copy can no longer stand alone"
+  docker run --rm --volumes-from "$APP_ID" alpine sh -c "rm -f '$DEST_ROOT/$KEY'.manifest.json*"
+  offline_open && fail "the test is void: the copy opened without its envelope"
+  echo "  without its envelope the remote archive cannot be opened"
+
+  step "A scrub of that copy finds it"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$BID/verify" -d "{\"source\":\"$DEST_ID\"}" >/dev/null
+  # One read, for status and reason together: the offsite drain may repair the copy
+  # moments later, which is its job and is what the next step also accepts.
+  local FOUND=""
+  for i in $(seq 1 40); do
+    FOUND="$(location_field status)|$(location_field detail)"
+    case "$FOUND" in incomplete\|*envelope*) break ;; esac
+    [ "$i" = 40 ] && fail "the scrub did not mark the copy incomplete and say why: $FOUND"
+    sleep 1
+  done
+  echo "  the copy now reads: $FOUND"
+
+  step "Send offsite repairs it without sending the archive again"
+  local BEFORE AFTER
+  BEFORE="$(docker run --rm --volumes-from "$APP_ID" alpine stat -c '%i %Y' "$DEST_ROOT/$KEY")"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$BID/mirror" -d "{\"destinations\":[\"$DEST_ID\"]}" >/dev/null
+  for i in $(seq 1 40); do
+    [ -z "$(location_field status)" ] && break
+    [ "$i" = 40 ] && fail "the repair did not finish: $(location_field detail)"
+    sleep 1
+  done
+  AFTER="$(docker run --rm --volumes-from "$APP_ID" alpine stat -c '%i %Y' "$DEST_ROOT/$KEY")"
+  [ "$BEFORE" = "$AFTER" ] || fail "the repair sent the archive again"
+
+  step "The repaired copy opens from the destination's files alone"
+  offline_open || fail "the repaired copy must open from its own files"
+  tar -tf "$HOSTDIR/opened.tar" | grep -q '^volumes.tar$' || fail "the opened copy holds no volume payload"
+
+  printf '\033[1;32mE2E PASSED (offsite-envelope): a copy that lost its envelope was found, repaired in place, and opened from its own files.\033[0m\n'
+}
+
+# ── case: offsite-window ─────────────────────────────────────────────────────
+
+case_offsite_window() {
+  local DEST_ROOT="/app/backups/e2e-window" APP_ID DEST_ID CID BID KEY i BEFORE AFTER
+  # The drain looks once a minute, so this outlasts one look.
+  local DRAIN_LOOK=65
+  docker volume create "$VOL" >/dev/null
+  docker run -d --name "$TARGET" -v "$VOL":/data alpine sleep 900 >/dev/null
+  docker exec "$TARGET" sh -c 'echo window-data > /data/file'
+  APP_ID="$("${COMPOSE[@]}" ps -q backup-app)"
+  location_status() {
+    curl -fsS -b "$JAR" "$BASE/api/backups/$BID" \
+      | jget '[l for l in json.loads(d["locations"]) if l.get("dest_id")=="'"$DEST_ID"'"][0].get("status","")'
+  }
+  remote_archive() {
+    docker run --rm --volumes-from "$APP_ID" alpine stat -c '%i %Y' "$DEST_ROOT/$KEY" 2>/dev/null || true
+  }
+
+  step "Back up with the destination's upload window closed"
+  # The app runs in UTC. A window two hours from now cannot be open during this case.
+  DEST_ID="$(curl -fsS "${auth[@]}" -X POST "$BASE/api/destinations" \
+    -d "{\"name\":\"e2e-window\",\"type\":\"local\",\"config\":{\"path\":\"$DEST_ROOT\",\"upload_window_start\":\"$(date -u -d '+2 hours' +%H:%M)\",\"upload_window_end\":\"$(date -u -d '+3 hours' +%H:%M)\"}}" \
+    | jget 'd["id"]')" || fail "could not add the destination"
+  CID="$(find_container "$TARGET")"
+  BID="$(backup_and_verify "$CID" "$TARGET" "$DEST_ID")"
+  KEY="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID" | jget 'd["storage_key"]')"
+  [ "$(location_status)" = deferred ] || fail "outside its window the copy should be deferred"
+
+  step "Restart DockBack, and let the drain look at it with the window still closed"
+  "${COMPOSE[@]}" restart backup-app >/dev/null 2>&1
+  log_in
+  sleep "$DRAIN_LOOK"
+  [ "$(location_status)" = deferred ] || fail "a closed window must keep the copy deferred"
+  [ -z "$(remote_archive)" ] || fail "the archive was sent outside the window"
+
+  step "Open the window. No new backup, and no one asks"
+  curl -fsS "${auth[@]}" -X PUT "$BASE/api/destinations/$DEST_ID" \
+    -d "{\"name\":\"e2e-window\",\"type\":\"local\",\"config\":{\"upload_window_start\":\"\",\"upload_window_end\":\"\"}}" >/dev/null \
+    || fail "could not open the window"
+  for i in $(seq 1 45); do
+    [ -z "$(location_status)" ] && break
+    [ "$i" = 45 ] && fail "the copy was not sent after the window opened: $(location_status)"
+    sleep 3
+  done
+  BEFORE="$(remote_archive)"
+  [ -n "$BEFORE" ] || fail "the copy reads as good with no archive on the destination"
+
+  step "It goes only once"
+  sleep "$DRAIN_LOOK"
+  AFTER="$(remote_archive)"
+  [ "$AFTER" = "$BEFORE" ] || fail "the archive was sent again: $BEFORE then $AFTER"
+
+  printf '\033[1;32mE2E PASSED (offsite-window): a deferred copy survived a restart and went by itself, once, when its window opened.\033[0m\n'
+}
+
+# ── case: restore-outcome ────────────────────────────────────────────────────
+
+case_restore_outcome() {
+  local APP="$PROJECT-backup-app-1" CID BID i
+  local FIRST="" REPEAT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" KILLED="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  docker volume create "$VOL" >/dev/null
+  docker run -d --name "$TARGET" -v "$VOL":/data alpine sleep 900 >/dev/null
+  docker exec "$TARGET" sh -c 'echo outcome-data > /data/file'
+  CID="$(find_container "$TARGET")"
+  # status_field <field> [execution] — what the record says.
+  status_field() {
+    curl -fsS -b "$JAR" "$BASE/api/restores/$BID/status${2:+?execution=$2}" | jget 'd.get("'"$1"'","")'
+  }
+  start_restore() {
+    curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$BID/restore" \
+      -d "{\"execution_id\":\"$1\",\"node_id\":\"local\",\"target_id\":\"$CID\",\"volumes\":true,\"database\":false,\"confirm\":true}" >/dev/null
+  }
+  await_outcome() {
+    for i in $(seq 1 90); do
+      local outcome
+      outcome="$(status_field outcome "$1" 2>/dev/null || true)"
+      case "$outcome" in ""|running) ;; *) printf '%s' "$outcome"; return 0 ;; esac
+      sleep 2
+    done
+    fail "the restore never reached an outcome"
+  }
+
+  step "A post-restore hook that fails, then a restore"
+  curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/hooks" \
+    -d '{"post_restore":["sh -c \"exit 7\""]}' >/dev/null || fail "could not set the hook"
+  BID="$(backup_and_verify "$CID" "$TARGET")"
+  start_restore ""
+  [ "$(await_outcome "")" = ok ] || fail "the hook is non-fatal, so the restore should have succeeded: $(status_field message)"
+  local LOG
+  LOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID/log")"
+  case "$LOG" in
+    *"post-restore-hook failed"*) ;;
+    *) printf '%s\n' "$LOG" | tail -c 2500 >&2; fail "the hook did not log its failure, so this proves nothing" ;;
+  esac
+  FIRST="$(status_field execution_id)"
+  echo "  the log has the hook's failure, and the record says ok"
+
+  step "A repeat restore of the same backup keeps its own record"
+  start_restore "$REPEAT"
+  [ "$(await_outcome "$REPEAT")" = ok ] || fail "the repeat restore failed: $(status_field message "$REPEAT")"
+  [ "$(status_field execution_id)" = "$REPEAT" ] || fail "the newest record should be the repeat"
+  [ "$(status_field outcome "$FIRST")" = ok ] || fail "the first run lost its record"
+
+  step "A restore cut off by SIGKILL reads as interrupted after the restart"
+  start_restore "$KILLED"
+  docker kill -s KILL "$APP" >/dev/null
+  docker start "$APP" >/dev/null
+  log_in
+  [ "$(status_field outcome "$KILLED")" = interrupted ] \
+    || fail "a restore the process died during must not read as running or fine: $(status_field outcome "$KILLED")"
+  [ "$(status_field outcome "$REPEAT")" = ok ] || fail "a finished run must survive the restart"
+
+  printf '\033[1;32mE2E PASSED (restore-outcome): the record, not the log, says how each restore ended, across a repeat and a SIGKILL.\033[0m\n'
+}
+
+# ── case: clone-redaction ────────────────────────────────────────────────────
+
+case_clone_redaction() {
+  local COPY="$TARGET-copy" IMAGE="dback-e2e/linuxserver/plex:$SUFFIX" TOKEN="invented-token-$SUFFIX"
+  local DIR="/config/Library/Application Support/Plex Media Server" CID BID i
+  EXTRA_CONTAINERS+=("$COPY")
+  docker pull -q alpine:3.20 >/dev/null
+  docker tag alpine:3.20 "$IMAGE"
+  docker volume create "$VOL" >/dev/null
+
+  step "An application that records, on every start, what its config file said"
+  # What the first start saw is the proof the file was clean before the application ran.
+  docker run -d --name "$TARGET" -v "$VOL":/config "$IMAGE" sh -c \
+    'mkdir -p "$0" && [ -f "$0/Preferences.xml" ] && cp "$0/Preferences.xml" /config/seen-at-start; sleep 900' "$DIR" >/dev/null
+  docker exec "$TARGET" sh -c "mkdir -p '$DIR' && printf '<Preferences MachineIdentifier=\"keep-me\" PlexOnlineToken=\"$TOKEN\" PublishServerOnPlexOnlineKey=\"1\"/>' > '$DIR/Preferences.xml' && chown 1000:1000 '$DIR/Preferences.xml' && chmod 640 '$DIR/Preferences.xml'"
+  CID="$(find_container "$TARGET")"
+  BID="$(backup_and_verify "$CID" "$TARGET")"
+
+  step "Restore it as a copy"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/backups/$BID/restore" \
+    -d "{\"node_id\":\"local\",\"target_id\":\"$CID\",\"volumes\":true,\"database\":false,\"confirm\":true,\"as_name\":\"$COPY\",\"isolated\":true}" >/dev/null
+  for i in $(seq 1 40); do
+    [ "$(docker inspect -f '{{.State.Running}}' "$COPY" 2>/dev/null || true)" = "true" ] && break
+    [ "$i" = 40 ] && { curl -fsS -b "$JAR" "$BASE/api/backups/$BID/log" | tail -c 1200 >&2; fail "the copy never came up"; }
+    sleep 3
+  done
+  sleep 2
+
+  step "The copy's first start never saw the token"
+  local SEEN NOW
+  SEEN="$(docker exec "$COPY" cat /config/seen-at-start)" || fail "the copy did not record its first start"
+  NOW="$(docker exec "$COPY" cat "$DIR/Preferences.xml")"
+  case "$SEEN" in *"$TOKEN"*) fail "the application started with the token in its file" ;; esac
+  case "$SEEN" in *'PlexOnlineToken=""'*'PublishServerOnPlexOnlineKey=""'*) ;; *) fail "the values should be emptied: $SEEN" ;; esac
+  case "$NOW" in *'MachineIdentifier="keep-me"'*) ;; *) fail "other settings must survive" ;; esac
+  [ "$(docker exec "$COPY" stat -c '%u:%g %a' "$DIR/Preferences.xml")" = "1000:1000 640" ] \
+    || fail "the file must keep its owner and mode"
+  [ -z "$(docker exec "$COPY" sh -c "ls -a '$DIR' | grep dockback || true")" ] || fail "working copies were left behind"
+
+  step "The original keeps its token, and the log does not hold it"
+  case "$(docker exec "$TARGET" cat "$DIR/Preferences.xml")" in *"$TOKEN"*) ;; *) fail "the original was changed" ;; esac
+  local LOG
+  LOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID/log")"
+  case "$LOG" in *"$TOKEN"*) fail "the token reached the log" ;; esac
+
+  docker rm -f "$COPY" "$TARGET" >/dev/null 2>&1 || true
+  docker image rm "$IMAGE" >/dev/null 2>&1 || true
+  printf '\033[1;32mE2E PASSED (clone-redaction): the copy came up with its token gone before its first start, and the original kept its own.\033[0m\n'
+}
+
+# ── case: stack-parity ───────────────────────────────────────────────────────
+
+case_stack_parity() {
+  local PROJ="dback-e2e-parity-$SUFFIX" IMAGE="dback-e2e/mealie:$SUFFIX" CID BID i
+  EXTRA_PROJECTS+=("$PROJ")
+  HOSTDIR="$(mktemp -d /tmp/dback-e2e-parity-XXXXXX)"
+  docker pull -q alpine:3.20 >/dev/null
+  # A profile's image name on alpine, so its declared exclusions apply.
+  docker tag alpine:3.20 "$IMAGE"
+  cat > "$HOSTDIR/docker-compose.yml" <<EOF
+services:
+  app:
+    image: $IMAGE
+    command: ["sleep", "900"]
+    volumes: [app-data:/app/data]
+  other:
+    image: alpine:3.20
+    command: ["sleep", "900"]
+    volumes: [other-data:/data]
+volumes:
+  app-data:
+  other-data:
+EOF
+  docker compose -p "$PROJ" --project-directory "$HOSTDIR" -f "$HOSTDIR/docker-compose.yml" up -d --quiet-pull >/dev/null 2>&1 \
+    || fail "the test stack did not start"
+  docker exec "$PROJ-app-1" sh -c 'echo recipe > /app/data/recipe.txt; echo noise > /app/data/mealie.log.1; mkdir -p /app/data/.temp; echo scratch > /app/data/.temp/x'
+  CID="$(find_container "$PROJ-app-1")"
+
+  step "Save this service's own choices: its image, an app-native export, incremental"
+  curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/backup-options" \
+    -d '{"compression":"balanced","save_image":true,"app_export":true,"incremental":true}' >/dev/null || fail "could not save the options"
+  curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/export-profile" \
+    -d '{"dir":"/app/export","export_cmd":"mkdir -p /app/export && cp /app/data/recipe.txt /app/export/","import_cmd":"true"}' >/dev/null \
+    || fail "could not save the export profile"
+
+  step "Take an app-consistent snapshot of the stack"
+  curl -fsS "${auth[@]}" -X POST "$BASE/api/nodes/local/stacks/$PROJ/backup" -d '{"consistent":true}' >/dev/null
+  local SLOG=""
+  for i in $(seq 1 90); do
+    SLOG="$(curl -fsS -b "$JAR" "$BASE/api/backups/stack:$PROJ/log" || true)"
+    case "$SLOG" in
+      *"App-consistent snapshot complete"*) break ;;
+      *"App-consistent snapshot failed"*) fail "the snapshot failed" ;;
+    esac
+    [ "$i" = 90 ] && fail "the snapshot never finished"
+    sleep 2
+  done
+  BID="$(curl -fsS -b "$JAR" "$BASE/api/backups?node_id=local&page_size=50" \
+    | jget '[b for b in d["items"] if b["target_name"]=="'"$PROJ-app-1"'" and b["status"]=="success"][0]["id"]')"
+  local MAN
+  MAN="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID" | jget 'd["manifest_json"]')"
+  manifest() { printf '%s' "$MAN" | python3 -c "import sys,json; m=json.load(sys.stdin); print($1)"; }
+
+  step "Its archive holds what its own settings asked for"
+  [ "$(manifest 'm.get("consistency_group","")!=""')" = True ] || fail "this is not a group snapshot, so it proves nothing"
+  [ "$(manifest 'bool(m.get("image_tar"))')" = True ] || fail "the saved image was not bundled"
+  [ "$(manifest 'm.get("vol_index","")!=""')" = True ] || fail "the file index was not written"
+  [ "$(manifest 'sorted(p["path"] for p in m.get("excluded_regenerable") or [])')" = "['/app/data/.temp', '/app/data/mealie.log*']" ] \
+    || fail "the paths this profile never keeps were not recorded as left out: $(manifest 'm.get("excluded_regenerable")')"
+  local ENTRIES
+  ENTRIES="$(curl -fsS -b "$JAR" "$BASE/api/backups/$BID/entries" | jget '" ".join(e["name"] for e in d["entries"])')"
+  case "$ENTRIES" in *recipe.txt*) ;; *) fail "the kept file is missing: $ENTRIES" ;; esac
+  case "$ENTRIES" in *mealie.log.1*|*.temp/x*) fail "a path with no restore value was archived: $ENTRIES" ;; esac
+  echo "  image bundled, index written, the two left-out paths absent"
+
+  step "What a group cannot honour is on the archive, not dropped"
+  [ "$(manifest 'sorted(f["subject"] for f in m.get("findings") or [] if f["code"]=="capture-overridden")')" = "['app-native export', 'incremental']" ] \
+    || fail "the overrides were not recorded: $(manifest '[f for f in m.get("findings") or []]')"
+  [ "$(manifest 'm.get("app_export") is None and not m.get("incremental", False)')" = True ] || fail "the archive claims what it did not do"
+
+  docker compose -p "$PROJ" --project-directory "$HOSTDIR" -f "$HOSTDIR/docker-compose.yml" down -v >/dev/null 2>&1 || true
+  docker image rm "$IMAGE" >/dev/null 2>&1 || true
+  printf '\033[1;32mE2E PASSED (stack-parity): a stack snapshot kept every saved choice it could, and said which it could not.\033[0m\n'
 }
 
 # ── case: pg-hash ────────────────────────────────────────────────────────────
@@ -712,7 +1902,21 @@ case "$E2E_CASE" in
   sentinel) case_sentinel ;;
   pg-hash)  case_pg_hash ;;
   deleted-binds) case_deleted_binds ;;
+  moved-bind) case_moved_bind ;;
   stack-folder) case_stack_folder ;;
   files-only) case_files_only ;;
-  *) fail "unknown E2E_CASE '$E2E_CASE' (known: sentinel, pg-hash, deleted-binds, stack-folder, files-only)" ;;
+  stack-selection) case_stack_selection ;;
+  clone-ownership) case_clone_ownership ;;
+  clone-sandbox) case_clone_sandbox ;;
+  revert-rollback) case_revert_rollback ;;
+  shutdown-holds) case_shutdown_holds ;;
+  hook-cleanup) case_hook_cleanup ;;
+  hold-required) case_hold_required ;;
+  incremental-fidelity) case_incremental_fidelity ;;
+  offsite-envelope) case_offsite_envelope ;;
+  offsite-window) case_offsite_window ;;
+  restore-outcome) case_restore_outcome ;;
+  clone-redaction) case_clone_redaction ;;
+  stack-parity) case_stack_parity ;;
+  *) fail "unknown E2E_CASE '$E2E_CASE' (known: offsite-envelope, offsite-window, restore-outcome, clone-redaction, stack-parity, sentinel, pg-hash, deleted-binds, moved-bind, stack-folder, files-only, stack-selection, clone-ownership, clone-sandbox, revert-rollback, shutdown-holds, hook-cleanup, hold-required, incremental-fidelity)" ;;
 esac

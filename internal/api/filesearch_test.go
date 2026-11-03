@@ -2,7 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -137,5 +140,175 @@ func TestBackupDiffListsNeverNull(t *testing.T) {
 	added, changed, deleted = splitDiff(same, cur)
 	if len(changed) == 0 || added == nil || deleted == nil {
 		t.Fatalf("changed-only diff: added=%v changed=%v deleted=%v", added, changed, deleted)
+	}
+}
+
+// historyRow adds one successful backup to the store, created at a given moment.
+func historyRow(t *testing.T, st *store.Store, id, target string, createdAt int64) *store.Backup {
+	t.Helper()
+	b := &store.Backup{ID: id, NodeID: "n1", TargetName: target, Status: "success", CreatedAt: createdAt}
+	if err := st.CreateBackup(b); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+const historyBeyondOnePage = fileSearchBackupsPerPage + 5
+
+// The finding: the sole match lies past the newest thousand node backups, behind a
+// busier container's history.
+func TestTheOnlyMatchBeyondOnePageIsReached(t *testing.T) {
+	st := testStore(t)
+	for i := range historyBeyondOnePage {
+		historyRow(t, st, fmt.Sprintf("busy%05d", i), "busy", int64(10_000+i))
+	}
+	historyRow(t, st, "oldmatch", "quiet", 5)
+	indexOf := func(b *store.Backup) (backup.VolIndex, bool) {
+		if b.ID == "oldmatch" {
+			return fsIdx("config.xml"), true
+		}
+		return fsIdx("unrelated.bin"), true
+	}
+
+	var found []fileHit
+	cursor := store.BackupCursor{}
+	pages, scanned := 0, 0
+	for {
+		list, err := st.ListSuccessfulBackupsPage("n1", "", cursor, fileSearchBackupsPerPage+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		older := len(list) > fileSearchBackupsPerPage
+		list = list[:min(len(list), fileSearchBackupsPerPage)]
+		page, last := scanForFile(list, indexOf, "config.xml")
+		found = append(found, page.Results...)
+		scanned += page.Scanned
+		pages++
+		if !older {
+			break
+		}
+		cursor = store.BackupCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	if len(found) != 1 || found[0].BackupID != "oldmatch" {
+		t.Fatalf("found %+v", found)
+	}
+	if pages != 2 || scanned != historyBeyondOnePage+1 {
+		t.Fatalf("%d pages, %d scanned", pages, scanned)
+	}
+	quiet, err := st.ListSuccessfulBackupsPage("n1", "quiet", store.BackupCursor{}, fileSearchBackupsPerPage)
+	if err != nil || len(quiet) != 1 {
+		t.Fatalf("a target's own history is not drowned out by another's: %d %v", len(quiet), err)
+	}
+}
+
+func fileSearchResponse(t *testing.T, s *Server, query string) fileSearchPage {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.handleFileSearch(rec, httptest.NewRequest("GET", "/api/backups/search-file?"+query, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: %d %s", query, rec.Code, rec.Body.String())
+	}
+	var page fileSearchPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	return page
+}
+
+// Through the handler: a page that leaves history unread says so and carries on.
+func TestFileSearchSaysWhenOlderHistoryIsUnread(t *testing.T) {
+	st := testStore(t)
+	s := &Server{store: st, engine: &backup.Engine{Store: st}}
+	for i := range historyBeyondOnePage {
+		historyRow(t, st, fmt.Sprintf("b%05d", i), "app", int64(i+1))
+	}
+	first := fileSearchResponse(t, s, "node_id=n1&q=config")
+	if first.Scanned != fileSearchBackupsPerPage || first.NextCursor == "" {
+		t.Fatalf("first page: scanned %d, cursor %q", first.Scanned, first.NextCursor)
+	}
+	second := fileSearchResponse(t, s, "node_id=n1&q=config&cursor="+url.QueryEscape(first.NextCursor))
+	if second.Scanned != historyBeyondOnePage-fileSearchBackupsPerPage || second.NextCursor != "" {
+		t.Fatalf("second page: scanned %d, cursor %q", second.Scanned, second.NextCursor)
+	}
+	if first.Skipped+second.Skipped != historyBeyondOnePage {
+		t.Fatalf("every indexless backup is counted once: %d + %d", first.Skipped, second.Skipped)
+	}
+}
+
+// A backup taken mid-search is newer than any cursor, so it neither shifts nor
+// repeats the pages behind it.
+func TestPagingNeitherSkipsNorRepeatsWhileBackupsArrive(t *testing.T) {
+	st := testStore(t)
+	const total = 25
+	for i := range total {
+		historyRow(t, st, fmt.Sprintf("b%03d", i), "app", int64(100+i/3)) // shared timestamps too
+	}
+	seen := map[string]bool{}
+	cursor := store.BackupCursor{}
+	for round := 0; ; round++ {
+		list, err := st.ListSuccessfulBackupsPage("n1", "app", cursor, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list) == 0 {
+			break
+		}
+		historyRow(t, st, fmt.Sprintf("new%03d", round), "app", int64(1_000+round))
+		for _, b := range list {
+			if seen[b.ID] {
+				t.Fatalf("%s returned twice", b.ID)
+			}
+			seen[b.ID] = true
+		}
+		last := list[len(list)-1]
+		cursor = store.BackupCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	for i := range total {
+		if !seen[fmt.Sprintf("b%03d", i)] {
+			t.Fatalf("b%03d was never returned", i)
+		}
+	}
+}
+
+func TestOnlySuccessfulBackupsArePaged(t *testing.T) {
+	st := testStore(t)
+	historyRow(t, st, "good", "app", 2)
+	failed := &store.Backup{ID: "bad", NodeID: "n1", TargetName: "app", Status: "failed", CreatedAt: 3}
+	if err := st.CreateBackup(failed); err != nil {
+		t.Fatal(err)
+	}
+	list, err := st.ListSuccessfulBackupsPage("n1", "", store.BackupCursor{}, 10)
+	if err != nil || len(list) != 1 || list[0].ID != "good" {
+		t.Fatalf("%v %v", list, err)
+	}
+}
+
+// A capped page has more matches than can be read, so it asks for a narrower query
+// rather than offering more.
+func TestACappedPageOffersNoContinuation(t *testing.T) {
+	big := make([]string, maxFileSearchHits+1)
+	for i := range big {
+		big[i] = fmt.Sprintf("app%d.log", i)
+	}
+	list := []*store.Backup{{ID: "b1", CreatedAt: 2}, {ID: "b2", CreatedAt: 1}}
+	page, last := scanForFile(list, func(*store.Backup) (backup.VolIndex, bool) { return fsIdx(big...), true }, "app")
+	if !page.Truncated || page.Scanned != 1 || last.ID != "b1" {
+		t.Fatalf("%+v", page)
+	}
+}
+
+func TestACursorMustBeOneThisEndpointMade(t *testing.T) {
+	st := testStore(t)
+	s := &Server{store: st, engine: &backup.Engine{Store: st}}
+	for _, bad := range []string{"nonsense", "12.", ".abc", "x.abc"} {
+		rec := httptest.NewRecorder()
+		s.handleFileSearch(rec, httptest.NewRequest("GET", "/api/backups/search-file?node_id=n1&q=x&cursor="+url.QueryEscape(bad), nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%q: %d", bad, rec.Code)
+		}
+	}
+	at, err := parseBackupCursor(formatBackupCursor(&store.Backup{ID: "abc.def", CreatedAt: 42}))
+	if err != nil || at.CreatedAt != 42 || at.ID != "abc.def" {
+		t.Fatalf("round trip: %+v %v", at, err)
 	}
 }

@@ -24,6 +24,9 @@ import ExportDownloadButton from "../components/ExportDownloadButton";
 import { readStackRestoreSeed, StackRestoreSeed } from "../lib/stackRestoreSeed";
 import { capacityTone } from "../lib/capacityTone";
 
+type RestoreOptions = NonNullable<Parameters<typeof api.restoreStack>[2]>;
+// Step 27: what the operator has accepted the target lacks, one prompt at a time.
+type AcceptedGaps = { devices?: boolean; networks?: boolean };
 
 export default function StackRestore() {
   const { id: sourceNodeID = "", project = "" } = useParams();
@@ -80,7 +83,8 @@ export default function StackRestore() {
   const [remembered, setRemembered] = useState<CrossRestoreDefaults | null>(null);
   // F210: a member of this stack is marked protected, so overwriting it needs
   // fresh proof of the password — the same gate a single-container restore has.
-  const [stepUp, setStepUp] = useState<{ totp: boolean; err: string } | null>(null);
+  // Holds the request that was confirmed, which is what the password completes.
+  const [stepUp, setStepUp] = useState<{ totp: boolean; err: string; reviewed: RestoreOptions; accepted: AcceptedGaps } | null>(null);
   // F173: the two optional address changes, offered only when this stack's
   // application declares that it records one. Blank is the normal case.
   const [newSiteAddress, setNewSiteAddress] = useState(initial?.newSiteAddress || "");
@@ -181,7 +185,30 @@ export default function StackRestore() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceNodeID, project, group, deselected, reconstructHost, hostBaseDir, remapPath, pathFrom, pathTo, targetNode]);
 
-  const start = async (creds?: { password: string; code: string }, confirmed?: { devices?: boolean; networks?: boolean }) => {
+  // Everything the destructive confirm agrees to, as one request.
+  const reviewedOptions = (): RestoreOptions => ({
+    recreate, snapshot, target_node: targetNode,
+    // F213: only a partial restore names its services. The engine reads any list
+    // as partial, and a partial restore does not write the compose file it rebuilt.
+    ...(partial ? { services: keptServices.map((s) => s.service) } : {}),
+    ...(source ? { source } : {}),
+    ...(privKey.trim() ? { private_key: privKey.trim() } : {}),
+    ...(newSiteAddress.trim() ? { new_site_address: newSiteAddress.trim() } : {}),
+    ...(newUpstreamAddress.trim() ? { new_upstream_address: newUpstreamAddress.trim() } : {}),
+    ...(group ? { group } : {}),
+    ...(skippedLive.length > 0 ? { confirm_missing: true } : {}),
+    ...(lacking.length > 0 ? { confirm_missing_devices: true } : {}),
+    ...(allowDifferentImage ? { allow_different_image: true } : {}),
+    ...(filesOnly ? { files_only: true } : {}),
+    ...(reconstructHost ? { reconstruct_host: true, ...(hostBaseDir.trim() ? { host_base_dir: hostBaseDir.trim() } : {}) } : {}),
+    ...(promoteRestart ? { promote_restart_policy: true } : {}),
+    ...(injectHealthchecks ? { inject_healthchecks: true } : {}),
+    ...(remapIP ? { remap_ip: true, ...(remapFrom.trim() ? { remap_from_ip: remapFrom.trim() } : {}), ...(remapTo.trim() ? { remap_to_ip: remapTo.trim() } : {}) } : {}),
+    ...(remapDomain && domainFrom.trim() && domainTo.trim() ? { remap_domain: true, remap_from_domain: domainFrom.trim(), remap_to_domain: domainTo.trim() } : {}),
+    ...(remapPath ? { remap_path: true, ...(pathFrom.trim() ? { remap_from_path: pathFrom.trim() } : {}), ...(pathTo.trim() ? { remap_to_path: pathTo.trim() } : {}) } : {}),
+  });
+
+  const start = () => {
     const targetName = nodes.find((n) => n.id === targetNode)?.name || targetNode;
     const n = keptServices.length;
     const total = plan?.services.length || 0;
@@ -191,39 +218,30 @@ export default function StackRestore() {
       : `RESTORE STACK "${project}" — recreate and restore ${scope} in the order shown on node ${targetName}${crossHost ? " (CROSS-HOST — recreating the stack there)" : ""}.`;
     // ALL-services guarantee: a member with no backup CANNOT be recreated —
     // force explicit acknowledgment instead of a quietly incomplete stack.
-    // Step 27: devices the target lacks stop the restore unless confirmed here.
-    const lacking = keptServices.flatMap((sv) => (sv.missing_devices || []).map((d) => `${sv.service}: ${d}`));
     const devicesNote = lacking.length > 0
       ? `\n\nThe target machine LACKS devices these services need: ${lacking.join(", ")}. They will be created and then fail to start unless the devices are attached.`
       : "";
     const gap = skippedLive.length > 0
       ? `\n\nWARNING: ${skippedLive.length} stack member(s) have NO backup and will NOT exist after this restore: ${skippedLive.join(", ")}. Run a stack backup first to cover every service.`
       : "";
-    // F210: the destructive confirm is asked ONCE. On a step-up retry the
-    // operator has already agreed to it — re-asking would train them to click
-    // through the very dialog that carries the warning.
     const filesHead = `RESTORE FILES ONLY for stack "${project}" on node ${targetName} — put back its compose file, .env, project files and any missing single-file binds. No service is stopped or changed, and nothing that exists is overwritten. Continue?`;
-    if (!creds && !confirmed && !confirm(filesOnly ? filesHead : `${head}${snapshot ? " Current state is snapshotted first." : " No safety snapshot will be taken."}${gap}${devicesNote} This is destructive. Continue?`)) return;
+    if (!confirm(filesOnly ? filesHead : `${head}${snapshot ? " Current state is snapshotted first." : " No safety snapshot will be taken."}${gap}${devicesNote} This is destructive. Continue?`)) return;
+    return submit(reviewedOptions());
+  };
+
+  // Sends what was confirmed. A retry repeats that request with what the server
+  // asked for added, and is never rebuilt from the page: a plan that has since
+  // failed to reload would read as no selection, which the server takes as the
+  // whole stack. F210: the destructive confirm is asked ONCE, in start() — re-asking
+  // would train the operator to click through the dialog that carries the warning.
+  const submit = async (reviewed: RestoreOptions, accepted: AcceptedGaps = {}, creds?: { password: string; code: string }) => {
     setBusy(true); setErr("");
     try {
       await api.restoreStack(sourceNodeID, project, {
-        recreate, snapshot, target_node: targetNode,
-        ...(privKey.trim() ? { private_key: privKey.trim() } : {}),
-        ...(creds ? { password: creds.password, code: creds.code } : {}),
-        ...(newSiteAddress.trim() ? { new_site_address: newSiteAddress.trim() } : {}),
-        ...(newUpstreamAddress.trim() ? { new_upstream_address: newUpstreamAddress.trim() } : {}),
-        ...(group ? { group } : {}),
-        ...(skippedLive.length > 0 ? { confirm_missing: true } : {}),
-        ...(lacking.length > 0 || confirmed?.devices ? { confirm_missing_devices: true } : {}),
-        ...(confirmed?.networks ? { confirm_missing_networks: true } : {}),
-        ...(allowDifferentImage ? { allow_different_image: true } : {}),
-        ...(filesOnly ? { files_only: true } : {}),
-        ...(reconstructHost ? { reconstruct_host: true, ...(hostBaseDir.trim() ? { host_base_dir: hostBaseDir.trim() } : {}) } : {}),
-        ...(promoteRestart ? { promote_restart_policy: true } : {}),
-        ...(injectHealthchecks ? { inject_healthchecks: true } : {}),
-        ...(remapIP ? { remap_ip: true, ...(remapFrom.trim() ? { remap_from_ip: remapFrom.trim() } : {}), ...(remapTo.trim() ? { remap_to_ip: remapTo.trim() } : {}) } : {}),
-        ...(remapDomain && domainFrom.trim() && domainTo.trim() ? { remap_domain: true, remap_from_domain: domainFrom.trim(), remap_to_domain: domainTo.trim() } : {}),
-        ...(remapPath ? { remap_path: true, ...(pathFrom.trim() ? { remap_from_path: pathFrom.trim() } : {}), ...(pathTo.trim() ? { remap_to_path: pathTo.trim() } : {}) } : {}),
+        ...reviewed,
+        ...(accepted.devices ? { confirm_missing_devices: true } : {}),
+        ...(accepted.networks ? { confirm_missing_networks: true } : {}),
+        ...creds,
       });
       setStepUp(null);
       // The stack's own page carries the console that follows this run.
@@ -233,16 +251,15 @@ export default function StackRestore() {
       // failure — the operator is entitled to this restore, they just have to
       // prove who they are first.
       if (e instanceof StepUpError) {
-        setStepUp({ totp: e.totp_required, err: creds ? e.message : "" });
+        setStepUp({ totp: e.totp_required, err: creds ? e.message : "", reviewed, accepted });
         return;
       }
       // Step 27: the target lacks a device or a shared network. The operator may
       // know better; say what is missing and let them go ahead.
       if (e instanceof RestoreNeedsConfirmError) {
         setBusy(false);
-        if (confirm(`The target machine lacks: ${[...e.devices, ...e.networks].join(", ")}\n\n${e.message}\n\nRestore anyway?`)) {
-          return start(creds, { devices: confirmed?.devices || e.devices.length > 0, networks: confirmed?.networks || e.networks.length > 0 });
-        }
+        if (!confirm(`The target machine lacks: ${[...e.devices, ...e.networks].join(", ")}\n\n${e.message}\n\nRestore anyway?`)) return;
+        await submit(reviewed, { devices: accepted.devices || e.devices.length > 0, networks: accepted.networks || e.networks.length > 0 }, creds);
         return;
       }
       setErr((e as Error).message);
@@ -257,12 +274,24 @@ export default function StackRestore() {
   const partial = !!plan && keptServices.length < plan.services.length;
   const toggleService = (svc: string, on: boolean) =>
     setDeselected((prev) => { const n = new Set(prev); if (on) n.delete(svc); else n.add(svc); return n; });
+  // Step 27: devices the target lacks stop the restore unless confirmed.
+  const lacking = keptServices.flatMap((sv) => (sv.missing_devices || []).map((d) => `${sv.service}: ${d}`));
 
   // F214: the chosen copy does not cover every member — say so before the
   // confirm rather than letting the fallback be a surprise in the log.
   const sourcePartial = (plan?.source_copies || []).find(
     (c) => c.id === source && plan && c.services < plan.services.length,
   );
+  // F214: a chosen copy these backups do not hold — carried over from a backup's
+  // drawer, or left behind by a different point in time. Sending it reads from
+  // wherever the fallback lands while this page names the copy, and clearing it
+  // swaps the operator's choice for one they did not make, so it stops the confirm.
+  const sourceWithdrawn = !!plan && !!source && !(plan.source_copies || []).some((c) => c.id === source);
+  const sourceSummary = ((): string => {
+    if (sourceWithdrawn) return "the chosen copy is not available";
+    if (!source) return "reading from the fastest copy";
+    return `reading from ${(plan?.source_copies || []).find((c) => c.id === source)?.name || source}`;
+  })();
 
   // F215: a short, human list of what this route used last time.
   const rememberedSummary = ((): string[] => {
@@ -304,8 +333,12 @@ export default function StackRestore() {
   // rather than being discovered by the plan request and returned as a banner.
   const baseDirsInvalid = (remapPath && (baseDirInvalid(pathFrom) || baseDirInvalid(pathTo))) ||
     (reconstructHost && baseDirInvalid(hostBaseDir));
-  const blocked = busy || planLoading || !plan || keptServices.length === 0 || !!plan.atomic_block || (needsKey && !privKey.trim()) || baseDirsInvalid;
+  const blocked = busy || planLoading || !plan || keptServices.length === 0 || !!plan.atomic_block || (needsKey && !privKey.trim()) || baseDirsInvalid || sourceWithdrawn;
   const targetName = nodes.find((n) => n.id === targetNode)?.name || targetNode;
+  // The prompt completes the request that was confirmed, so it is offered only
+  // while the page still shows that request. Any other choice, including one made
+  // while the request was in flight, goes through the confirm again.
+  const pendingStepUp = stepUp && JSON.stringify(stepUp.reviewed) === JSON.stringify(reviewedOptions()) ? stepUp : null;
 
   return (
     <div>
@@ -577,7 +610,7 @@ export default function StackRestore() {
 
             {/* F214: WHICH COPY to read from. Only copies the planned members
                 actually hold are offered, each saying how many it covers. */}
-            {(plan?.source_copies || []).length > 0 && (
+            {((plan?.source_copies || []).length > 0 || sourceWithdrawn) && (
               <div className="mb-4">
                 <div className="mb-1 text-xs font-medium uppercase tracking-wider text-on-surface-variant">Source copy</div>
                 <Select value={source} onChange={(e) => setSource(e.target.value)}>
@@ -588,10 +621,16 @@ export default function StackRestore() {
                       {plan && c.services < plan.services.length ? ` — ${c.services} of ${plan.services.length} services` : ""}
                     </option>
                   ))}
+                  {sourceWithdrawn && <option value={source}>The copy you chose</option>}
                 </Select>
                 {sourcePartial && (
                   <p className="mt-1.5 break-words text-xs text-warning">
                     Only {sourcePartial.services} of {plan?.services.length} services have a copy there — the rest fall back to their best available copy, and the log names which.
+                  </p>
+                )}
+                {sourceWithdrawn && (
+                  <p className="mt-1.5 break-words text-xs text-error">
+                    These backups have no copy there. Choose another source to continue.
                   </p>
                 )}
               </div>
@@ -729,9 +768,9 @@ export default function StackRestore() {
           )}
 
           {/* F210: a protected member's overwrite needs the password. */}
-          {stepUp && (
-            <StepUpPrompt totp={stepUp.totp} busy={busy} error={stepUp.err} confirmLabel="Confirm and restore"
-              onConfirm={(pw, code) => start({ password: pw, code })} />
+          {pendingStepUp && (
+            <StepUpPrompt totp={pendingStepUp.totp} busy={busy} error={pendingStepUp.err} confirmLabel="Confirm and restore"
+              onConfirm={(pw, code) => submit(pendingStepUp.reviewed, pendingStepUp.accepted, { password: pw, code })} />
           )}
         </div>
       </div>
@@ -748,7 +787,7 @@ export default function StackRestore() {
           {plan
             ? <><b className="text-on-surface">{keptServices.length} of {plan.services.length} service{plan.services.length === 1 ? "" : "s"}</b> onto <b className="text-on-surface">{targetName}</b>
                 {snapshot ? " · safety snapshot first" : " · NO safety snapshot"}
-                {source ? ` · reading from ${(plan.source_copies || []).find((c) => c.id === source)?.name || source}` : " · reading from the fastest copy"}</>
+                {` · ${sourceSummary}`}</>
             : "Loading the plan…"}
         </p>
         <Link to={stackHome} className="shrink-0 rounded border border-outline-variant px-3 py-1.5 text-sm text-on-surface-variant hover:text-on-surface">Cancel</Link>

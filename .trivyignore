@@ -1,11 +1,20 @@
-# Accepted image-scan findings (Security.md §5). Review each release.
+# Accepted image-scan findings (Security.md §5).
+# Owner: the release maintainer. Last reviewed 2026-11-03; review again every release.
 #
-# CVE-2026-34040 — Moby daemon authorization-bypass shipped inside the
-# github.com/docker/docker SDK module. Fixed in Moby 29.3.1, but that is NOT yet
-# available as an importable Go module (github.com/docker/docker tops out at
-# v28.5.2+incompatible). It is daemon-side code: DockBack is a *client* that
-# only talks to the hardened, allow-listed socket-proxy and never runs dockerd,
-# so the path is not reachable — confirmed by govulncheck (reachability) which
-# does NOT report it. Remove + bump the SDK once v29.x is importable.
+# CVE-2026-34040 (GO-2026-4887): an authorization-plugin bypass in the Moby DAEMON,
+# shipped inside the github.com/docker/docker module DockBack imports for its
+# client. No github.com/docker/docker release fixes it (the newest is
+# v28.5.2+incompatible); the fix is in the daemon module, github.com/moby/moby/v2.
+#
+# Why it is accepted: the vulnerable code runs in dockerd's AuthZ plugin handling.
+# DockBack is only a client and never runs a daemon. govulncheck does list the
+# advisory as reachable, but only because the advisory names the whole module
+# rather than any function, so every client call matches.
+#
+# What this does not cover: the daemon on each node is still exposed if it is
+# vulnerable and uses an AuthZ plugin. The socket-proxy in front of it does not
+# change that. Patch Docker Engine on the nodes.
+#
+# Remove this entry, and move to a patched client, once one is importable.
 CVE-2026-34040
 GHSA-x744-4wpc-v9h2

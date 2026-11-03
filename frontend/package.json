@@ -18,7 +18,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.1.0",
-    "react-router-dom": "^6.28.0",
+    "react-router-dom": "^7.18.4",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
@@ -32,7 +32,7 @@
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
     "typescript": "^5.6.3",
-    "vite": "^5.4.11",
-    "vitest": "3.2.4"
+    "vite": "^6.4.5",
+    "vitest": "5.0.5"
   }
 }

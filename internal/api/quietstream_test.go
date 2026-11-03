@@ -52,7 +52,7 @@ func TestRefreshSkippedWhileStreaming(t *testing.T) {
 	t.Run("a running restore holds the node too", func(t *testing.T) {
 		// A restore streams a whole archive INTO the same proxy.
 		s := &Server{store: testStore(t), reg: dockercli.NewRegistry(), stats: map[string]*nodeStat{}}
-		_, finish, ok := s.beginRestoreRun(context.Background(), "b1", "nextcloud", "n1", time.Minute)
+		_, finish, ok := s.beginRestoreRun(context.Background(), "b1", "nextcloud", "n1", time.Minute, "")
 		if !ok {
 			t.Fatal("register")
 		}

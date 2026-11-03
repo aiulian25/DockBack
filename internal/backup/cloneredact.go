@@ -14,13 +14,13 @@ import (
 // Identity-neutralised clones (F155).
 //
 // "Restore as a copy" is the safest thing DockBack offers: an isolated clone
-// gets fresh volumes, no published ports and a throwaway network, so it can be
+// gets fresh volumes, no published ports and no network, so it can be
 // brought up beside a running production container, inspected, and deleted. That
 // isolation is about the HOST — nothing on the network can reach the clone.
 //
-// It says nothing about what the clone can reach. An application that registers
-// itself with a cloud service needs only outbound access, which a throwaway
-// bridge network provides, and the restored copy carries the same identity and
+// It says nothing about what the clone holds. An application that registers
+// itself with a cloud service needs only outbound access, which an operator can
+// give a copy to browse it, and the restored copy carries the same identity and
 // the same account token as the original. So the clone announces itself as the
 // server the operator is still running, and the two contend: the rehearsal
 // intended to prove a backup works instead disturbs the thing it was proving.
@@ -62,10 +62,11 @@ func cloneRedactionsFor(image string) []CloneRedaction {
 // attribute that merely ends with the same word is not caught, and a value
 // containing the word is not either.
 //
-// Written with sed because it has to run inside an arbitrary application image
-// with no assumption beyond a POSIX shell. Nothing is read back out of the
+// Written with sed for the helper's small image. Nothing is read back out of the
 // file — the verification below re-reads only whether the values are now empty,
-// never what they were.
+// never what they were. The working copies hold the very values being removed, so
+// they are private to root and go on every way out, and the result is written back
+// with cat so the file keeps its owner and mode.
 func redactAttrScript(path string, attrs []string) string {
 	var b strings.Builder
 	q := "'" + shellEscape(path) + "'"
@@ -73,15 +74,15 @@ func redactAttrScript(path string, attrs []string) string {
 	// neutralise and nothing to refuse over. Reported, not failed — the opposite
 	// would turn a profile matching an image slightly too broadly into a clone
 	// that cannot be started at all.
-	b.WriteString("[ -f " + q + " ] || { echo '" + noFileMarker + "'; exit 0; }; set -e; ")
+	b.WriteString("[ -f " + q + " ] || { echo '" + noFileMarker + "'; exit 0; }; set -e; umask 077; ")
+	b.WriteString("trap 'rm -f " + shellEscape(q) + ".dockback-tmp " + shellEscape(q) + ".dockback-pre-redact' EXIT; ")
 	b.WriteString("cp " + q + " " + q + ".dockback-pre-redact; ")
 	for _, a := range attrs {
 		esc := shellEscape(a)
 		// sed -i is not universally available; write to a temp file and move.
 		b.WriteString("sed 's/\\(" + esc + `="\)[^"]*"/\1` + redactedMarker + "\"/g' " + q +
-			" > " + q + ".dockback-tmp && cat " + q + ".dockback-tmp > " + q + "; ")
+			" > " + q + ".dockback-tmp; cat " + q + ".dockback-tmp > " + q + "; ")
 	}
-	b.WriteString("rm -f " + q + ".dockback-tmp " + q + ".dockback-pre-redact; ")
 	// Prove it: any character other than the closing quote immediately after the
 	// opening one means a value is still there.
 	//
@@ -103,9 +104,10 @@ func redactAttrScript(path string, attrs []string) string {
 
 // neutralizeClone applies an application's declared clone redactions (F155).
 //
-// Called only on the clone path, only before the container starts. Returns an
-// error when a REQUIRED redaction could not be applied, which fails the restore
-// rather than starting something that would reach outside its sandbox.
+// Called only on the clone path, only before the container starts, which is why it
+// works from a helper rather than inside the container. Returns an error when a
+// REQUIRED redaction could not be applied, which fails the restore rather than
+// starting something that would reach outside its sandbox.
 func (e *Engine) neutralizeClone(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions) error {
 	reds := cloneRedactionsFor(manifestImage(man, b))
 	if len(reds) == 0 {
@@ -117,8 +119,7 @@ func (e *Engine) neutralizeClone(ctx context.Context, cli *client.Client, b *sto
 		}
 		e.logf(b.ID, "INFO", "Neutralising this copy before it starts: clearing %s in %s — %s",
 			strings.Join(r.Attrs, ", "), r.Path, r.Why)
-		out, err := dockercli.ExecHook(ctx, cli, opts.TargetID,
-			[]string{"/bin/sh", "-c", redactAttrScript(r.Path, r.Attrs)}, "", "")
+		out, err := dockercli.RunCloneRedaction(ctx, cli, opts.TargetID, redactAttrScript(r.Path, r.Attrs))
 		if err == nil {
 			if strings.Contains(string(out), noFileMarker) {
 				e.logf(b.ID, "INFO", "%s is not present in this copy, so there is nothing to clear", r.Path)

@@ -69,9 +69,12 @@ export function locations(b: Backup): BackupLocation[] {
   return list.length ? list : LOCAL_ONLY;
 }
 
-/** A backup is degraded when an intended offsite copy did not upload. */
+/** The archive is on the destination, but the envelope that opens it is not proven there. */
+export const LOCATION_INCOMPLETE = "incomplete";
+
+/** A backup is degraded when an intended offsite copy did not fully upload. */
 export function failedCopies(b: Backup): BackupLocation[] {
-  return locations(b).filter((l) => l.status === "failed");
+  return locations(b).filter((l) => l.status === "failed" || l.status === LOCATION_INCOMPLETE);
 }
 
 /** Copies that hold restorable data right now. */

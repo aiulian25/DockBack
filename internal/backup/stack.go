@@ -466,6 +466,7 @@ func (e *Engine) RestoreStack(ctx context.Context, sourceNodeID, targetNodeID, p
 		targetNodeID = sourceNodeID
 	}
 	logID := "stack:" + project
+	ctx = context.WithValue(ctx, stackRunLogKey{}, logID)
 	if sopts.Recreate {
 		e.logf(logID, "INFO", "Reverting stack %q — rolling each service back to its latest backup (image + data)", project)
 	} else {
@@ -589,7 +590,7 @@ func (e *Engine) RestoreStack(ctx context.Context, sourceNodeID, targetNodeID, p
 		// F213: a partial restore writes no file rebuilt from its subset —
 		// reconstructStackCompose decides that, because the operator's own file
 		// describes the whole project and is still worth writing.
-		e.reconstructStackCompose(ctx, targetNodeID, project, order, sopts, logID)
+		_ = e.reconstructStackCompose(ctx, targetNodeID, project, order, sopts, logID)
 	} else if len(order) > 0 {
 		// Said once for the stack rather than once per service: the files are one
 		// set, in one folder, and the operator makes one decision about them.
@@ -737,13 +738,14 @@ func whyNotHealthy(still []string, reasons map[string]string) string {
 // turn they overwrite each other and what remains describes whichever service
 // went last.
 //
-// Non-fatal in every direction. The containers are already restored and running;
+// Non-fatal for a full restore. The containers are already restored and running;
 // this rebuilds the folder beside them, and an operator who keeps their real
-// compose file in version control needs none of it.
-func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, project string, order []*stackService, sopts StackRestoreOptions, logID string) {
+// compose file in version control needs none of it. What could not be written
+// is still returned, because a files-only restore exists only to write it.
+func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, project string, order []*stackService, sopts StackRestoreOptions, logID string) error {
 	cli, err := e.Reg.Get(targetNodeID)
 	if err != nil {
-		return
+		return err
 	}
 	var (
 		docs        [][]byte
@@ -775,7 +777,7 @@ func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, proj
 		raw := e.liveComposeDoc(ctx, cli, s, siblings)
 		if len(raw) == 0 {
 			var xerr error
-			raw, xerr = e.extractEntry(ctx, s.backup, "", "config/docker-compose.yml")
+			raw, xerr = e.extractEntry(ctx, s.backup, sopts.Source, "config/docker-compose.yml")
 			if xerr != nil || len(raw) == 0 {
 				e.logf(logID, "WARN", "No compose source for %q (live read failed and the backup has no reconstruction) — that service will be missing from the written file", s.service)
 				continue
@@ -788,12 +790,12 @@ func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, proj
 		}
 	}
 	if len(docs) == 0 {
-		return
+		return fmt.Errorf("no service's compose file could be read")
 	}
 	merged, promoted, merr := mergeComposeDocs(docs)
 	if merr != nil {
 		e.logf(logID, "WARN", "Could not assemble the stack's compose file: %v", merr)
-		return
+		return fmt.Errorf("the stack's compose file could not be assembled: %w", merr)
 	}
 	// #16: the written file now waits for a database to be READY where the source
 	// waited only for its container to exist. Said out loud, because the file
@@ -806,7 +808,7 @@ func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, proj
 	stackDir := ResolveStackDir(workingDir, anchorName, sopts.HostBaseDir, sopts.RemapFromPath, sopts.RemapToPath)
 	if stackDir == "" {
 		e.logf(logID, "INFO", "Skipping host stack reconstruction — %q has no recorded compose directory and no base directory was provided", project)
-		return
+		return nil
 	}
 	// F192: a working directory recorded by a management tool is that tool's
 	// internal layout — Portainer runs compose from /data/compose/26 — and
@@ -907,7 +909,7 @@ func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, proj
 		narrowed, ok := partialStackFolder(layout)
 		if !ok {
 			e.logf(logID, "INFO", "Not writing %q's compose file — this restore covers only some of its services, the backup holds no original compose file, and one rebuilt from a subset would describe a fraction of the project", project)
-			return
+			return nil
 		}
 		layout, envFile, movedSecrets = narrowed, originalEnv, 0
 		e.logf(logID, "INFO", "This restore covers only some of %q's services, so only your own compose file and .env are written — they describe the whole project", project)
@@ -923,21 +925,23 @@ func (e *Engine) reconstructStackCompose(ctx context.Context, targetNodeID, proj
 	layout = e.guardReconstruction(ctx, checker, layout, envFile, project, logID)
 
 	e.logf(logID, "INFO", "Writing the compose file for %q at %s", project, stackDir)
-	res, rerr := dockercli.ReconstructStackDirWithEnv(ctx, cli, stackDir, composeFile, layout.Primary, envFile, stackOwner, layout.Beside...)
+	res, rerr := dockercli.ReconstructStackDirWithEnv(ctx, cli, stackDir, composeFile, layout.Primary, envFile, stackOwner, hostWritePolicy(sopts.FilesOnly), layout.Beside...)
 	if rerr != nil {
 		e.logf(logID, "WARN", "Host stack reconstruction skipped: %v", rerr)
-		return
+		return fmt.Errorf("the stack folder %s was not written: %w", stackDir, rerr)
 	}
 	e.logStackFolder(logID, res, layout, movedSecrets)
 	// The project's other files, from the first member that captured them: a
 	// project has one folder, and every member that captured it holds the same.
+	var folderErr error
 	for _, s := range order {
 		if s != nil && s.man != nil && s.man.ProjectFolder != nil && s.man.ProjectFolder.Entries > 0 {
-			e.restoreProjectFolder(ctx, cli, s.backup, s.man, sopts.Source, logID, res.Dir)
+			folderErr = e.restoreProjectFolder(ctx, cli, s.backup, s.man, sopts.Source, logID, res.Dir)
 			break
 		}
 	}
 	e.reportComposeCheck(ctx, cli, checker, res, layout, project, true, logID)
+	return errors.Join(unwrittenFiles(res), folderErr)
 }
 
 // restoreStackFilesOnly puts back the stack's folder once, and every member's
@@ -948,12 +952,16 @@ func (e *Engine) restoreStackFilesOnly(ctx context.Context, targetNodeID, projec
 		return err
 	}
 	e.logf(logID, "INFO", "Files-only restore of stack %q: putting back its files on the host. No service is stopped or changed, and nothing that exists is overwritten.", project)
+	var failures []error
 	for _, s := range order {
 		memberOpts := stackServiceRestoreOptions(s, targetNodeID, sopts)
-		e.restoreMissingBindFiles(ctx, cli, s.backup, s.man, memberOpts, logID)
+		failures = append(failures, e.restoreMissingBindFiles(ctx, cli, s.backup, s.man, memberOpts, logID))
 		e.reportMissingDataFolders(ctx, cli, s.man, memberOpts, logID)
 	}
-	e.reconstructStackCompose(ctx, targetNodeID, project, order, sopts, logID)
+	failures = append(failures, e.reconstructStackCompose(ctx, targetNodeID, project, order, sopts, logID))
+	if err := errors.Join(failures...); err != nil {
+		return fmt.Errorf("files-only restore of stack %q did not put back every file: %w", project, err)
+	}
 	e.logf(logID, "INFO", "Stack %q: files restored — no service was stopped or changed", project)
 	return nil
 }

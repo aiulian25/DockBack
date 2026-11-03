@@ -10,10 +10,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -414,6 +416,17 @@ func (d *Dispatcher) TestChannel(cfg Config, channel string) error {
 	return fmt.Errorf("unknown channel %q", channel)
 }
 
+// withoutURL drops the address from an HTTP client error. A webhook or heartbeat URL
+// carries its credential in the path, and Go writes the whole URL into the error,
+// which then reaches the log and the test endpoint's reply.
+func withoutURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
+}
+
 // httpStatusError turns a non-2xx response into an error that includes a short,
 // cleaned snippet of the response body. The body usually carries the ACTIONABLE
 // reason a bare status code hides — e.g. a paused Uptime Kuma push monitor
@@ -446,11 +459,11 @@ func (d *Dispatcher) sendHeartbeat(hb HeartbeatConfig) error {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hb.URL, nil)
 	if err != nil {
-		return err
+		return withoutURL(err)
 	}
 	resp, err := d.hc.Do(req)
 	if err != nil {
-		return err
+		return withoutURL(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
@@ -575,12 +588,12 @@ func (d *Dispatcher) sendWebhook(wh WebhookConfig, kind string, sev Severity, ti
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wh.URL, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return withoutURL(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.hc.Do(req)
 	if err != nil {
-		return err
+		return withoutURL(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {

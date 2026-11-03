@@ -81,6 +81,16 @@ type Server struct {
 	// otherwise only consulted, not reserved, between check and enqueue).
 	createMu sync.Mutex
 
+	// drillMu runs one restore drill at a time, and drillsInFlight refuses a second
+	// request to drill a backup that is already waiting for or holding it.
+	drillMu        sync.Mutex
+	drillsInFlight sync.Map // backupID -> struct{}
+
+	// appBackupMu runs one application-backup creator at a time (manual, scheduled
+	// or key rotation), so the covered-config mark only moves forward and no
+	// partial file is cleared while its creator is still writing it.
+	appBackupMu sync.Mutex
+
 	// mirrorInFlight guards on-demand "mirror existing backup" runs so the same
 	// backup can't be mirrored twice concurrently (a wasteful re-upload race).
 	mirrorInFlight sync.Map // backupID -> struct{}
@@ -118,6 +128,8 @@ type Server struct {
 	// outsideQueueRuns counts the app-consistent stack backups and restores in
 	// flight, which write archives without passing through the job queue (see
 	// beginOutsideQueueRun).
+	life lifecycle // what stops with the process (lifecycle.go)
+
 	outsideQueueRuns atomic.Int64
 
 	// ignoreMu serializes edits to a node's ignore list (read, change, write).
@@ -377,6 +389,34 @@ func (s *Server) migrateNodeSecrets() {
 	}
 }
 
+// reconcileHolds settles the hold journal left by the previous process. Rows on a
+// node that cannot answer yet are retried until it can, or until shutdown; only
+// those rows, so a hold taken since is never touched.
+func (s *Server) reconcileHolds() {
+	rows, err := s.store.ListWorkloadHolds()
+	if err != nil {
+		log.Printf("startup: could not read the hold journal: %v", err)
+		return
+	}
+	remaining := s.engine.ReconcileWorkloadHolds(s.rootContext(), rows)
+	if len(remaining) == 0 {
+		return
+	}
+	log.Printf("startup: %d held container(s) on unreachable nodes — retrying", len(remaining))
+	go func() {
+		t := time.NewTicker(holdRetryInterval)
+		defer t.Stop()
+		for len(remaining) > 0 {
+			select {
+			case <-s.rootContext().Done():
+				return
+			case <-t.C:
+				remaining = s.engine.ReconcileWorkloadHolds(s.rootContext(), remaining)
+			}
+		}
+	}()
+}
+
 // Engine exposes the backup engine (used by main for bootstrap tasks).
 func (s *Server) Engine() *backup.Engine { return s.engine }
 
@@ -384,6 +424,7 @@ func (s *Server) Engine() *backup.Engine { return s.engine }
 // Docker event-stream watchers; the periodic full reconcile is a slow safety net
 // (and the cadence at which CPU/mem stats are re-sampled), not the primary path.
 const (
+	holdRetryInterval = time.Minute
 	reconcileInterval = 20 * time.Second
 	eventDebounce     = 1500 * time.Millisecond // coalesce event bursts (e.g. compose up)
 	watchBackoffBase  = 3 * time.Second
@@ -397,7 +438,9 @@ const (
 // polling), and runs a slow periodic reconcile that re-samples stats and catches
 // any missed events.
 func (s *Server) StartBackground() {
-	s.loadInventoryCache() // instant dashboard + survives restart
+	s.reconcileHolds()             // before anything can claim work: settle what the last process held
+	s.interruptAbandonedRestores() // likewise: no restore survives a restart, whatever its row says
+	s.loadInventoryCache()         // instant dashboard + survives restart
 	go func() {
 		s.refreshAll()
 		s.manageWatchers()
@@ -414,6 +457,7 @@ func (s *Server) StartBackground() {
 	s.startRetentionPrune()    // optional scheduled fleet-wide retention sweep (F17)
 	s.startNodePurge()         // hard-delete forgotten nodes once their undo window elapses
 	s.startAppBackupSchedule() // automatic application (control-plane) backups (F4)
+	s.startOffsiteDrain()      // send deferred/failed offsite copies when they are due (DBK-011)
 	s.startScrub()             // periodic re-verification of stored backups (PLAN §9.4)
 	s.startDrills()            // periodic per-container restore drills into a sandbox (PLAN §9.4)
 	s.startStandby()           // periodic cross-node standby rehearsals (F62)
@@ -896,9 +940,13 @@ type runDoneEvent struct {
 	// RunID is what the console is following: a backup id, "stack:<project>" or
 	// "node:<id>".
 	RunID string `json:"run_id"`
-	// Outcome is "ok", "failed" or "canceled". Canceled is its own answer, not a
-	// failure: the operator chose it, and a destructive run stopped part-way
-	// needs saying differently from one that broke.
+	// ExecutionID says which restore under that reused id this is. Empty for a run
+	// with no record, such as a stack backup.
+	ExecutionID string `json:"execution_id,omitempty"`
+	// Outcome is "ok", "failed", "canceled" or "interrupted". Canceled is its own
+	// answer, not a failure: the operator chose it, and a destructive run stopped
+	// part-way needs saying differently from one that broke. Interrupted means
+	// DockBack itself stopped.
 	Outcome string `json:"outcome"`
 	// Message is the same sentence the run log carries, so a console can show it
 	// without re-deriving one.
@@ -907,9 +955,10 @@ type runDoneEvent struct {
 
 // Run outcomes. Named so a caller cannot invent a fourth spelling.
 const (
-	runOutcomeOK       = "ok"
-	runOutcomeFailed   = "failed"
-	runOutcomeCanceled = "canceled"
+	runOutcomeOK          = "ok"
+	runOutcomeFailed      = "failed"
+	runOutcomeCanceled    = "canceled"
+	runOutcomeInterrupted = "interrupted"
 )
 
 // publishRunDone announces that a followed run has ended.
@@ -920,12 +969,17 @@ const (
 // and the fallback it lands in is the text matching the code comments elsewhere
 // describe as unreliable. A momentarily-full subscriber gets a grace period.
 func (s *Server) publishRunDone(runID, outcome, message string) {
+	s.publishExecutionDone(runID, "", outcome, message)
+}
+
+// publishExecutionDone is publishRunDone naming the restore execution that ended.
+func (s *Server) publishExecutionDone(runID, executionID, outcome, message string) {
 	if s.bcast == nil || runID == "" {
 		return
 	}
 	s.bcast.fanoutImportant(sseMsg{
 		event: "run.done",
-		data:  mustJSON(runDoneEvent{RunID: runID, Outcome: outcome, Message: message}),
+		data:  mustJSON(runDoneEvent{RunID: runID, ExecutionID: executionID, Outcome: outcome, Message: message}),
 	})
 }
 
@@ -1348,6 +1402,7 @@ func (s *Server) Handler(uiFS fs.FS) http.Handler {
 	mux.Handle("GET /api/nodes/{id}/test-clones", s.auth(http.HandlerFunc(s.handleListTestClones)))
 	mux.Handle("POST /api/test-clones/remove", s.auth(s.csrf(http.HandlerFunc(s.handleDeleteTestClone))))
 	mux.Handle("POST /api/restores/{id}/cancel", s.auth(s.csrf(http.HandlerFunc(s.handleCancelRestore))))
+	mux.Handle("GET /api/restores/{id}/status", s.auth(http.HandlerFunc(s.handleRestoreStatus)))
 	// F199: exports are step-up gated. The GET carries a one-shot ticket because
 	// a browser navigation has no body to put a password in; the POST below is
 	// where the password actually goes.

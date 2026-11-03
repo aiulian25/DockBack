@@ -266,7 +266,39 @@ func run() error {
 	case <-srv.RestartRequested():
 		log.Printf("application-config restore staged — restarting to apply…")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	return shutdown(httpSrv, srv)
+}
+
+const (
+	// shutdownHTTPTimeout bounds waiting for open requests. An open log stream never
+	// ends by itself, so it runs alongside the drain rather than ahead of it.
+	shutdownHTTPTimeout = 15 * time.Second
+	// shutdownDrainTimeout bounds waiting for owned work, whose cleanup is short once
+	// canceled. Below the 60 second stop_grace_period the docs ask for; Docker's
+	// default of 10 seconds can kill the process first, which the hold journal covers.
+	shutdownDrainTimeout = 45 * time.Second
+)
+
+// shutdown stops accepting requests and drains owned work, then returns so the
+// deferred catalog close and lock release happen after it. Running out of time is an
+// error: the process still exits, and the next start reconciles what was held.
+func shutdown(httpSrv *http.Server, srv *api.Server) error {
+	httpDone := make(chan struct{})
+	go func() {
+		defer close(httpDone)
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownHTTPTimeout)
+		defer cancel()
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			log.Printf("shutdown: open requests were cut off: %v", err)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
-	return httpSrv.Shutdown(ctx)
+	err := srv.Shutdown(ctx)
+	<-httpDone
+	if err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	log.Printf("shutdown complete: all work drained")
+	return nil
 }

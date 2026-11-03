@@ -226,6 +226,8 @@ func (s *Server) handleRestoreNodeAll(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		stepUpBody
 		SkipBlocked bool `json:"skip_blocked"`
+		// ExecutionID is the console's own name for this run. Optional.
+		ExecutionID string `json:"execution_id,omitempty"`
 		// F227: which services this run covers, by the same label the plan shows
 		// ("stack/container", or the container name). Omitted or empty means every
 		// service — what every caller before this sent, and still the default.
@@ -436,7 +438,7 @@ func (s *Server) handleRestoreNodeAll(w http.ResponseWriter, r *http.Request) {
 				s.releaseRestoreAndDispatch(h)
 			}
 		}()
-		ctx, finish, ok := s.beginRestoreRun(context.Background(), logID, "node "+node.Name, targetID, 6*time.Hour)
+		ctx, finish, ok := s.beginRestoreRun(context.Background(), logID, "node "+node.Name, targetID, 6*time.Hour, body.ExecutionID)
 		if !ok {
 			s.logSink(logID, "ERR", "Node restore failed: another restore of this node is already running")
 			return
@@ -575,7 +577,7 @@ func (s *Server) runNodeRestore(ctx context.Context, run nodeRestoreRun) {
 		if ctx.Err() != nil {
 			msg := fmt.Sprintf("Node restore CANCELED after %d of %d step(s) — those are up; the rest were NOT touched", i, len(units))
 			s.logSink(logID, "WARN", msg)
-			s.publishRunDone(logID, runOutcomeCanceled, msg)
+			s.finishRestoreExecution(logID, runOutcomeCanceled, msg)
 			return
 		}
 		// F212: name the destination on EVERY step of a rebuild, not only in the
@@ -599,12 +601,12 @@ func (s *Server) runNodeRestore(ctx context.Context, run nodeRestoreRun) {
 			// such (and don't fire a FAILED alert for something they asked for).
 			msg := fmt.Sprintf("[%d/%d] %s: %v — node restore stopped here; the %d step(s) before it are up", i+1, len(units), label, err, i)
 			s.logSink(logID, "WARN", msg)
-			s.publishRunDone(logID, runOutcomeCanceled, msg)
+			s.finishRestoreExecution(logID, runOutcomeCanceled, msg)
 			return
 		default:
 			msg := fmt.Sprintf("[%d/%d] %s failed: %v — aborting node restore", i+1, len(units), label, err)
 			s.logSink(logID, "ERR", msg)
-			s.publishRunDone(logID, runOutcomeFailed, msg)
+			s.finishRestoreExecution(logID, runOutcomeFailed, msg)
 			s.notify(notify.KindRestoreFailed, "Node restore FAILED: "+run.TargetName,
 				fmt.Sprintf("Whole-node restore of %s stopped at %s: %v. Services already restored are up; the rest were NOT restored.", run.TargetName, label, err))
 			return
@@ -613,7 +615,7 @@ func (s *Server) runNodeRestore(ctx context.Context, run nodeRestoreRun) {
 	done := fmt.Sprintf("Node %q restored — all %d service(s) are back up in the proven order", run.TargetName, len(plan))
 	s.logSink(logID, "INFO", done)
 	// #N10: the console stops guessing from the wording of the line above.
-	s.publishRunDone(logID, runOutcomeOK, done)
+	s.finishRestoreExecution(logID, runOutcomeOK, done)
 }
 
 // restoreNodeStackUnit restores one compose project through the stack path, so

@@ -2,6 +2,8 @@ package storage
 
 import (
 	"bytes"
+	"errors"
+	"io/fs"
 	"net"
 	"testing"
 	"time"
@@ -58,5 +60,23 @@ func TestDeadlineWriterRefreshesPerWrite(t *testing.T) {
 	}
 	if fc.deadlines[1].Before(fc.deadlines[0]) {
 		t.Error("deadline moved backwards across writes")
+	}
+}
+
+// A server whose directory listing makes go-smb2 panic (GO-2026-5051) must fail
+// the listing, not crash DockBack, and must not read as an empty directory.
+func TestAMalformedListingFailsInsteadOfCrashing(t *testing.T) {
+	entries, err := recoverListing("backups", func() ([]fs.FileInfo, error) {
+		var reply []byte
+		_ = reply[8] // what an unchecked NextEntryOffset does
+		return nil, nil
+	})
+	if !errors.Is(err, errMalformedListing) || entries != nil {
+		t.Fatalf("want errMalformedListing and no entries, got %v %v", entries, err)
+	}
+
+	missing := errors.New("no such directory")
+	if _, err := recoverListing("backups", func() ([]fs.FileInfo, error) { return nil, missing }); !errors.Is(err, missing) {
+		t.Fatalf("an ordinary listing error must pass through unchanged, got %v", err)
 	}
 }

@@ -204,7 +204,9 @@ func TestWriteOnlyDrillIsSkippedNotFailed(t *testing.T) {
 	pub, priv, _ := crypto.NewBackupKeypair()
 	dek, _ := crypto.NewDataKey()
 	wrapped, _ := crypto.WrapKeyPub(dek, pub)
-	man := Manifest{WrappedKeyPub: wrapped, BackupPubFP: crypto.BackupPubFP(pub)}
+	// A volume, so there is something a drill could restore.
+	data := []VolumeRef{{Destination: "/data"}}
+	man := Manifest{WrappedKeyPub: wrapped, BackupPubFP: crypto.BackupPubFP(pub), Volumes: data}
 	mj, _ := json.Marshal(&man)
 	b := &store.Backup{ID: "b1", ManifestJSON: string(mj)}
 
@@ -221,7 +223,7 @@ func TestWriteOnlyDrillIsSkippedNotFailed(t *testing.T) {
 		t.Fatalf("with the private key a drill must be possible, got %q", r)
 	}
 	// A symmetric backup is always drillable.
-	symMan, _ := json.Marshal(&Manifest{WrappedKey: "x"})
+	symMan, _ := json.Marshal(&Manifest{WrappedKey: "x", Volumes: data})
 	if r := e.DrillSkipReason(&store.Backup{ID: "b2", ManifestJSON: string(symMan)}); r != "" {
 		t.Fatalf("a symmetric backup must be drillable, got %q", r)
 	}

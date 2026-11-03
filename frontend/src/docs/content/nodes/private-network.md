@@ -144,12 +144,7 @@ Run the proxy on the node but **bind it to the overlay IP only**, so the plainte
       - "10.10.0.2:2375:2375"        # WireGuard IP  (or "100.101.102.104:2375:2375" for Tailscale)
 ```
 
-Then firewall it to the overlay interface as a belt-and-suspenders:
-
-```bash
-sudo ufw allow in on wg0 to any port 2375 proto tcp    # or tailscale0
-sudo ufw deny 2375/tcp
-```
+The binding is what protects it. UFW rules for this port don't help much, because Docker's rules for published ports skip UFW's usual ones ([Docker and ufw](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw)). Check instead: from another machine on the LAN, `curl -s -m 5 http://<server-lan-ip>:2375/version` must fail, while the same request to the overlay address from the DockBack host answers. With Tailscale, also limit port `2375` to the DockBack host in your ACLs.
 
 Add the node:
 
@@ -164,6 +159,6 @@ Now you get the proxy's endpoint filtering **and** encrypted, authenticated tran
 ## Do / don't
 
 - **Do** bind the socket-proxy to the overlay IP (or `127.0.0.1` + overlay), never `0.0.0.0`.
-- **Do** firewall the Docker/SSH port to the `wg0` / `tailscale0` interface.
+- **Do** firewall the SSH port to the `wg0` / `tailscale0` interface. For the socket-proxy, rely on the binding and check it from a machine that must be refused: Docker's published-port rules skip UFW's usual ones.
 - **Don't** publish a plaintext `2375` proxy on the LAN or internet — that's unauthenticated host root in the clear. The overlay exists precisely to avoid that.
 - **Don't** forget the overlay is reachable only while it's up; `PersistentKeepalive` (WireGuard) and the Tailscale daemon keep it alive across reboots.

@@ -25,6 +25,13 @@ import (
 // archiveWithEntries builds a real encrypted backup holding the named member.
 func archiveWithEntries(t *testing.T) (*Engine, *store.Backup) {
 	t.Helper()
+	return archiveWithPayload(t, bytes.Repeat([]byte("payload-"), 512*1024))
+}
+
+// archiveWithPayload builds the same backup around a given volume payload. An
+// incompressible one is what leaves a reader that stops early with data still to come.
+func archiveWithPayload(t *testing.T, payload []byte) (*Engine, *store.Backup) {
+	t.Helper()
 	be, err := storage.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +49,7 @@ func archiveWithEntries(t *testing.T) (*Engine, *store.Backup) {
 	work := t.TempDir()
 	var vbuf bytes.Buffer
 	vtw := tar.NewWriter(&vbuf)
-	tarAdd(t, vtw, "big/blob.bin", bytes.Repeat([]byte("payload-"), 512*1024))
+	tarAdd(t, vtw, "big/blob.bin", payload)
 	if err := vtw.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -1,8 +1,11 @@
 # Grype config (Security.md §5). Mirrors .trivyignore.
+# Owner: the release maintainer. Last reviewed 2026-11-03; review again every release.
 # See .trivyignore for the full justification of each accepted advisory.
 ignore:
-  # Moby daemon authorization-bypass (no importable Go-module fix yet; daemon-side
-  # code, not reachable via DockBack's client-only socket-proxy use). Grype keys
-  # it by GHSA; Trivy by CVE — list both aliases.
+  # Moby daemon authorization-plugin bypass (GO-2026-4887). No fixed
+  # github.com/docker/docker release; the code is daemon-side, which the DockBack
+  # client never runs. Each node's Docker Engine still needs patching: the
+  # socket-proxy does not protect a vulnerable daemon. Grype keys it by GHSA,
+  # Trivy by CVE, so both aliases are listed.
   - vulnerability: CVE-2026-34040
   - vulnerability: GHSA-x744-4wpc-v9h2

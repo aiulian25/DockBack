@@ -302,8 +302,15 @@ func watchUploadIdle(activity *uploadActivity, idle time.Duration, cancel contex
 // Bounded by inactivity rather than by elapsed time, so a large archive on a
 // throttled link finishes as long as bytes keep moving.
 func (s *S3) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
+	n, _, err := s.PutVersion(ctx, key, r)
+	return n, err
+}
+
+// PutVersion is Put, also returning the version id the bucket gave the object
+// ("" when it keeps no versions). See Versioned.
+func (s *S3) PutVersion(ctx context.Context, key string, r io.Reader) (int64, string, error) {
 	if err := validateKey(key); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -326,11 +333,11 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
 		// otherwise read as "context canceled", indistinguishable from the
 		// operator stopping the run.
 		if stalled.Load() && ctx.Err() == nil {
-			return 0, fmt.Errorf("s3 put %q: no data moved for %s — the destination stopped responding", s.objKey(key), s.idle())
+			return 0, "", fmt.Errorf("s3 put %q: no data moved for %s — the destination stopped responding", s.objKey(key), s.idle())
 		}
-		return 0, fmt.Errorf("s3 put %q: %w", s.objKey(key), err)
+		return 0, "", fmt.Errorf("s3 put %q: %w", s.objKey(key), err)
 	}
-	return info.Size, nil
+	return info.Size, info.VersionID, nil
 }
 
 // Get opens an object for reading.
@@ -340,10 +347,19 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
 // method without it is a path the rest cannot rely on. No absolute deadline —
 // Get streams a whole archive to a restore, and that is what step 8 removed.
 func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	return s.getObject(ctx, key, minio.GetObjectOptions{})
+}
+
+// GetVersion opens one exact version of key. See Versioned.
+func (s *S3) GetVersion(ctx context.Context, key, versionID string) (io.ReadCloser, error) {
+	return s.getObject(ctx, key, minio.GetObjectOptions{VersionID: versionID})
+}
+
+func (s *S3) getObject(ctx context.Context, key string, opts minio.GetObjectOptions) (io.ReadCloser, error) {
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
-	obj, err := s.client.GetObject(ctx, s.bucket, s.objKey(key), minio.GetObjectOptions{})
+	obj, err := s.client.GetObject(ctx, s.bucket, s.objKey(key), opts)
 	if err != nil {
 		return nil, err
 	}
@@ -363,6 +379,16 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 	return s.client.RemoveObject(ctx, s.bucket, s.objKey(key), minio.RemoveObjectOptions{})
+}
+
+// DeleteVersion permanently removes one version of key. See Versioned.
+func (s *S3) DeleteVersion(ctx context.Context, key, versionID string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+	return s.client.RemoveObject(ctx, s.bucket, s.objKey(key), minio.RemoveObjectOptions{VersionID: versionID})
 }
 
 // s3NotFound reports whether err means the object is definitively absent, as

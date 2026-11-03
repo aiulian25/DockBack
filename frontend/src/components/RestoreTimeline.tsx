@@ -10,6 +10,7 @@ import { useMemo, useState } from "react";
 import { failedCopies, goodCopies } from "../lib/backupRows";
 import { ShieldCheck, KeyRound, AlertTriangle, ArrowUpRight, CheckCircle2 } from "lucide-react";
 import { Backup, DrillStatus, fmtBytes } from "../api";
+import { INTEGRITY_VERIFIED_LABEL } from "../lib/verificationScope";
 
 // Geometry (px). Even index spacing (a filmstrip) rather than time-proportional
 // so clustered backups never overlap, while still reading oldest→newest L→R.
@@ -74,7 +75,7 @@ const STATE_LABEL: Record<PointState, string> = {
   degraded: "Degraded — an offsite copy is missing",
   "drill-failed": "Restore drill failed",
   drilled: "Drill-proven restorable",
-  verified: "Verified by test-restore",
+  verified: INTEGRITY_VERIFIED_LABEL,
   unverified: "Stored, not yet verified",
 };
 

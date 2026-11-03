@@ -4,7 +4,7 @@
 // the stored value when a field is left blank. Nothing is hardcoded.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Bell, Send, Loader2 } from "lucide-react";
-import { api, NotifyConfig, emptyNotifyConfig } from "../api";
+import { api, NotifyConfig, NotifyConfigResponse, emptyNotifyConfig } from "../api";
 import { Card, Button, Input, Label, Select } from "./ui";
 import { useRegisterSaver } from "./SettingsSave";
 
@@ -13,11 +13,12 @@ export default function NotificationsCard() {
   const [cfgBaseline, setCfgBaseline] = useState<NotifyConfig>(emptyNotifyConfig); // last-saved
   const [tokenSet, setTokenSet] = useState(false);
   const [pwSet, setPwSet] = useState(false);
+  const [stored, setStored] = useState<NotifyConfigResponse | null>(null);           // what the server says is saved
   const [testing, setTesting] = useState("");                                        // channel whose test is in flight
   const [results, setResults] = useState<Record<string, { ok: boolean; msg: string }>>({}); // per-channel last test result
 
   const load = () =>
-    api.getNotifications().then((r) => { setCfg(r.config); setCfgBaseline(r.config); setTokenSet(r.gotify_token_set); setPwSet(r.email_password_set); }).catch(() => {});
+    api.getNotifications().then((r) => { setCfg(r.config); setCfgBaseline(r.config); setTokenSet(r.gotify_token_set); setPwSet(r.email_password_set); setStored(r); }).catch(() => {});
   useEffect(() => { load(); }, []);
 
   // Register with the single global Save (replaces this card's own Save button).
@@ -25,8 +26,21 @@ export default function NotificationsCard() {
   const cfgBaseRef = useRef(cfgBaseline); cfgBaseRef.current = cfgBaseline;
   const saveNotif = useCallback(async () => {
     const r = await api.setNotifications(cfgRef.current);
-    setCfg(r.config); setCfgBaseline(r.config); setTokenSet(r.gotify_token_set); setPwSet(r.email_password_set);
+    setCfg(r.config); setCfgBaseline(r.config); setTokenSet(r.gotify_token_set); setPwSet(r.email_password_set); setStored(r);
   }, []);
+  // Removing a stored URL is its own action: a blank field means "keep it". It saves
+  // the last-saved settings, so edits still in the form stay unsaved.
+  const removeStoredUrl = async (secret: string) => {
+    const r = await api.setNotifications(cfgBaseRef.current, [secret]);
+    setCfgBaseline(r.config); setStored(r);
+  };
+  // storedUrlHint says what a blank URL field stands for, and offers to remove it.
+  const storedUrlHint = (isSet: boolean | undefined, host: string | undefined, secret: string) => isSet && (
+    <p className="flex flex-wrap items-center gap-2 text-xs text-on-surface-variant">
+      Saved URL{host ? ` for ${host}` : ""}, hidden because it contains a secret. Leave blank to keep it, or paste a new one to replace it.
+      <button type="button" className="underline" onClick={() => removeStoredUrl(secret).catch(() => {})}>Remove saved URL</button>
+    </p>
+  );
   // Discard: revert to the last-saved config (drives the global bar's Discard button).
   const resetNotif = useCallback(() => setCfg(cfgBaseRef.current), []);
   const dirty = JSON.stringify(cfg) !== JSON.stringify(cfgBaseline);
@@ -152,7 +166,8 @@ export default function NotificationsCard() {
         {cfg.webhook.enabled && (
           <div className="mt-2 space-y-2">
             <Label>URL</Label>
-            <Input value={cfg.webhook.url} placeholder="https://hooks.slack.com/services/…" onChange={(e) => setCfg({ ...cfg, webhook: { ...cfg.webhook, url: e.target.value } })} />
+            <Input value={cfg.webhook.url} placeholder={stored?.webhook_url_set ? "••••••••" : "https://hooks.slack.com/services/…"} onChange={(e) => setCfg({ ...cfg, webhook: { ...cfg.webhook, url: e.target.value } })} />
+            {storedUrlHint(stored?.webhook_url_set, stored?.webhook_url_host, "webhook_url")}
             {events("webhook")}
             {testBtn("webhook")}
           </div>
@@ -166,7 +181,8 @@ export default function NotificationsCard() {
         {cfg.heartbeat.enabled && (
           <div className="mt-2 space-y-2">
             <Label>Ping URL</Label>
-            <Input value={cfg.heartbeat.url} placeholder="https://hc-ping.com/your-uuid" onChange={(e) => setCfg({ ...cfg, heartbeat: { ...cfg.heartbeat, url: e.target.value } })} />
+            <Input value={cfg.heartbeat.url} placeholder={stored?.heartbeat_url_set ? "••••••••" : "https://hc-ping.com/your-uuid"} onChange={(e) => setCfg({ ...cfg, heartbeat: { ...cfg.heartbeat, url: e.target.value } })} />
+            {storedUrlHint(stored?.heartbeat_url_set, stored?.heartbeat_url_host, "heartbeat_url")}
             <Label>Keep-alive interval (minutes, 0 = only on verified backup)</Label>
             <Input type="number" min={0} value={cfg.heartbeat.interval_minutes} onChange={(e) => setCfg({ ...cfg, heartbeat: { ...cfg.heartbeat, interval_minutes: Math.max(0, parseInt(e.target.value || "0", 10)) } })} />
             {testBtn("heartbeat")}

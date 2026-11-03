@@ -92,7 +92,7 @@ func TestRewrapAppBackups(t *testing.T) {
 	snap := makeSnapshot(t)
 
 	// A v2 app-backup, wrapped by the OLD key.
-	v2, err := appbackup.CreateFile(dir, snap, oldKey, appbackup.Entry{CreatedAt: 1700000001, AppVersion: "t", KeyFingerprint: KeyFingerprint(oldKey)})
+	v2, err := appbackup.CreateFile(dir, snap, oldKey, appbackup.Entry{CreatedAt: 1700000001, AppVersion: "t", KeyFingerprint: KeyFingerprint(oldKey)}, t.TempDir())
 	if err != nil {
 		t.Fatalf("create v2: %v", err)
 	}

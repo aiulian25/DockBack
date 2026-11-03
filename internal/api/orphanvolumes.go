@@ -142,7 +142,7 @@ func (s *Server) restoreVolumeBackup(w http.ResponseWriter, r *http.Request, b *
 		// invisible and unstoppable — which the safety snapshot makes materially
 		// worse, since the run now begins by capturing the whole volume before it
 		// reaches the part the operator was waiting for.
-		ctx, finish, ok := s.beginRestoreRun(context.Background(), id, "volume "+vol, req.NodeID, 2*time.Hour)
+		ctx, finish, ok := s.beginRestoreRun(context.Background(), id, "volume "+vol, req.NodeID, 2*time.Hour, "")
 		if !ok {
 			s.logSink(id, "ERR", "Restore failed: another restore of this backup is already running")
 			return

@@ -26,7 +26,7 @@ const MaxIndexBytes = 512 << 20
 
 // CaptureSidecarRO runs cmd in a read-only sidecar (`--volumes-from target:ro`)
 // and returns its stdout, bounded by MaxIndexBytes. Used to build the volume file
-// index for an incremental backup (F61) via BuildIndexCmd. Read-only: it can never
+// index for an incremental backup (F61) via an inventory command. Read-only: it can never
 // mutate the target's data.
 // CaptureSidecarInNetns runs a command inside the TARGET's network namespace and
 // returns its output.
@@ -172,16 +172,6 @@ func CaptureSidecarRO(ctx context.Context, c *client.Client, targetID string, cm
 	return stdout.Bytes(), nil
 }
 
-// TarVolumesFromList streams a tar of ONLY the given volume-relative paths from a
-// read-only sidecar — the incremental "changed files only" payload (F61). The path
-// list is fed via stdin (unbounded, no ARG_MAX limit) into a temp file the sidecar
-// then hands to `tar -T`, so a large changed-set is fine. Paths are volume-relative
-// (leading slash stripped) so `tar -C /` restores them to the right place, exactly
-// like the full `volumes.tar`.
-func TarVolumesFromList(ctx context.Context, c *client.Client, targetID string, relPaths []string) (io.ReadCloser, error) {
-	return tarFromList(ctx, c, targetID, relPaths, "")
-}
-
 // TarVolumeEntries streams a tar of exactly the given volume-relative entries —
 // a directory as itself, never what is inside it — from a read-only sidecar:
 // the second pass of a short freeze, copying again only what changed while the
@@ -285,7 +275,7 @@ func DeleteVolumePaths(ctx context.Context, c *client.Client, targetID string, r
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{
-			Image: sidecarRef(), Cmd: []string{"/bin/sh", "-c", "cd / && xargs -0 rm -f"},
+			Image: sidecarRef(), Cmd: []string{"/bin/sh", "-c", "cd / && xargs -0 rm -rf"},
 			OpenStdin: true, StdinOnce: true, AttachStdin: true, AttachStdout: true, AttachStderr: true,
 			Labels: sidecarLabels(),
 		},

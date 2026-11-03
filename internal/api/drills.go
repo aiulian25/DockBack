@@ -134,15 +134,25 @@ func (s *Server) drillTick() {
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].ranAt < pending[j].ranAt })
 	perCycle := s.drillPerCycle()
-	for i := 0; i < perCycle && i < len(pending); i++ {
+	ran := 0
+	for _, p := range pending {
+		if ran >= perCycle {
+			break
+		}
 		// Full row for the drill itself — DrillBackup reads manifest/locations.
-		full, gerr := s.store.GetBackup(pending[i].b.ID)
+		full, gerr := s.store.GetBackup(p.b.ID)
 		if gerr != nil {
+			continue
+		}
+		// A backup a drill cannot test is never recorded, so it stays most overdue.
+		// Counting it against the cycle would let one such backup stop every drill.
+		if s.engine.DrillSkipReason(full) != "" {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 		s.runBackupDrill(ctx, full)
 		cancel()
+		ran++
 	}
 }
 
@@ -164,6 +174,10 @@ func (s *Server) recordDrillResult(b *store.Backup, ok bool, summary string) err
 // runBackupDrill test-restores one backup into a sandbox and records the result.
 // Alerts on failure so a broken restore path is never silent.
 func (s *Server) runBackupDrill(ctx context.Context, b *store.Backup) {
+	// One drill at a time on this instance, whoever asked: each spins up a database or
+	// an application, and a burst of manual drills must not exhaust a node.
+	s.drillMu.Lock()
+	defer s.drillMu.Unlock()
 	label := b.TargetName
 	if b.Stack != "" {
 		label = b.Stack + "/" + b.TargetName
@@ -227,8 +241,13 @@ func (s *Server) handleDrillBackup(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "this backup can't be drilled: "+reason)
 		return
 	}
+	if _, running := s.drillsInFlight.LoadOrStore(b.ID, struct{}{}); running {
+		errJSON(w, http.StatusConflict, "a drill of this backup is already running or waiting")
+		return
+	}
 	_ = s.store.Audit(userFrom(r), "backup.drill", b.ID, b.TargetName)
 	go func() {
+		defer s.drillsInFlight.Delete(b.ID)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 		defer cancel()
 		s.runBackupDrill(ctx, b)

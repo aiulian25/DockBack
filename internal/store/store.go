@@ -289,6 +289,34 @@ CREATE TABLE IF NOT EXISTS standby (
   PRIMARY KEY(node_id, target)
 );
 
+-- One restore run, so its outcome survives the console watching it and a restart.
+-- run_id is the stable id the log streams on and is reused; execution_id is unique.
+CREATE TABLE IF NOT EXISTS restore_executions (
+  execution_id TEXT PRIMARY KEY,
+  run_id       TEXT NOT NULL,
+  label        TEXT NOT NULL DEFAULT '',
+  started_at   INTEGER NOT NULL,
+  finished_at  INTEGER NOT NULL DEFAULT 0,
+  outcome      TEXT NOT NULL,   -- running|ok|failed|canceled|interrupted
+  message      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_restore_executions_run ON restore_executions(run_id, started_at DESC);
+
+-- What an operation is holding on a node, written before it pauses or stops a
+-- container and cleared once it has confirmably let go, so a restart can tell a
+-- hold it owns from a container somebody else stopped.
+CREATE TABLE IF NOT EXISTS workload_holds (
+  id               TEXT PRIMARY KEY,
+  node_id          TEXT NOT NULL,
+  container_id     TEXT NOT NULL DEFAULT '',
+  name             TEXT NOT NULL DEFAULT '',
+  kind             TEXT NOT NULL,   -- pause|stop|restore
+  state            TEXT NOT NULL,   -- intent|acquired
+  prior_started_at TEXT NOT NULL DEFAULT '',
+  detail           TEXT NOT NULL DEFAULT '',
+  created_at       INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS destination_samples (
   dest_id     TEXT NOT NULL,
   day         INTEGER NOT NULL,   -- unix day (ts/86400): one sample kept per day
@@ -665,17 +693,51 @@ func (s *Store) SetTOTPSecret(userID int64, sealed string) error {
 	return err
 }
 
-// SetTOTPLastStep records the newest consumed TOTP step (SEC-4 single-use guard).
-// The WHERE guard keeps it monotonic so a racing/older login can't roll it back.
-func (s *Store) SetTOTPLastStep(userID, step int64) error {
-	_, err := s.db.Exec(`UPDATE users SET totp_last_step=? WHERE id=? AND totp_last_step<?`, step, userID, step)
-	return err
+// ConsumeTOTPStep spends a verified TOTP step, reporting whether this call is the
+// one that did (SEC-4). Only one caller can move the step forward, so two requests
+// holding the same code cannot both win. The secret has to still be the one the code
+// was checked against, or the account's 2FA changed underneath the request.
+func (s *Store) ConsumeTOTPStep(userID int64, sealed string, step int64) (bool, error) {
+	res, err := s.db.Exec(`UPDATE users SET totp_last_step=? WHERE id=? AND totp_secret=? AND totp_last_step<?`, step, userID, sealed, step)
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	return changed == 1, err
 }
 
-// UpdateRecovery persists the remaining recovery-code hashes (after one is used).
-func (s *Store) UpdateRecovery(userID int64, recoveryJSON string) error {
-	_, err := s.db.Exec(`UPDATE users SET totp_recovery=? WHERE id=?`, recoveryJSON, userID)
-	return err
+// recoveryConsumeAttempts bounds how often a recovery-code use re-reads after losing
+// the swap. One account has only a handful of codes, so a loss is rare.
+const recoveryConsumeAttempts = 8
+
+// ConsumeRecoveryCode spends a recovery code against the account's current list, not
+// a snapshot read earlier. match gets the stored list and returns what remains, or
+// false when the code is not in it. The list is replaced only if it is still the one
+// match saw; otherwise it is read again, so a code spent by another request stays
+// spent. It returns the remaining list, and whether this call spent the code.
+func (s *Store) ConsumeRecoveryCode(userID int64, match func(current string) (remaining string, ok bool)) (string, bool, error) {
+	for range recoveryConsumeAttempts {
+		var current string
+		if err := s.db.QueryRow(`SELECT totp_recovery FROM users WHERE id=?`, userID).Scan(&current); err != nil {
+			return "", false, err
+		}
+		remaining, ok := match(current)
+		if !ok {
+			return "", false, nil
+		}
+		res, err := s.db.Exec(`UPDATE users SET totp_recovery=? WHERE id=? AND totp_recovery=?`, remaining, userID, current)
+		if err != nil {
+			return "", false, err
+		}
+		changed, err := res.RowsAffected()
+		if err != nil {
+			return "", false, err
+		}
+		if changed == 1 {
+			return remaining, true, nil
+		}
+	}
+	return "", false, errors.New("recovery codes kept changing while one was being used")
 }
 
 // UpdatePassword sets a new password hash for a user.
@@ -1765,6 +1827,69 @@ func (s *Store) ClearBackupSuspects(nodeID, target string) (int64, error) {
 	return n, nil
 }
 
+// BackupInterruptedByRestart marks a backup cut short by DockBack stopping. Such a
+// row is discarded at the next start, and its queued job runs again.
+const BackupInterruptedByRestart = "interrupted by restart"
+
+// WorkloadHold is one journal row: see backup/holdjournal.go.
+type WorkloadHold struct {
+	ID             string
+	NodeID         string
+	ContainerID    string
+	Name           string
+	Kind           string
+	State          string
+	PriorStartedAt string
+	Detail         string
+	CreatedAt      int64
+}
+
+// AddWorkloadHold writes a journal row, replacing one of the same id.
+func (s *Store) AddWorkloadHold(h WorkloadHold) error {
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO workload_holds
+		(id, node_id, container_id, name, kind, state, prior_started_at, detail, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?)`,
+		h.ID, h.NodeID, h.ContainerID, h.Name, h.Kind, h.State, h.PriorStartedAt, h.Detail, h.CreatedAt)
+	return err
+}
+
+// MarkWorkloadHoldAcquired records that the Docker call the row announced happened.
+func (s *Store) MarkWorkloadHoldAcquired(id string) error {
+	_, err := s.db.Exec(`UPDATE workload_holds SET state='acquired' WHERE id=?`, id)
+	return err
+}
+
+// SetWorkloadHoldDetail records what recovery will need to name.
+func (s *Store) SetWorkloadHoldDetail(id, detail string) error {
+	_, err := s.db.Exec(`UPDATE workload_holds SET detail=? WHERE id=?`, detail, id)
+	return err
+}
+
+// DeleteWorkloadHold clears a row. Clearing one that is not there is no error.
+func (s *Store) DeleteWorkloadHold(id string) error {
+	_, err := s.db.Exec(`DELETE FROM workload_holds WHERE id=?`, id)
+	return err
+}
+
+// ListWorkloadHolds returns every row, oldest first.
+func (s *Store) ListWorkloadHolds() ([]WorkloadHold, error) {
+	rows, err := s.db.Query(`SELECT id, node_id, container_id, name, kind, state, prior_started_at, detail, created_at
+		FROM workload_holds ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WorkloadHold
+	for rows.Next() {
+		var h WorkloadHold
+		if err := rows.Scan(&h.ID, &h.NodeID, &h.ContainerID, &h.Name, &h.Kind, &h.State, &h.PriorStartedAt, &h.Detail, &h.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
 // PurgeInterruptedBackups removes backups left "running" by an app restart/crash
 // (and any prior rows already flagged 'interrupted by restart'). Such runs never
 // produced a usable artifact, so they're discarded rather than kept as confusing
@@ -1772,7 +1897,7 @@ func (s *Store) ClearBackupSuspects(nodeID, target string) (int64, error) {
 // removed.
 func (s *Store) PurgeInterruptedBackups() (int64, error) {
 	res, err := s.db.Exec(`DELETE FROM backups
-		WHERE status='running' OR (status='failed' AND error='interrupted by restart')`)
+		WHERE status='running' OR (status='failed' AND error=?)`, BackupInterruptedByRestart)
 	if err != nil {
 		return 0, err
 	}
@@ -1910,6 +2035,53 @@ func (s *Store) ListBackups(nodeID string, limit int) ([]*Backup, error) {
 	return out, rows.Err()
 }
 
+// BackupCursor is a position in a node's backup history, newest first: the
+// created_at and id of the last backup a page held. The zero value is the newest.
+type BackupCursor struct {
+	CreatedAt int64
+	ID        string
+}
+
+// ListSuccessfulBackupsPage returns up to limit successful backups of a node, newest
+// first and older than after, optionally one target's only. Ordered by (created_at,
+// id), so a page ends at an exact row: a backup taken meanwhile is newer than every
+// cursor and cannot shift or repeat the pages behind it. Filtering happens here, so
+// one busy container cannot push another's history out of the page.
+func (s *Store) ListSuccessfulBackupsPage(nodeID, target string, after BackupCursor, limit int) ([]*Backup, error) {
+	q := `SELECT id, node_id, stack, target_name, status, verified, size_bytes,
+		cipher_sha256, storage_key, manifest_json, verification_json, locations, error, created_at, completed_at, last_verified_at, pinned, label, duration_ms, suspect
+		FROM backups WHERE node_id=? AND status='success'`
+	args := []any{nodeID}
+	if target != "" {
+		q += ` AND target_name=?`
+		args = append(args, target)
+	}
+	if after.ID != "" {
+		q += ` AND (created_at < ? OR (created_at = ? AND id < ?))`
+		args = append(args, after.CreatedAt, after.CreatedAt, after.ID)
+	}
+	q += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Backup{}
+	for rows.Next() {
+		b := &Backup{}
+		var pin int
+		if err := rows.Scan(&b.ID, &b.NodeID, &b.Stack, &b.TargetName, &b.Status, &b.Verified, &b.SizeBytes,
+			&b.CipherSHA256, &b.StorageKey, &b.ManifestJSON, &b.VerificationJSON, &b.LocationsJSON, &b.Error,
+			&b.CreatedAt, &b.CompletedAt, &b.LastVerifiedAt, &pin, &b.Label, &b.DurationMs, &b.Suspect); err != nil {
+			return nil, err
+		}
+		b.Pinned = pin == 1
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 // ListBackupsForTarget returns the newest `limit` backups of ONE container
 // (node_id + target_name), newest first.
 //
@@ -1927,6 +2099,103 @@ func (s *Store) ListBackupsForTarget(nodeID, target string, limit int) ([]*Backu
 		cipher_sha256, storage_key, manifest_json, verification_json, locations, error, created_at, completed_at, last_verified_at, pinned, label, duration_ms, suspect
 		FROM backups WHERE node_id=? AND target_name=? ORDER BY created_at DESC LIMIT ?`,
 		nodeID, target, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Backup{}
+	for rows.Next() {
+		b := &Backup{}
+		var pin int
+		if err := rows.Scan(&b.ID, &b.NodeID, &b.Stack, &b.TargetName, &b.Status, &b.Verified, &b.SizeBytes,
+			&b.CipherSHA256, &b.StorageKey, &b.ManifestJSON, &b.VerificationJSON, &b.LocationsJSON, &b.Error,
+			&b.CreatedAt, &b.CompletedAt, &b.LastVerifiedAt, &pin, &b.Label, &b.DurationMs, &b.Suspect); err != nil {
+			return nil, err
+		}
+		b.Pinned = pin == 1
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// RestoreExecutionRunning is a restore execution's outcome until it has one.
+const RestoreExecutionRunning = "running"
+
+// restoreExecutionsKept bounds the history: this table answers "how did that run end",
+// and the run log and audit trail are the record of what happened.
+const restoreExecutionsKept = 500
+
+// RestoreExecution is one restore run and how it ended.
+type RestoreExecution struct {
+	ExecutionID string `json:"execution_id"`
+	RunID       string `json:"run_id"`
+	Label       string `json:"label"`
+	StartedAt   int64  `json:"started_at"`
+	FinishedAt  int64  `json:"finished_at,omitempty"`
+	Outcome     string `json:"outcome"`
+	Message     string `json:"message,omitempty"`
+}
+
+// BeginRestoreExecution records a run as started, and trims the oldest finished rows.
+func (s *Store) BeginRestoreExecution(executionID, runID, label string) error {
+	if _, err := s.db.Exec(`INSERT INTO restore_executions (execution_id, run_id, label, started_at, outcome) VALUES (?,?,?,?,?)`,
+		executionID, runID, label, now(), RestoreExecutionRunning); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM restore_executions WHERE outcome<>? AND execution_id NOT IN
+		(SELECT execution_id FROM restore_executions ORDER BY started_at DESC, rowid DESC LIMIT ?)`, RestoreExecutionRunning, restoreExecutionsKept)
+	return err
+}
+
+// FinishRestoreExecution records how a run ended, once: it reports whether this call
+// is the one that did, so a later cleanup cannot overwrite the real answer.
+func (s *Store) FinishRestoreExecution(executionID, outcome, message string) (bool, error) {
+	res, err := s.db.Exec(`UPDATE restore_executions SET outcome=?, message=?, finished_at=? WHERE execution_id=? AND outcome=?`,
+		outcome, message, now(), executionID, RestoreExecutionRunning)
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	return changed == 1, err
+}
+
+// InterruptRunningRestoreExecutions finishes every run still marked running. Only for
+// startup, when no restore can be running, and returns how many there were.
+func (s *Store) InterruptRunningRestoreExecutions(outcome, message string) (int64, error) {
+	res, err := s.db.Exec(`UPDATE restore_executions SET outcome=?, message=?, finished_at=? WHERE outcome=?`,
+		outcome, message, now(), RestoreExecutionRunning)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// GetRestoreExecution returns one execution of a run, or the newest one when
+// executionID is empty. sql.ErrNoRows when there is none.
+func (s *Store) GetRestoreExecution(runID, executionID string) (*RestoreExecution, error) {
+	query := `SELECT execution_id, run_id, label, started_at, finished_at, outcome, message FROM restore_executions WHERE run_id=?`
+	args := []any{runID}
+	if executionID != "" {
+		query += ` AND execution_id=?`
+		args = append(args, executionID)
+	}
+	query += ` ORDER BY started_at DESC, rowid DESC LIMIT 1`
+	e := &RestoreExecution{}
+	err := s.db.QueryRow(query, args...).Scan(&e.ExecutionID, &e.RunID, &e.Label, &e.StartedAt, &e.FinishedAt, &e.Outcome, &e.Message)
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// ListBackupsAwaitingOffsite returns the successful backups with a copy still to be
+// sent, oldest first, so a parent comes before the delta that needs it. The text
+// match is on JSON this program writes, and every row it finds is parsed before use.
+func (s *Store) ListBackupsAwaitingOffsite() ([]*Backup, error) {
+	rows, err := s.db.Query(`SELECT id, node_id, stack, target_name, status, verified, size_bytes,
+		cipher_sha256, storage_key, manifest_json, verification_json, locations, error, created_at, completed_at, last_verified_at, pinned, label, duration_ms, suspect
+		FROM backups WHERE status='success' AND (locations LIKE '%"status":"deferred"%' OR locations LIKE '%"status":"failed"%' OR locations LIKE '%"status":"incomplete"%')
+		ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}

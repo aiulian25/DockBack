@@ -2,11 +2,15 @@ package backup
 
 import (
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
+
+	"dockback/internal/crypto"
 )
 
 // Compression algorithms recorded in the manifest so restore can pick the right
@@ -111,6 +115,59 @@ func newDecompressReader(r io.Reader, algo string) (io.ReadCloser, error) {
 		return readCloser{Reader: d, closeFn: func() error { d.Close(); return nil }}, nil
 	}
 	return nil, fmt.Errorf("unknown compression algorithm %q", algo)
+}
+
+// archiveProducerExitWait is how long closing an archive stream waits for its decrypt
+// goroutine. A read stuck on a network that closing did not break is not worth holding
+// a restore for: it exits as soon as that read returns.
+var archiveProducerExitWait = 5 * time.Second
+
+// archiveStream is a stored archive being read: decrypted, then decompressed. It owns
+// everything that takes, so a reader can stop at any point. Reading a member out of a
+// backup stops early on purpose, and without this the decrypt goroutine stayed parked
+// on a pipe write nobody would read, holding its buffers and the open source.
+type archiveStream struct {
+	io.Reader
+	pipe         *io.PipeReader
+	decompressor io.Closer
+	source       io.Closer
+	producerDone chan struct{}
+}
+
+// openArchiveStream starts reading source, which it then owns: Close closes it, and
+// so does a failure here. Canceling ctx stops the read itself, since a local copy is
+// an os.File, which does not watch a context.
+func openArchiveStream(ctx context.Context, source io.ReadCloser, key []byte, algo string) (*archiveStream, error) {
+	pipeReader, pipeWriter := io.Pipe()
+	stream := &archiveStream{pipe: pipeReader, source: source, producerDone: make(chan struct{})}
+	go func() {
+		defer close(stream.producerDone)
+		pipeWriter.CloseWithError(crypto.Decrypt(pipeWriter, ctxReader(ctx, source), key))
+	}()
+	decompressed, err := newDecompressReader(pipeReader, algo)
+	if err != nil {
+		stream.Close()
+		return nil, err
+	}
+	stream.Reader, stream.decompressor = decompressed, decompressed
+	return stream, nil
+}
+
+// Close releases the stream, in the order that cannot deadlock: the pipe first, which
+// ends a producer blocked writing and any decompressor worker blocked reading, then
+// the decompressor, then the source, which ends a producer blocked reading.
+func (s *archiveStream) Close() {
+	s.pipe.Close()
+	if s.decompressor != nil {
+		s.decompressor.Close()
+	}
+	s.source.Close()
+	timer := time.NewTimer(archiveProducerExitWait)
+	defer timer.Stop()
+	select {
+	case <-s.producerDone:
+	case <-timer.C:
+	}
 }
 
 type readCloser struct {

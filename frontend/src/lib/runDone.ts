@@ -16,10 +16,13 @@
 // console that hears the event acts on it; one that does not carries on exactly
 // as it did.
 
-/** How a run ended. Canceled is its own answer — the operator chose it. */
-export type RunOutcome = "ok" | "failed" | "canceled";
+/**
+ * How a run ended. Canceled is its own answer — the operator chose it. Interrupted
+ * means DockBack itself stopped during the run.
+ */
+export type RunOutcome = "ok" | "failed" | "canceled" | "interrupted";
 
-export type RunDone = { run_id: string; outcome: RunOutcome; message: string };
+export type RunDone = { run_id: string; execution_id?: string; outcome: RunOutcome; message: string };
 
 /**
  * onRunDone calls fn when the run identified by runId reports that it is over.
@@ -51,10 +54,28 @@ export function onRunDone(
  * to this run, or null. Pure, so the shared log stream can dispatch it through
  * its own fan-out and the rule still lives in one place.
  */
-export function parseRunDone(data: unknown, runId: string): { outcome: RunOutcome; message: string } | null {
+export function parseRunDone(data: unknown, runId: string): { outcome: RunOutcome; message: string; executionId?: string } | null {
   const d = data as RunDone | null;
   if (!d || typeof d !== "object") return null;
   if (d.run_id !== runId) return null;
-  if (d.outcome !== "ok" && d.outcome !== "failed" && d.outcome !== "canceled") return null;
-  return { outcome: d.outcome, message: d.message ?? "" };
+  if (!isRunOutcome(d.outcome)) return null;
+  return { outcome: d.outcome, message: d.message ?? "", executionId: d.execution_id };
+}
+
+/** Whether a value is a finished run's outcome, as opposed to "running" or junk. */
+export function isRunOutcome(value: unknown): value is RunOutcome {
+  return value === "ok" || value === "failed" || value === "canceled" || value === "interrupted";
+}
+
+// A run id's hex length, matching what the server accepts for a proposed execution id.
+const EXECUTION_ID_BYTES = 16;
+
+/**
+ * A console's own name for a run it is about to start. It has to exist before the
+ * request does, because the console starts listening first. getRandomValues rather
+ * than randomUUID, which browsers only offer over HTTPS.
+ */
+export function newExecutionId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(EXECUTION_ID_BYTES));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }

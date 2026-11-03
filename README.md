@@ -5,15 +5,16 @@
 </p>
 
 A single-container, GUI-driven Docker backup tool that **discovers**, **backs up**,
-**verifies by test-restoring**, and **restores** your containers — with backups
-that are *actually proven readable* before you trust them.
+**verifies**, and **restores** your containers. Every backup is read back end to end
+before it is marked verified, and test restores (databases into a throwaway
+container, or whole containers into a sandbox) can run on top of that.
 
 Shipped as a single, hardened, distroless image — **just pull and run**.
 
 > **Why:** images are reproducible (re-pull from a registry); what's
 > irreplaceable is *state* — volumes, databases, and the config that wires them
 > together. DockBack backs up the state, records the exact image digest for
-> restore, and **verifies every backup**.
+> restore, and **integrity-checks every backup**.
 
 ---
 
@@ -83,7 +84,11 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   those backups. Fully recoverable offline with the bundled Python tool.
 - **Always-on verification** — every backup is integrity-checked (ciphertext
   SHA-256, full decrypt + decompress + archive walk, DB-dump sanity) and marked
-  `Verified` / `Unverified` / `Failed`. Never downgraded to sampling.
+  `Verified` / `Unverified` / `Failed`. Never downgraded to sampling. `Verified`
+  proves the archive is intact and readable; it is **not** a test restore. Two
+  deeper checks are opt-in and off by default: **deep verification** imports each
+  database dump into a throwaway container, and **restore drills** bring a whole
+  container up from its backup in a sandbox on a schedule.
 - **Restore** — re-import volumes + databases into a target container, recreate a
   container from its manifest, one-click whole-stack restore, or download a
   decrypted archive for manual/granular recovery. Backups **and** restores can be
@@ -114,8 +119,12 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   than inferring it from the wording of a log line.
   **Files only** puts back a deleted stack folder — compose file, `.env`, project
   files and missing secret files — while every container keeps running, and names
-  the data folders only a full restore can bring back. An in-place restore writes
-  single-file binds and missing folders back with their recorded owner and mode,
+  the data folders only a full restore can bring back. It never replaces a file
+  that is still there, so a compose file or `.env` you edited since stays yours,
+  and a file it cannot write fails it by name. An in-place restore stops the
+  container first, so a stop that is refused writes nothing, then writes its
+  single-file binds to where the container mounts them now, with their recorded
+  owner and mode, plus any missing folders. It
   writes into `:ro` mounts without making them writable, proves a database's
   backup before clearing it, and if it fails rolls back to its safety snapshot or
   starts the container again. A stack restore follows `depends_on`, keeps going
@@ -129,7 +138,10 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   Nextcloud/WebDAV, S3/Backblaze B2, and any **SSH box via SFTP** with pinned
   host keys), with **S3/B2 Object-Lock (WORM)** immutable copies, a one-click
   "is this bucket really immutable?" preflight, and optional **sealed manifests**
-  so a cloud storage operator learns nothing about what's inside.
+  so a cloud storage operator learns nothing about what's inside. Each S3 copy
+  records the version the bucket gave it, so a delete marker or a newer object
+  under the same name cannot hide or replace it from a restore, and pruning
+  counts space as freed only when the provider has really removed it.
 - **Scheduling & retention** — multiple named schedules, GFS retention,
   per-cluster / per-node / per-container overrides resolved most-specific-first,
   low-RPO protection for critical databases, and an
@@ -160,6 +172,10 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
 - **Insights & proof** — per-container size & growth trends, a recovery timeline,
   periodic **restore drills** (test-restores into a sandbox) and re-verification
   **scrubs** against bit-rot, plus persisted, **downloadable per-run logs**. A
+  drill reads the copy a restore would use, rebuilds an incremental's chain, boots
+  the image digest the backup recorded, and runs one at a time in a capped
+  memory, CPU and process budget. A backup it cannot test is reported as not
+  drillable instead of passing. A
   drill gives back any image it had to pull — by ID, so nothing is left untagged
   and unreclaimable — and while a large transfer is running the dashboard says
   **"stats paused"** for that node instead of polling a saturated socket and
@@ -433,14 +449,20 @@ default — a defense-in-depth complement to the private-network access above.
 
 ## Lightweight by design — runs on a Raspberry Pi
 
-DockBack is a single **~21 MB** distroless binary. It barely registers when idle
-and stays bounded under load, so it happily lives on a spare Pi or the smallest
-VPS without stealing resources from the containers it protects.
+DockBack is a single distroless binary (about **26 MB**, in a **45 MB** image). It
+barely registers when idle and stays bounded under load, so it happily lives on a
+spare Pi or the smallest VPS without stealing resources from the containers it
+protects.
 
 | State | CPU | RAM |
 |---|---|---|
-| **Idle** (watching + scheduling) | ~0% | **~18 MB** total (app + socket-proxy) |
+| **Idle** (watching + scheduling) | ~0% | **~20 MB** total (app + socket-proxy) |
 | **Under load** (compress · encrypt · upload) | up to its 2‑vCPU cap while compressing | a few hundred MB, hard‑capped at 1 GiB |
+
+The idle figures were measured on 2026-11-03 against a fresh instance with the
+local node only and no backups yet, after it had settled (a moment after start it
+briefly reads higher). More nodes and a longer history use more; check yours with
+`docker stats`. The load figures are the configured limits, not a measurement.
 
 Why it stays lean under load: the pipeline is **streaming** (chunked AES‑256‑GCM),
 large volume archives **spool to disk, not RAM**, and the heavy volume reads and
@@ -456,8 +478,10 @@ CPU or memory.
 | **Recommended** | 2 | 2 GB | typical home lab / small fleet — no hiccups |
 | Larger fleet | 4 | 4 GB | many nodes, big volumes, high concurrency |
 
-Plus disk for your backups (sized to your data × retention) and a little scratch
-for the work directory. Everything is tunable in the in-app **Docs → Getting
+Plus disk for your backups (sized to your data × retention) and scratch for the
+work directory. That spool is the data as captured, **unencrypted**, until the
+archive is packed and encrypted, so keep the work directory on a disk only
+DockBack can read. Everything is tunable in the in-app **Docs → Getting
 Started → Requirements, sizing & performance**.
 
 ---
@@ -558,8 +582,8 @@ before publication.
 
 ## Roadmap
 
-Point-in-time database recovery, content-defined deduplication, storage-capacity
-forecasting, and in-app browse-and-restore of individual files are on the way.
+Point-in-time database recovery (continuous WAL archiving) and content-defined
+deduplication are on the way.
 
 ---
 

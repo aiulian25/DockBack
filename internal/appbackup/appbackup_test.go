@@ -6,9 +6,11 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"dockback/internal/crypto"
@@ -220,7 +222,7 @@ func TestLocalCatalog(t *testing.T) {
 	src.Close()
 
 	catalog := t.TempDir()
-	e, err := CreateFile(catalog, snap, key, Entry{CreatedAt: 1700000000, AppVersion: "t", KeyFingerprint: "fp", Nodes: 2, Backups: 5, Destinations: 1})
+	e, err := CreateFile(catalog, snap, key, Entry{CreatedAt: 1700000000, AppVersion: "t", KeyFingerprint: "fp", Nodes: 2, Backups: 5, Destinations: 1}, t.TempDir())
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -278,7 +280,7 @@ func TestVerifyFile(t *testing.T) {
 	}
 	snap := makeSnapshot(t)
 
-	entry, err := CreateFile(dir, snap, key, Entry{CreatedAt: 1000, AppVersion: "test", KeyFingerprint: "fp"})
+	entry, err := CreateFile(dir, snap, key, Entry{CreatedAt: 1000, AppVersion: "test", KeyFingerprint: "fp"}, t.TempDir())
 	if err != nil {
 		t.Fatalf("CreateFile: %v", err)
 	}
@@ -307,7 +309,7 @@ func TestVerifyFile(t *testing.T) {
 	}
 
 	// Wrong key → fails (never silently "ok").
-	pristine, _ := CreateFile(dir, snap, key, Entry{CreatedAt: 2000, AppVersion: "test", KeyFingerprint: "fp"})
+	pristine, _ := CreateFile(dir, snap, key, Entry{CreatedAt: 2000, AppVersion: "test", KeyFingerprint: "fp"}, t.TempDir())
 	badKey := make([]byte, 32)
 	if err := VerifyFile(dir, pristine.File, badKey, tmp); err == nil {
 		t.Fatal("wrong key must FAIL verification")
@@ -341,7 +343,7 @@ func TestRewrapFile(t *testing.T) {
 	src.Close()
 
 	dir := t.TempDir()
-	ent, err := CreateFile(dir, snap, keyA, Entry{CreatedAt: 1700000000, AppVersion: "test", KeyFingerprint: "fp-a"})
+	ent, err := CreateFile(dir, snap, keyA, Entry{CreatedAt: 1700000000, AppVersion: "test", KeyFingerprint: "fp-a"}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,11 +389,50 @@ func TestRewrapFile(t *testing.T) {
 	// A file sealed under an UNRELATED key is a loud FAILURE, not a skip.
 	foreign := make([]byte, 32)
 	rand.Read(foreign)
-	fent, err := CreateFile(dir, snap, foreign, Entry{CreatedAt: 1700000001, AppVersion: "test", KeyFingerprint: "fp-x"})
+	fent, err := CreateFile(dir, snap, foreign, Entry{CreatedAt: 1700000001, AppVersion: "test", KeyFingerprint: "fp-x"}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := RewrapFile(dir, fent.File, "fp-b", keyA, keyB); err == nil {
 		t.Fatal("a foreign-key file must be reported as failed, not silently skipped")
+	}
+}
+
+// failingDestination takes the header and then fails, which is the point where the
+// tar writer is running and has more to write.
+type failingDestination struct{ remaining int }
+
+func (d *failingDestination) Write(p []byte) (int, error) {
+	if len(p) > d.remaining {
+		return 0, errors.New("destination is full")
+	}
+	d.remaining -= len(p)
+	return len(p), nil
+}
+
+// A destination failing part-way used to leave the tar writer parked on its pipe for
+// good, holding the snapshot file open.
+func TestCreateReleasesItsWriterWhenTheDestinationFails(t *testing.T) {
+	const incompressibleBytes = 4 << 20
+	snapshot := filepath.Join(t.TempDir(), "snapshot.db")
+	payload := make([]byte, incompressibleBytes)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshot, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	const headerRoom = 64 << 10
+	if err := Create(&failingDestination{remaining: headerRoom}, snapshot, key, Manifest{}); err == nil {
+		t.Fatal("a failed destination must fail the backup")
+	}
+	stacks := make([]byte, 1<<22)
+	stacks = stacks[:runtime.Stack(stacks, true)]
+	if bytes.Contains(stacks, []byte("appbackup.writeArchive")) {
+		t.Fatalf("the writer is still running:\n%s", stacks)
 	}
 }

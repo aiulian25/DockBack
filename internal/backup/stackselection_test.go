@@ -1,10 +1,14 @@
 package backup
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 
+	"dockback/internal/crypto"
+	"dockback/internal/storage"
 	"dockback/internal/store"
 )
 
@@ -200,5 +204,59 @@ func TestStackSourceReachesEveryMember(t *testing.T) {
 	// "local" is a real choice and must survive as one, not be normalised away.
 	if o := stackServiceRestoreOptions(member, "n1", StackRestoreOptions{Source: "local"}); o.Source != "local" {
 		t.Errorf(`"local" must reach the member verbatim, got %q`, o.Source)
+	}
+}
+
+// A chosen copy is tried first and is not a pin: the restore goes on without it.
+// Somebody who chose "not this disk" and was read from it anyway has to be told,
+// and in the stack's console, because that is the log they are watching.
+func TestReadingAnotherCopyThanTheChosenOneWarns(t *testing.T) {
+	const stackLog = "stack:blog"
+	be, err := storage.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	payload := []byte("ciphertext")
+	if _, err := be.Put(ctx, "k", bytes.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := crypto.CipherSHA256(bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &store.Backup{ID: "b1", TargetName: "blog-db", StorageKey: "k", CipherSHA256: sum,
+		LocationsJSON: `[{"kind":"local","name":"local","type":"local"}]`}
+
+	warningsReading := func(source string, ctx context.Context) map[string]string {
+		warnings := map[string]string{}
+		e := &Engine{Storage: be, Log: func(id, level, msg string) {
+			if level == "WARN" {
+				warnings[id] = msg
+			}
+		}}
+		rc, err := e.openVerified(ctx, b, source)
+		if err != nil {
+			t.Fatalf("source %q: the read must go on from the copy there is: %v", source, err)
+		}
+		rc.Close()
+		return warnings
+	}
+
+	inStack := context.WithValue(ctx, stackRunLogKey{}, stackLog)
+	got := warningsReading("dest-nas", inStack)
+	for _, id := range []string{b.ID, stackLog} {
+		if !strings.Contains(got[id], "local") || !strings.Contains(got[id], b.TargetName) {
+			t.Errorf("log %s must name the service and the copy read instead: %q", id, got[id])
+		}
+	}
+	if got := warningsReading("dest-nas", ctx); got[b.ID] == "" || len(got) != 1 {
+		t.Errorf("outside a stack restore only the backup's own log has it: %v", got)
+	}
+	// What was asked for, or nothing asked for at all, is nothing to warn about.
+	for _, source := range []string{"local", ""} {
+		if got := warningsReading(source, inStack); len(got) != 0 {
+			t.Errorf("source %q was honoured, so nothing should warn: %v", source, got)
+		}
 	}
 }

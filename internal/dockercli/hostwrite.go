@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
@@ -157,7 +158,30 @@ type HostReconstructResult struct {
 	// restore has to converge, not accumulate a .bak per attempt.
 	Unchanged bool
 	Owner     string // uid:gid stamped on the created dir/file (matched to the parent), "" if unknown
+	// Kept are the files a KeepExisting write found already there and left
+	// exactly as they were.
+	Kept []string
+	// Failed names each file that could not be written, with the reason.
+	Failed []string
 }
+
+// HostWritePolicy is what a stack-folder write does with a file already at a
+// name it is about to write.
+type HostWritePolicy int
+
+const (
+	// ReplaceExisting renames a different file aside and writes in its place: a
+	// full restore puts back what the stack ran from.
+	ReplaceExisting HostWritePolicy = iota
+	// KeepExisting leaves every file that is there as it is and writes only the
+	// missing ones: a files-only restore promises that nothing existing changes.
+	KeepExisting
+)
+
+const envFileName = ".env"
+
+// errHostFileTaken is a write refused because something already holds the name.
+var errHostFileTaken = errors.New("something is already there")
 
 // validateHostStackDir vets an absolute host directory we are about to create and
 // write a compose file into, returning the parent to bind-mount and the leaf
@@ -335,7 +359,7 @@ func safeComposeName(name string) string {
 // other stacks. Errors here are the caller's to treat as non-fatal — the
 // container has already been recreated; this only rebuilds the host-side folder.
 func ReconstructStackDir(ctx context.Context, c *client.Client, stackDir, composeName string, compose []byte) (*HostReconstructResult, error) {
-	return ReconstructStackDirWithEnv(ctx, c, stackDir, composeName, compose, nil, "")
+	return ReconstructStackDirWithEnv(ctx, c, stackDir, composeName, compose, nil, "", ReplaceExisting)
 }
 
 // ReconstructStackDirWithEnv is ReconstructStackDir plus an optional .env
@@ -357,7 +381,12 @@ func ReconstructStackDir(ctx context.Context, c *client.Client, stackDir, compos
 // same rules as the compose file: identical is left alone, different is renamed
 // aside first. The caller decides the names — an original compose file under
 // its own name, DockBack's reconstruction under one Compose does not read.
-func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir, composeName string, compose, envFile []byte, preferOwner string, beside ...NamedFile) (*HostReconstructResult, error) {
+//
+// policy KeepExisting changes "renamed aside" to "left as it is" for every one
+// of these files, and lists them in Kept. Under either policy a file is created
+// only where nothing is, and a beside file that cannot be written is named in
+// Failed rather than skipped in silence.
+func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir, composeName string, compose, envFile []byte, preferOwner string, policy HostWritePolicy, beside ...NamedFile) (*HostReconstructResult, error) {
 	parent, base, err := validateHostStackDir(stackDir)
 	if err != nil {
 		return nil, err
@@ -422,8 +451,8 @@ func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir,
 			_, _ = ExecCapture(ctx, c, created.ID, []string{"sh", "-c", "chown " + owner + " " + shQuote(dir) + " 2>/dev/null || true"})
 		}
 		res := &HostReconstructResult{Dir: path.Join(path.Dir(stackDir), base), Owner: owner}
-		err := writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, res)
-		writeFilesBeside(ctx, c, created.ID, dir, owner, beside, res)
+		err := writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, policy, res)
+		writeFilesBeside(ctx, c, created.ID, dir, owner, beside, policy, res)
 		return res, err
 	}
 
@@ -455,8 +484,20 @@ func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir,
 			Unchanged: true,
 			Owner:     owner,
 		}
-		err := writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, res)
-		writeFilesBeside(ctx, c, created.ID, dir, owner, beside, res)
+		err := writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, policy, res)
+		writeFilesBeside(ctx, c, created.ID, dir, owner, beside, policy, res)
+		return res, err
+	}
+
+	if policy == KeepExisting && present[target] {
+		res := &HostReconstructResult{
+			Path:  path.Join(path.Dir(stackDir), base, target),
+			Dir:   path.Join(path.Dir(stackDir), base),
+			Owner: owner,
+		}
+		res.Kept = append(res.Kept, res.Path)
+		err := writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, policy, res)
+		writeFilesBeside(ctx, c, created.ID, dir, owner, beside, policy, res)
 		return res, err
 	}
 
@@ -478,65 +519,87 @@ func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir,
 		displaced = path.Join(path.Dir(stackDir), base, aside)
 	}
 
-	// Under umask 077: when this is the operator's own file it can hold
-	// passwords written straight into `environment:`.
-	if err := ExecStdin(ctx, c, created.ID, []string{"sh", "-c", "umask 077; cat > " + shQuote(dir+"/"+target)}, bytes.NewReader(compose)); err != nil {
-		return nil, fmt.Errorf("writing compose file: %w", err)
-	}
-
-	// Stamp ownership to match the parent (best-effort — a root-owned parent on a
-	// fresh host just leaves it root-owned, which the caller surfaces).
-	if owner != "" {
-		_, _ = ExecCapture(ctx, c, created.ID, []string{"sh", "-c", "chown " + owner + " " + shQuote(dir) + " " + shQuote(dir+"/"+target) + " 2>/dev/null || true"})
-	}
-
 	res := &HostReconstructResult{
 		Path:      path.Join(path.Dir(stackDir), base, target),
 		Dir:       path.Join(path.Dir(stackDir), base),
 		Displaced: displaced,
 		Owner:     owner,
 	}
+	// Under umask 077: when this is the operator's own file it can hold
+	// passwords written straight into `environment:`.
+	werr := writeNewHostFile(ctx, c, created.ID, dir+"/"+target, compose)
+	composeKept := policy == KeepExisting && errors.Is(werr, errHostFileTaken)
+	if werr != nil && !composeKept {
+		return nil, fmt.Errorf("writing compose file: %w", werr)
+	}
+	if composeKept {
+		res.Kept = append(res.Kept, res.Path)
+	}
 
-	err = writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, res)
-	writeFilesBeside(ctx, c, created.ID, dir, owner, beside, res)
+	// Stamp ownership to match the parent (best-effort — a root-owned parent on a
+	// fresh host just leaves it root-owned, which the caller surfaces).
+	if owner != "" && !composeKept {
+		_, _ = ExecCapture(ctx, c, created.ID, []string{"sh", "-c", "chown " + owner + " " + shQuote(dir) + " " + shQuote(dir+"/"+target) + " 2>/dev/null || true"})
+	}
+
+	err = writeEnvBeside(ctx, c, created.ID, dir, owner, envFile, policy, res)
+	writeFilesBeside(ctx, c, created.ID, dir, owner, beside, policy, res)
 	return res, err
 }
 
 // writeEnvBeside writes the .env next to the compose file — same never-destroy
 // and converge rules, tighter mode (F194). It exists precisely because it holds
 // the secrets the compose file no longer does, so it is readable by its owner
-// and nobody else.
-func writeEnvBeside(ctx context.Context, c *client.Client, sidecarID, dir, owner string, envFile []byte, res *HostReconstructResult) error {
+// and nobody else. Under KeepExisting an .env that is there is not touched at
+// all, mode included.
+func writeEnvBeside(ctx context.Context, c *client.Client, sidecarID, dir, owner string, envFile []byte, policy HostWritePolicy, res *HostReconstructResult) error {
 	if len(envFile) == 0 {
 		return nil
 	}
-	const envTarget = ".env"
-	if sameContent(ctx, c, sidecarID, dir+"/"+envTarget, envFile) {
-		res.EnvPath = path.Join(res.Dir, envTarget)
-	} else {
-		if out, terr := ExecCapture(ctx, c, sidecarID, []string{"sh", "-c",
-			"[ -e " + shQuote(dir+"/"+envTarget) + " ] && echo yes || echo no"}); terr == nil && strings.TrimSpace(string(out)) == "yes" {
-			aside := envTarget + displacedSuffix + "-" + composeTimestamp(time.Now())
-			if _, merr := ExecCapture(ctx, c, sidecarID, []string{"sh", "-c",
-				"mv -n " + shQuote(dir+"/"+envTarget) + " " + shQuote(dir+"/"+aside)}); merr != nil {
-				return fmt.Errorf("moving the existing .env aside: %w", merr)
-			}
-			res.EnvDisplaced = path.Join(res.Dir, aside)
-		}
-		// Born 0600: a chmod after the write leaves a moment where the secrets are
-		// readable under the sidecar's umask.
-		if err := ExecStdin(ctx, c, sidecarID, []string{"sh", "-c", "umask 077; cat > " + shQuote(dir+"/"+envTarget)}, bytes.NewReader(envFile)); err != nil {
-			return fmt.Errorf("writing .env: %w", err)
-		}
-		res.EnvPath = path.Join(res.Dir, envTarget)
+	envPath := dir + "/" + envFileName
+	hostEnvPath := path.Join(res.Dir, envFileName)
+	if policy == KeepExisting && hostPathTaken(ctx, c, sidecarID, envPath) {
+		res.Kept = append(res.Kept, hostEnvPath)
+		return nil
+	}
+	err := replaceEnvFile(ctx, c, sidecarID, dir, envFile, res)
+	if policy == KeepExisting && errors.Is(err, errHostFileTaken) {
+		res.Kept = append(res.Kept, hostEnvPath)
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 	// 0600 always — even when the content already matched, the mode is part of
 	// the contract this file exists under.
-	cmd := "chmod 600 " + shQuote(dir+"/"+envTarget)
+	cmd := "chmod 600 " + shQuote(envPath)
 	if owner != "" {
-		cmd += " && chown " + owner + " " + shQuote(dir+"/"+envTarget)
+		cmd += " && chown " + owner + " " + shQuote(envPath)
 	}
 	_, _ = ExecCapture(ctx, c, sidecarID, []string{"sh", "-c", cmd + " 2>/dev/null || true"})
+	return nil
+}
+
+// replaceEnvFile leaves an identical .env alone, and otherwise moves a different
+// one aside and writes envFile in its place.
+func replaceEnvFile(ctx context.Context, c *client.Client, sidecarID, dir string, envFile []byte, res *HostReconstructResult) error {
+	envPath := dir + "/" + envFileName
+	if sameContent(ctx, c, sidecarID, envPath, envFile) {
+		res.EnvPath = path.Join(res.Dir, envFileName)
+		return nil
+	}
+	if hostPathTaken(ctx, c, sidecarID, envPath) {
+		aside := envFileName + displacedSuffix + "-" + composeTimestamp(time.Now())
+		if _, merr := ExecCapture(ctx, c, sidecarID, []string{"sh", "-c",
+			"mv -n " + shQuote(envPath) + " " + shQuote(dir+"/"+aside)}); merr != nil {
+			return fmt.Errorf("moving the existing .env aside: %w", merr)
+		}
+		res.EnvDisplaced = path.Join(res.Dir, aside)
+	}
+	if err := writeNewHostFile(ctx, c, sidecarID, envPath, envFile); err != nil {
+		return fmt.Errorf("writing .env: %w", err)
+	}
+	res.EnvPath = path.Join(res.Dir, envFileName)
 	return nil
 }
 
@@ -549,40 +612,85 @@ const (
 
 // writeFilesBeside writes each file next to the compose file under its own
 // name, by the compose file's rules: identical is left alone (a re-run
-// converges), different is renamed aside first and never overwritten, and the
-// bytes are born 0600, because an original compose file can carry passwords.
+// converges), different is renamed aside first (KeepExisting: left as it is)
+// and never overwritten, and the bytes are born 0600, because an original
+// compose file can carry passwords.
 //
-// A file that cannot be written is skipped rather than failing the restore: the
-// containers are already back, and the archive still holds every one of these.
-func writeFilesBeside(ctx context.Context, c *client.Client, sidecarID, dir, owner string, files []NamedFile, res *HostReconstructResult) {
+// A file that cannot be written does not stop the others; it is named in
+// res.Failed, and the caller decides what that means for the restore.
+func writeFilesBeside(ctx context.Context, c *client.Client, sidecarID, dir, owner string, files []NamedFile, policy HostWritePolicy, res *HostReconstructResult) {
 	for _, f := range files {
 		if f.Name == "." || f.Name == ".." || !safeHostComponent.MatchString(f.Name) || len(f.Content) == 0 {
 			continue
 		}
 		target := dir + "/" + f.Name
+		hostPath := path.Join(res.Dir, f.Name)
 		if sameContent(ctx, c, sidecarID, target, f.Content) {
-			res.Beside = append(res.Beside, path.Join(res.Dir, f.Name))
+			res.Beside = append(res.Beside, hostPath)
 			continue
 		}
-		aside := f.Name + displacedSuffix + "-" + composeTimestamp(time.Now())
-		moveAside := "if [ -e " + shQuote(target) + " ]; then mv -n " + shQuote(target) + " " + shQuote(dir+"/"+aside) +
-			" && [ ! -e " + shQuote(target) + " ] && echo " + besideMoved + "; else echo " + besideAbsent + "; fi"
-		out, _ := ExecCapture(ctx, c, sidecarID, []string{"sh", "-c", moveAside})
-		switch strings.TrimSpace(string(out)) {
-		case besideMoved:
-			res.BesideDisplaced = append(res.BesideDisplaced, path.Join(res.Dir, aside))
-		case besideAbsent:
-		default:
+		if policy == KeepExisting && hostPathTaken(ctx, c, sidecarID, target) {
+			res.Kept = append(res.Kept, hostPath)
 			continue
 		}
-		if err := ExecStdin(ctx, c, sidecarID, []string{"sh", "-c", "umask 077; cat > " + shQuote(target)}, bytes.NewReader(f.Content)); err != nil {
+		if policy == ReplaceExisting && !moveBesideAside(ctx, c, sidecarID, dir, f.Name, res) {
+			res.Failed = append(res.Failed, hostPath+": the file there could not be moved aside")
+			continue
+		}
+		err := writeNewHostFile(ctx, c, sidecarID, target, f.Content)
+		if policy == KeepExisting && errors.Is(err, errHostFileTaken) {
+			res.Kept = append(res.Kept, hostPath)
+			continue
+		}
+		if err != nil {
+			res.Failed = append(res.Failed, hostPath+": "+err.Error())
 			continue
 		}
 		if owner != "" {
 			_, _ = ExecCapture(ctx, c, sidecarID, []string{"sh", "-c", "chown " + owner + " " + shQuote(target) + " 2>/dev/null || true"})
 		}
-		res.Beside = append(res.Beside, path.Join(res.Dir, f.Name))
+		res.Beside = append(res.Beside, hostPath)
 	}
+}
+
+// moveBesideAside frees a beside file's name by renaming what holds it, and
+// reports whether the name is now free.
+func moveBesideAside(ctx context.Context, c *client.Client, sidecarID, dir, name string, res *HostReconstructResult) bool {
+	target := dir + "/" + name
+	aside := name + displacedSuffix + "-" + composeTimestamp(time.Now())
+	moveAside := "if [ -e " + shQuote(target) + " ]; then mv -n " + shQuote(target) + " " + shQuote(dir+"/"+aside) +
+		" && [ ! -e " + shQuote(target) + " ] && echo " + besideMoved + "; else echo " + besideAbsent + "; fi"
+	out, _ := ExecCapture(ctx, c, sidecarID, []string{"sh", "-c", moveAside})
+	switch strings.TrimSpace(string(out)) {
+	case besideMoved:
+		res.BesideDisplaced = append(res.BesideDisplaced, path.Join(res.Dir, aside))
+		return true
+	case besideAbsent:
+		return true
+	}
+	return false
+}
+
+// writeNewHostFile creates target with content, born 0600, only where nothing
+// is: noclobber makes the check and the create one step, so a file that appears
+// in between is never truncated and a symlink at the name is never followed. A
+// refusal for that reason is errHostFileTaken.
+func writeNewHostFile(ctx context.Context, c *client.Client, sidecarID, target string, content []byte) error {
+	err := ExecStdin(ctx, c, sidecarID, []string{"sh", "-c", "set -C; umask 077; cat > " + shQuote(target)}, bytes.NewReader(content))
+	if err == nil {
+		return nil
+	}
+	if hostPathTaken(ctx, c, sidecarID, target) {
+		return errHostFileTaken
+	}
+	return err
+}
+
+// hostPathTaken reports whether anything, a dangling symlink included, holds target.
+func hostPathTaken(ctx context.Context, c *client.Client, sidecarID, target string) bool {
+	out, err := ExecCapture(ctx, c, sidecarID, []string{"sh", "-c",
+		"{ [ -e " + shQuote(target) + " ] || [ -L " + shQuote(target) + " ]; } && echo yes || echo no"})
+	return err == nil && strings.TrimSpace(string(out)) == "yes"
 }
 
 // existingComposeNames reports which standard compose filenames — plus the

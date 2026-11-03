@@ -82,7 +82,7 @@ func TestSealManifestPerDestination(t *testing.T) {
 	sealDest(t, st, key, "d-plain", plainDir, "false")
 	sealDest(t, st, key, "d-fallback", fallbackDir, "") // unset → global (false by default)
 
-	locs := e.mirror(ctx, "run1", archiveKey, manBytes, nil, false, true)
+	locs := e.mirror(ctx, "run1", archiveKey, manBytes, nil, false, true, nil)
 	if len(locs) != 3 {
 		t.Fatalf("expected 3 mirrored locations, got %d: %+v", len(locs), locs)
 	}

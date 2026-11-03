@@ -120,6 +120,12 @@ func (e *Engine) Verify(ctx context.Context, b *store.Backup, man *Manifest, sou
 		}
 	}
 
+	if source != "" && source != "local" {
+		if problem := e.replicaEnvelopeProblem(ctx, be, b.StorageKey, man, []byte(b.ManifestJSON)); problem != "" {
+			rep.add(replicaEnvelopeCheck, false, problem)
+		}
+	}
+
 	// F86: a write-only backup cannot be opened by this instance — that is the
 	// whole point of the mode. The structural checks above (ciphertext SHA-256,
 	// size, master-key-signed/encrypted manifest) have already run and still
@@ -138,24 +144,20 @@ func (e *Engine) Verify(ctx context.Context, b *store.Backup, man *Manifest, sou
 		rep.add("archive-open", false, err.Error())
 		return rep
 	}
-	defer rc2.Close()
-
 	ak, err := e.archiveKey(man)
 	if err != nil {
+		rc2.Close()
 		rep.add("archive-key", false, err.Error())
 		return rep
 	}
-	pr, pw := io.Pipe()
-	go func() { pw.CloseWithError(crypto.Decrypt(pw, rc2, ak)) }()
-
-	zr, err := newDecompressReader(pr, man.Format.Algorithm)
+	stream, err := openArchiveStream(ctx, rc2, ak, man.Format.Algorithm)
 	if err != nil {
 		rep.add("decompress", false, err.Error())
 		return rep
 	}
-	defer zr.Close()
+	defer stream.Close()
 
-	tr := tar.NewReader(zr)
+	tr := tar.NewReader(stream)
 	seen := map[string]int64{}
 	dbHeads := map[string][]byte{}
 	dbSHAs := map[string]string{} // F87: sha256 of each stored dump, from this same walk
@@ -346,7 +348,7 @@ func (e *Engine) Verify(ctx context.Context, b *store.Backup, man *Manifest, sou
 			e.logf(b.ID, "INFO", "Deep verification is ON, but this backup has no database dumps to test-restore (file/volume backup) — nothing to do")
 			rep.add("deep-verify", true, "no database dumps in this backup — nothing to test-restore")
 		} else {
-			e.verifyDeepDB(ctx, b, man, rep)
+			e.verifyDeepDB(ctx, b, man, source, rep)
 		}
 	}
 
@@ -379,27 +381,30 @@ func (e *Engine) DrillBackup(ctx context.Context, b *store.Backup) (bool, string
 	if reason := e.drillSkipReason(man); reason != "" {
 		return false, reason
 	}
-	rc, err := e.Storage.Get(ctx, b.StorageKey)
+	// Any copy that passes its integrity check, local first: a backup adopted from a
+	// destination, or one whose local copy is gone, is as drillable as any other.
+	rc, err := e.openVerified(ctx, b, "")
 	if err != nil {
 		return false, "archive unreadable: " + err.Error()
 	}
-	defer rc.Close()
 	ak, err := e.archiveKey(man)
 	if err != nil {
+		rc.Close()
 		return false, "archive key: " + err.Error()
 	}
-	pr, pw := io.Pipe()
-	go func() { pw.CloseWithError(crypto.Decrypt(pw, rc, ak)) }()
-	defer pr.Close() // unblocks the decrypt goroutine if we bail early
-	zr, err := newDecompressReader(pr, man.Format.Algorithm)
+	stream, err := openArchiveStream(ctx, rc, ak, man.Format.Algorithm)
 	if err != nil {
 		return false, "decompress: " + err.Error()
 	}
-	defer zr.Close()
+	defer stream.Close()
+	// A delta's payload is only what changed, so its volumes are put together from
+	// the chain below, after this walk has checked the delta's own bytes.
+	payloadMember := volPayloadMember(man)
+	spoolPayload := len(man.Volumes) > 0 && !man.Incremental
 
 	// One tar walk: authenticate every entry, hash the volume payload, and spool
 	// DB dumps to disk (they're small — MB) for test-restore after the walk.
-	tr := tar.NewReader(zr)
+	tr := tar.NewReader(stream)
 	volSHA := ""
 	var volTmp string       // spooled volumes.tar (for the F5 volume boot) — cleaned up below
 	var inspectBytes []byte // config/inspect.json (to boot the throwaway app the way it really runs)
@@ -422,13 +427,13 @@ func (e *Engine) DrillBackup(ctx context.Context, b *store.Backup) (bool, string
 			return false, "archive incomplete (corruption/tamper): " + err.Error()
 		}
 		switch {
-		case hdr.Name == "volumes.tar":
+		case hdr.Name == payloadMember:
 			// Hash the payload (checksum proof) and, when the backup actually has
 			// volumes, ALSO spool it to disk in this single decrypt pass so we can
 			// boot it in an isolated throwaway container after the walk (F5).
 			vh := sha256.New()
 			var dst io.Writer = vh
-			if len(man.Volumes) > 0 {
+			if spoolPayload {
 				f, ferr := os.CreateTemp(e.WorkDir, "drillvol-*")
 				if ferr != nil {
 					return false, "temp file: " + ferr.Error()
@@ -478,11 +483,18 @@ func (e *Engine) DrillBackup(ctx context.Context, b *store.Backup) (bool, string
 	if man.VolumesSHA256 != "" && volSHA != man.VolumesSHA256 {
 		return false, "volume payload checksum mismatch (corruption/tamper)"
 	}
-
-	hasVol := len(man.Volumes) > 0 && volTmp != ""
-	if !hasVol && len(dumps) == 0 {
-		return true, "archive intact; nothing to test-restore"
+	if len(man.Volumes) > 0 && man.Incremental {
+		merged, merr := e.materializeChainVolumes(ctx, b, man)
+		if merr != nil {
+			return false, "the backup chain could not be put together: " + merr.Error()
+		}
+		volTmp = merged
 	}
+	if len(man.Volumes) > 0 && volTmp == "" {
+		return false, "the manifest lists volumes but the archive holds no " + payloadMember
+	}
+	hasVol := len(man.Volumes) > 0
+	image := drillImageRef(man)
 
 	cli, err := e.Reg.Get(b.NodeID)
 	if err != nil {
@@ -504,7 +516,7 @@ func (e *Engine) DrillBackup(ctx context.Context, b *store.Backup) (bool, string
 				dests = append(dests, v.Destination)
 			}
 		}
-		summary, bootEnv, verr := dockercli.VerifyRestoreVolumes(ctx, cli, man.Image, inspectBytes, dests, f)
+		summary, bootEnv, verr := dockercli.VerifyRestoreVolumes(ctx, cli, image, inspectBytes, dests, f)
 		f.Close()
 		if verr != nil {
 			return false, "volume restore did not boot: " + verr.Error()
@@ -527,14 +539,72 @@ func (e *Engine) DrillBackup(ctx context.Context, b *store.Backup) (bool, string
 		if oerr != nil {
 			return false, "reopening dump: " + oerr.Error()
 		}
-		summary, verr := dockercli.VerifyRestoreDB(ctx, cli, man.Image, d.engine, f)
+		summary, verr := dockercli.VerifyRestoreDB(ctx, cli, image, d.engine, f)
 		f.Close()
 		if verr != nil {
 			return false, "database " + d.svc + " did not restore: " + verr.Error()
 		}
 		parts = append(parts, d.svc+": "+summary)
 	}
+	if man.Incremental {
+		parts = append(parts, fmt.Sprintf("from a chain of %d generation(s)", man.ChainDepth+1))
+	}
+	if image != man.ImageDigest {
+		parts = append(parts, "booted by tag "+image+", which may have changed since this backup")
+	}
 	return true, strings.Join(parts, "; ")
+}
+
+// LegacyUntestedDrillDetail is what a drill recorded, before drills were told apart
+// from not-tested, when it passed a backup it had nothing to restore from. Such a
+// result proves nothing, so confidence reads it as no drill at all.
+const LegacyUntestedDrillDetail = "archive intact; nothing to test-restore"
+
+// drillImageRef is the image a drill boots: the exact one the backup recorded, by
+// digest, when it has one, since a tag can have moved since. Pure.
+func drillImageRef(man *Manifest) string {
+	if man.ImageDigest != "" {
+		return man.ImageDigest
+	}
+	return man.Image
+}
+
+// materializeChainVolumes puts a delta's full volume state together from its chain,
+// with the same merge a synthetic full uses, and returns a temporary file holding it
+// for the caller to remove. Every generation is read from whichever copy passes its
+// integrity check, and a missing or mismatched ancestor fails here with its name.
+func (e *Engine) materializeChainVolumes(ctx context.Context, b *store.Backup, man *Manifest) (string, error) {
+	chain, err := e.resolveRestoreChain(b, man)
+	if err != nil {
+		return "", err
+	}
+	tipIdx, err := e.loadVolIndex(ctx, b, "")
+	if err != nil {
+		return "", fmt.Errorf("the delta's file index: %w", err)
+	}
+	// The merge takes a further local delta to lay over the chain; a drill has none.
+	empty, err := os.CreateTemp(e.WorkDir, "drillnone-*.tar")
+	if err != nil {
+		return "", err
+	}
+	emptyPath := empty.Name()
+	defer os.Remove(emptyPath)
+	if err := tar.NewWriter(empty).Close(); err != nil {
+		empty.Close()
+		return "", err
+	}
+	empty.Close()
+	merged, err := os.CreateTemp(e.WorkDir, "drillvol-*")
+	if err != nil {
+		return "", err
+	}
+	mergedPath := merged.Name()
+	merged.Close()
+	if _, _, err := e.synthesizeFullVolumes(ctx, chain, emptyPath, tipIdx, nil, mergedPath); err != nil {
+		os.Remove(mergedPath)
+		return "", err
+	}
+	return mergedPath, nil
 }
 
 // deepVerifyEnabled reports whether opt-in deep (real test-restore) verification
@@ -546,7 +616,7 @@ func (e *Engine) deepVerifyEnabled() bool {
 
 // verifyDeepDB re-imports every database dump into a throwaway isolated container
 // and records a scored db-restore check per service.
-func (e *Engine) verifyDeepDB(ctx context.Context, b *store.Backup, man *Manifest, rep *VerificationReport) {
+func (e *Engine) verifyDeepDB(ctx context.Context, b *store.Backup, man *Manifest, source string, rep *VerificationReport) {
 	cli, err := e.Reg.Get(b.NodeID)
 	if err != nil {
 		rep.add("db-restore", false, "node unavailable: "+err.Error())
@@ -559,7 +629,7 @@ func (e *Engine) verifyDeepDB(ctx context.Context, b *store.Backup, man *Manifes
 		byEntry["db/"+strings.TrimPrefix(db.Path, "db/")] = dbInfo{db.Engine, db.Service}
 	}
 	e.logf(b.ID, "INFO", "Deep verification: test-restoring %d database dump(s) into throwaway containers", len(man.Databases))
-	walkErr := e.streamArchive(ctx, b, "", func(tr *tar.Reader, hdr *tar.Header) (bool, error) {
+	walkErr := e.streamArchive(ctx, b, source, func(tr *tar.Reader, hdr *tar.Header) (bool, error) {
 		info, ok := byEntry[hdr.Name]
 		if !ok {
 			return true, nil

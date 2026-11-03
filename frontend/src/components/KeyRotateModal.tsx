@@ -57,7 +57,7 @@ export default function KeyRotateModal({ open, onClose, onRotated }: { open: boo
   const copy = (v: string) => navigator.clipboard?.writeText(v).catch(() => {});
 
   return (
-    <Modal open={open} onClose={close} title="Rotate encryption key"
+    <Modal open={open} onClose={close} title="Rotate encryption key" dismissible={!busy}
       footer={result
         ? <Button variant="primary" onClick={close}>Done</Button>
         : <><Button variant="ghost" onClick={close} disabled={busy}>Cancel</Button>

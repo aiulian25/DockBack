@@ -34,28 +34,90 @@ func FindContainerByName(ctx context.Context, c *client.Client, name string) (st
 	return "", false
 }
 
-// cloneNetwork is the throwaway bridge an isolated restore-as-copy clone attaches
-// to, so it can't reach or shadow the live stack (F10).
-const cloneNetwork = "dockback-restore"
+// ErrNothingReplaced says a recreate failed without replacing anything: an existing
+// container of that name is still there, under that name, and was never stopped.
+var ErrNothingReplaced = errors.New("nothing was replaced")
+
+// While its replacement is created, an existing container goes by its name plus
+// this suffix and the start of its id.
+const (
+	priorHoldingSuffix = "-dockback-prior-"
+	priorIDChars       = 12
+	priorCleanupWindow = time.Minute
+)
+
+// RestorePriorName gives a container set aside by a recreate its name back, when
+// the process died before finishing and nothing has taken the name since. It
+// reports whether it did.
+func RestorePriorName(ctx context.Context, c *client.Client, name string) bool {
+	if _, taken := FindContainerByName(ctx, c, name); taken {
+		return false
+	}
+	list, err := c.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return false
+	}
+	for _, ct := range list {
+		for _, n := range ct.Names {
+			if strings.HasPrefix(strings.TrimPrefix(n, "/"), name+priorHoldingSuffix) {
+				return c.ContainerRename(ctx, ct.ID, name) == nil
+			}
+		}
+	}
+	return false
+}
+
+// putPriorBack and removePrior get their own context: they finish what a recreate
+// started, including one the operator has just canceled.
+func putPriorBack(c *client.Client, priorID, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), priorCleanupWindow)
+	defer cancel()
+	return c.ContainerRename(ctx, priorID, name)
+}
+
+func removePrior(c *client.Client, priorID, holdingName string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), priorCleanupWindow)
+	defer cancel()
+	if err := c.ContainerRemove(ctx, priorID, container.RemoveOptions{Force: true}); err != nil {
+		return []string{fmt.Sprintf("the container this one replaced could not be removed (%v) — it is still there as %q, and may hold ports this one needs", err, holdingName)}
+	}
+	return nil
+}
+
+// cloneNetworkMode gives a copy no network at all, the same as a drill. A private
+// bridge would still reach the host through its gateway, and the host's published
+// ports with it; a copy holds the original's credentials and must not be able to
+// use them.
+const cloneNetworkMode = container.NetworkMode("none")
+
+// cloneDefaultCapabilities are the capabilities Docker grants unless told not to.
+// An original that dropped them all and added some of these back still runs that
+// way; anything beyond them is a host power a copy does not get.
+var cloneDefaultCapabilities = map[string]bool{
+	"AUDIT_WRITE": true, "CHOWN": true, "DAC_OVERRIDE": true, "FOWNER": true, "FSETID": true,
+	"KILL": true, "MKNOD": true, "NET_BIND_SERVICE": true, "NET_RAW": true, "SETFCAP": true,
+	"SETGID": true, "SETPCAP": true, "SETUID": true, "SYS_CHROOT": true,
+}
+
+// noNewPrivilegesOption prefixes the one security option a copy keeps: it only
+// tightens. The rest, such as seccomp=unconfined, can only loosen the defaults.
+const noNewPrivilegesOption = "no-new-privileges"
 
 // RemoveCloneContainer force-removes a throwaway clone container AND its anonymous
 // volumes (F62 standby rehearsal teardown). The isolated clone's mounts are all
 // fresh anonymous volumes (stripForClone), so RemoveVolumes cleans them up leaving
-// zero residue; the shared `dockback-restore` bridge is intentionally left in place
-// (other clones/restores may still be using it).
+// zero residue.
 func RemoveCloneContainer(ctx context.Context, c *client.Client, id string) error {
 	return c.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true})
 }
 
 // CloneOptions, when non-nil, makes RecreateContainer build an ISOLATED clone
-// instead of restoring in place (F10): a NEW name, and — when Isolate is set —
-// fresh EMPTY volumes (never the original's data), no published host ports, and
-// only the throwaway `dockback-restore` bridge network. This brings a backup up
-// ALONGSIDE the live container (to inspect data or test an upgrade) without
-// touching it.
+// instead of restoring in place (F10): a NEW name, fresh EMPTY volumes (never the
+// original's data), no published host ports, no host powers and no network. This
+// brings a backup up ALONGSIDE the live container (to inspect data or test an
+// upgrade) without touching it.
 type CloneOptions struct {
 	NewName string // the clone's container name (required in clone mode)
-	Isolate bool   // fresh volumes + no host ports + isolated network
 	// Labels are set on the created clone, on top of whatever survived the strip
 	// (F219). Used to stamp a test clone with its expiry so the reaper can find
 	// it later — the container itself carries its own lifetime, so nothing is
@@ -78,8 +140,27 @@ type CloneOptions struct {
 // allowDifferentImage lets the recreate run the tag's current image when the
 // recorded one cannot be provided; without it that is refused, before anything
 // is removed (see provideRecordedImage).
-func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte, imageDigest string, clone *CloneOptions, nets []NetworkSpec, allowDifferentImage bool) (string, string, []string, error) {
-	var warnings []string
+//
+// An existing container of the name is only set aside until its replacement
+// exists, and keeps running meanwhile. Any failure before that returns
+// ErrNothingReplaced with the original back under its own name.
+func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte, imageDigest string, clone *CloneOptions, nets []NetworkSpec, allowDifferentImage bool) (newID, newName string, warnings []string, err error) {
+	priorID, priorName, priorHoldingName := "", "", ""
+	defer func() {
+		if err == nil {
+			if priorID != "" {
+				warnings = append(warnings, removePrior(c, priorID, priorHoldingName)...)
+			}
+			return
+		}
+		if priorID != "" {
+			if rerr := putPriorBack(c, priorID, priorName); rerr != nil {
+				err = fmt.Errorf("%w — and the original container could not be given its name back (%v), so it is still there as %q", err, rerr, priorHoldingName)
+				return
+			}
+		}
+		err = fmt.Errorf("%w: %w", ErrNothingReplaced, err)
+	}()
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
@@ -93,10 +174,8 @@ func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte
 	name := strings.TrimPrefix(insp.Name, "/")
 	isolate := false
 	if clone != nil && clone.NewName != "" {
-		// Clone mode: the target is the NEW name, so the force-remove below can only
-		// ever remove a stale PRIOR CLONE of this name — never the original.
 		name = clone.NewName
-		isolate = clone.Isolate
+		isolate = true
 	}
 
 	// The image first: a recreate refused for want of the recorded image must
@@ -113,11 +192,18 @@ func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte
 	// to the container it recreates and is never anybody's to reclaim.
 	hadImageAlready := isolate && !pulled
 
-	// Remove any existing container with this name (e.g. a corrupted or stale
+	// Set aside any existing container with this name (e.g. a corrupted or stale
 	// one from a prior deploy) so ContainerCreate doesn't fail with a name
-	// conflict ("name ... is already in use").
-	if existing, ok := FindContainerByName(ctx, c, name); ok {
-		_ = c.ContainerRemove(ctx, existing, container.RemoveOptions{Force: true})
+	// conflict ("name ... is already in use"). Never for a clone: whatever holds
+	// its name is not its own, and the create's conflict is the atomic refusal.
+	if !isolate {
+		if existing, ok := FindContainerByName(ctx, c, name); ok {
+			holdingName := name + priorHoldingSuffix + existing[:min(priorIDChars, len(existing))]
+			if rerr := c.ContainerRename(ctx, existing, holdingName); rerr != nil {
+				return "", "", warnings, fmt.Errorf("setting aside the existing container %q: %w", name, rerr)
+			}
+			priorID, priorName, priorHoldingName = existing, name, holdingName
+		}
 	}
 
 	// F89: recorded network topology, keyed by name. Empty for a legacy backup —
@@ -145,9 +231,9 @@ func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte
 		insp.Config.Hostname = ""
 	}
 
-	// Isolated clone: strip the spec down to fresh volumes + no ports, and attach
-	// ONLY the throwaway bridge — so it can't touch the original's data, clash on a
-	// host port, or shadow the live stack's DNS.
+	// Isolated clone: strip the spec down to fresh volumes, no ports, no host powers
+	// and no network — so it can't touch the original's data, clash on a host port,
+	// shadow the live stack's DNS, or act on anything outside itself.
 	if isolate {
 		stripForClone(&insp)
 		applyCloneLabels(&insp, clone.Labels)
@@ -158,8 +244,6 @@ func RecreateContainer(ctx context.Context, c *client.Client, inspectJSON []byte
 		if !hadImageAlready {
 			stampClonePulledImage(ctx, c, &insp, chosen)
 		}
-		ensureNetwork(ctx, c, cloneNetwork)
-		insp.HostConfig.NetworkMode = container.NetworkMode(cloneNetwork)
 		resp, cerr := c.ContainerCreate(ctx, insp.Config, insp.HostConfig, nil, nil, name)
 		if cerr != nil {
 			return "", "", warnings, fmt.Errorf("creating clone %q: %w", name, cerr)
@@ -338,11 +422,9 @@ func logDriverUnavailable(err error) bool {
 // ISOLATED clone that can never touch the original's data or ports (F10): every
 // mount destination becomes a FRESH anonymous volume (the original named volumes
 // and host binds are dropped, so a restore fills the CLONE's own volumes, not the
-// live container's), all published ports are removed (no host-port clash), the
-// restart policy is disabled (a broken clone shouldn't loop), and stack links are
-// dropped. The caller switches it onto the isolated bridge network.
+// live container's), and its host configuration is rebuilt from cloneHostConfig,
+// so ports, restart policy, links, host powers and network are not carried over.
 func stripForClone(insp *types.ContainerJSON) {
-	hc := insp.HostConfig
 	// Fresh empty volume at every original mount destination; drop all real
 	// volume/bind sources so nothing points at the live container's data.
 	if insp.Config.Volumes == nil {
@@ -353,16 +435,7 @@ func stripForClone(insp *types.ContainerJSON) {
 			insp.Config.Volumes[m.Destination] = struct{}{}
 		}
 	}
-	hc.Binds = nil
-	hc.Mounts = nil
-	hc.VolumesFrom = nil
-	// No host ports (avoid clashing with the running original).
-	hc.PortBindings = nil
-	hc.PublishAllPorts = false
-	// Don't restart-loop a clone that can't reach its (absent) dependencies.
-	hc.RestartPolicy = container.RestartPolicy{Name: "no"}
-	// Legacy links reference the live stack by name — drop them.
-	hc.Links = nil
+	insp.HostConfig = cloneHostConfig(insp.HostConfig)
 	// F219: and drop the labels that make this container SOMEONE ELSE.
 	//
 	// A clone inherited the original's compose identity, so Docker, and DockBack
@@ -381,6 +454,111 @@ func stripForClone(insp *types.ContainerJSON) {
 			delete(insp.Config.Labels, k)
 		}
 	}
+}
+
+// cloneHostConfig builds a copy's host configuration from an allowlist: only what
+// limits the container, or what an application needs to start, comes across. A
+// host power this code has never heard of therefore stays behind, which removing
+// known risks from the original could not promise.
+func cloneHostConfig(original *container.HostConfig) *container.HostConfig {
+	return &container.HostConfig{
+		NetworkMode: cloneNetworkMode,
+		// Don't restart-loop a clone that can't reach its (absent) dependencies.
+		RestartPolicy:  container.RestartPolicy{Name: "no"},
+		CapDrop:        original.CapDrop,
+		CapAdd:         defaultCapabilitiesIn(original.CapAdd),
+		SecurityOpt:    tighteningSecurityOptions(original.SecurityOpt),
+		GroupAdd:       original.GroupAdd,
+		ReadonlyRootfs: original.ReadonlyRootfs,
+		Tmpfs:          original.Tmpfs,
+		ShmSize:        original.ShmSize,
+		Init:           original.Init,
+		Resources: container.Resources{
+			Memory:            original.Memory,
+			MemorySwap:        original.MemorySwap,
+			MemoryReservation: original.MemoryReservation,
+			NanoCPUs:          original.NanoCPUs,
+			CPUShares:         original.CPUShares,
+			CPUPeriod:         original.CPUPeriod,
+			CPUQuota:          original.CPUQuota,
+			PidsLimit:         original.PidsLimit,
+			Ulimits:           original.Ulimits,
+		},
+	}
+}
+
+func capabilityName(capability string) string {
+	return strings.TrimPrefix(strings.ToUpper(capability), "CAP_")
+}
+
+func defaultCapabilitiesIn(added []string) []string {
+	var kept []string
+	for _, capability := range added {
+		if cloneDefaultCapabilities[capabilityName(capability)] {
+			kept = append(kept, capability)
+		}
+	}
+	return kept
+}
+
+func tighteningSecurityOptions(options []string) []string {
+	var kept []string
+	for _, option := range options {
+		if strings.HasPrefix(option, noNewPrivilegesOption) {
+			kept = append(kept, option)
+		}
+	}
+	return kept
+}
+
+// sharesNamespace reports a namespace mode that reaches outside the container,
+// the host's or another container's.
+func sharesNamespace(mode string) bool {
+	return mode == "host" || strings.HasPrefix(mode, "container:")
+}
+
+// CloneSandboxRemovals names the host powers the original had and a copy of it
+// will not, from the saved inspect. A copy that fails without one of them says
+// nothing about the backup, so the operator has to be told. Empty when the saved
+// config cannot be read: the copy is sandboxed either way.
+func CloneSandboxRemovals(inspectJSON []byte) []string {
+	var insp types.ContainerJSON
+	if err := json.Unmarshal(inspectJSON, &insp); err != nil || insp.ContainerJSONBase == nil || insp.HostConfig == nil {
+		return nil
+	}
+	hc := insp.HostConfig
+	var removed []string
+	if hc.Privileged {
+		removed = append(removed, "privileged mode")
+	}
+	var capabilities []string
+	for _, capability := range hc.CapAdd {
+		if !cloneDefaultCapabilities[capabilityName(capability)] {
+			capabilities = append(capabilities, capabilityName(capability))
+		}
+	}
+	if len(capabilities) > 0 {
+		removed = append(removed, "capabilities "+strings.Join(capabilities, ", "))
+	}
+	for _, device := range hc.Devices {
+		removed = append(removed, "device "+device.PathOnHost)
+	}
+	if len(hc.DeviceRequests) > 0 {
+		removed = append(removed, "GPU access")
+	}
+	if hc.Runtime != "" && hc.Runtime != "runc" {
+		removed = append(removed, "runtime "+hc.Runtime)
+	}
+	if sharesNamespace(string(hc.NetworkMode)) {
+		removed = append(removed, "the host network")
+	}
+	if sharesNamespace(string(hc.PidMode)) {
+		removed = append(removed, "the shared PID namespace")
+	}
+	if sharesNamespace(string(hc.IpcMode)) {
+		removed = append(removed, "the shared IPC namespace")
+	}
+	return removed
 }
 
 // applyCloneLabels stamps caller-supplied labels onto the clone. Applied AFTER
@@ -519,13 +697,4 @@ func endpointIPAM(spec NetworkSpec) *network.EndpointIPAMConfig {
 		return nil
 	}
 	return &network.EndpointIPAMConfig{IPv4Address: spec.IPv4, IPv6Address: spec.IPv6}
-}
-
-// ensureNetwork creates a bridge network with the given name if it doesn't
-// already exist (best-effort).
-func ensureNetwork(ctx context.Context, c *client.Client, name string) {
-	if _, err := c.NetworkInspect(ctx, name, network.InspectOptions{}); err == nil {
-		return
-	}
-	_, _ = c.NetworkCreate(ctx, name, network.CreateOptions{Driver: "bridge"})
 }

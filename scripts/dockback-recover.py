@@ -696,8 +696,8 @@ def _decrypt_one_to_tar(dback_path, manifest, master, out_tar, private_key=None)
 def apply_chain(args, master, private_key=None):
     """Resolve an incremental backup's parent chain from a directory of .dback files
     and emit ordered plain tars plus an APPLY_ORDER.txt describing how to rebuild the
-    volume state (F61): extract the full baseline, then each delta OVER it, removing
-    the paths each delta deleted. Fails closed if any link is missing or its recorded
+    volume state (F61): extract the full baseline, then for each delta remove the paths
+    it deleted or replaced and extract it OVER the result. Fails closed if any link is missing or its recorded
     parent checksum doesn't match (the same cryptographic pin the app enforces)."""
     chain_dir = args.apply_chain
     if not os.path.isdir(chain_dir):
@@ -755,8 +755,9 @@ def apply_chain(args, master, private_key=None):
     out_dir = args.out or (args.infile + ".chain")
     os.makedirs(out_dir, exist_ok=True)
     order_lines = [
-        "DockBack incremental restore — apply these tars IN THIS ORDER into one directory.",
-        "Each delta is extracted OVER the previous state; then remove the listed deleted paths.",
+        "DockBack incremental restore — from this folder, mkdir RESTORE_DIR and run these IN THIS ORDER.",
+        "Run as root, so that owners come back too.",
+        "Each delta first removes the paths it lists, then is extracted OVER the previous state.",
         "",
     ]
     for i, node in enumerate(chain):
@@ -767,14 +768,15 @@ def apply_chain(args, master, private_key=None):
         print("Decrypting %s (%s)…" % (man.get("backup_id", "?")[:12], kind))
         _decrypt_one_to_tar(node["dback"], man, master, out_tar, private_key)
         order_lines.append("%d) %s  [%s]" % (i + 1, tar_name, kind))
-        order_lines.append("     tar -xf %s -C RESTORE_DIR" % tar_name)
-        deleted = man.get("deleted") or []
-        if deleted:
-            del_name = "%02d_%s.deleted.txt" % (i, (man.get("backup_id") or "gen")[:12])
-            with open(os.path.join(out_dir, del_name), "w") as df:
-                df.write("\n".join(deleted) + "\n")
-            order_lines.append("     # then remove %d path(s) listed in %s:" % (len(deleted), del_name))
-            order_lines.append("     (cd RESTORE_DIR && xargs -a ../%s rm -f)" % del_name)
+        removed = (man.get("replaced") or []) + (man.get("deleted") or [])
+        if removed:
+            removed_name = "%02d_%s.removed.txt" % (i, (man.get("backup_id") or "gen")[:12])
+            with open(os.path.join(out_dir, removed_name), "w") as rf:
+                rf.write("\n".join(removed) + "\n")
+            order_lines.append("     # first remove %d path(s) listed in %s:" % (len(removed), removed_name))
+            order_lines.append("     (cd RESTORE_DIR && xargs -a ../%s -d '\\n' rm -rf --)" % removed_name)
+        member = "volumes-delta.tar" if man.get("incremental") else "volumes.tar"
+        order_lines.append("     tar -xOf %s %s | tar --numeric-owner -xpf - -C RESTORE_DIR" % (tar_name, member))
         order_lines.append("")
     with open(os.path.join(out_dir, "APPLY_ORDER.txt"), "w") as of:
         of.write("\n".join(order_lines))

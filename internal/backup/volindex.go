@@ -1,30 +1,39 @@
 package backup
 
 import (
+	"bytes"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"path"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Incremental volume backups (F61). An opt-in per container: after a FULL
-// baseline, each run captures only the files whose (size, mtime) changed against
-// the parent's stored index, plus a deletion list — packaged as `volumes-delta.tar`
+// baseline, each run captures only the entries that changed against the parent's
+// stored inventory, plus a deletion list — packaged as `volumes-delta.tar`
 // alongside a complete post-backup `volumes-index.json.zst`. Every Nth backup
 // forces a fresh full so chains stay short and bounded. Restore/verify/drills/
 // retention/the recover tool are all chain-aware. Databases are never incremental
 // (they're dumped in full — already the compact representation). This file holds
 // the PURE, Docker-free core so the diff/chain/retention logic is unit-tested.
 
-// FileEntry is one file's identity in a volume index: its volume-relative path
-// plus the (size, mtime, mode) tuple used to decide whether it changed. Field
+// FileEntry is one entry's identity in a volume index: its volume-relative path
+// plus what changedSinceIndex compares to decide whether it changed. Field
 // tags are short to keep the compressed index small on large volumes.
 type FileEntry struct {
 	Path      string `json:"p"`
 	Size      int64  `json:"s"`
 	MtimeUnix int64  `json:"m"`
 	Mode      uint32 `json:"o"`
+	CtimeUnix int64  `json:"c,omitempty"`
+	UID       uint32 `json:"u,omitempty"`
+	GID       uint32 `json:"g,omitempty"`
+	// PathB64 carries a Path that is not UTF-8, which JSON would otherwise alter.
+	PathB64 string `json:"pb,omitempty"`
 
 	// Volatile marks a file the application rewrites by itself (#41/#19), so a
 	// later content comparison can report it apart from real differences instead
@@ -59,7 +68,14 @@ type FileEntry struct {
 // stored (zstd-compressed) inside the archive as `volumes-index.json.zst`. The
 // NEXT incremental backup diffs its freshly-built index against this one.
 type VolIndex struct {
+	// Version is volIndexVersion, or 0 on an index that predates versions.
+	Version int `json:"version,omitempty"`
+	// WalkedAt is the node's clock when the walk began.
+	WalkedAt int64 `json:"walked_at,omitempty"`
+	// Entries is the regular files.
 	Entries []FileEntry `json:"entries"`
+	// Others is every other entry: directories, links, devices, FIFOs.
+	Others []FileEntry `json:"others,omitempty"`
 }
 
 // IncrementalFullEveryDefault forces a fresh full baseline every N backups so a
@@ -86,112 +102,235 @@ func ClampFullEvery(n int) int {
 	return n
 }
 
-// BuildIndexCmd is the sidecar command that lists every regular file under the
-// captured destinations with its (path, size, mtime, mode). It is run in the SAME
-// read-only Alpine sidecar (`--volumes-from target:ro`) that tars the volumes, so
-// it works even for distroless app containers that lack `find`/`stat` themselves.
+// volIndexVersion is the inventory a delta can be built on: every entry, its owner
+// and its ctime. An index without it cannot say what a delta would need to, so the
+// next run takes a true full rather than guess.
+const volIndexVersion = 2
+
+// Stat's raw mode bits for the entry types an inventory tells apart.
+const (
+	modeTypeMask = 0o170000
+	modeDir      = 0o040000
+	modeSocket   = 0o140000
+	modeRegular  = 0o100000
+)
+
+// inventoryCmd lists every entry under dests, leaving the excluded sub-paths out.
 //
-// The format `%n|%s|%Y|%f` is BusyBox-`stat`-portable (name, size, mtime-seconds,
-// raw mode in hex). `find ... -exec stat ... {} +` batches, and passing the
-// destinations as literal argv (no shell) removes any injection surface.
-func BuildIndexCmd(dests []string) []string {
-	cmd := []string{"find"}
-	for _, d := range dests {
-		if d == "" {
-			continue
+// A name can hold anything but a NUL, and neither stat nor BusyBox's find can frame
+// on one, so each record starts with marker, a random string no name will contain.
+// The first line is the node's clock, and the last is marker-END, printed only when
+// find and stat finished without a word on stderr: a listing that missed an entry
+// would read as that entry deleted. The destinations travel as literal argv, never
+// through the shell. Pure.
+func inventoryCmd(dests, excludes []string, marker string) []string {
+	script := `date +%s; "$@" 2>/tmp/dockback-walk.err && [ ! -s /tmp/dockback-walk.err ] && echo ` + marker + walkEndSuffix
+	cmd := []string{"/bin/sh", "-c", script, "sh", "find"}
+	for _, dest := range dests {
+		if dest != "" {
+			cmd = append(cmd, dest)
 		}
-		cmd = append(cmd, d)
 	}
-	cmd = append(cmd, "-type", "f", "-exec", "stat", "-c", "%n|%s|%Y|%f", "{}", "+")
-	return cmd
+	cmd = append(cmd, pruneExpression(excludes)...)
+	return append(cmd, "-exec", "stat", "-c", marker+walkStatFormat, "{}", "+")
 }
 
-// ParseIndexOutput parses the sidecar `stat` output into a sorted VolIndex. Each
-// line is `<abs-path>|<size>|<mtime>|<mode-hex>`; the leading slash is stripped so
-// paths match the tar member names (`tar -C /` uses volume-relative names). Lines
-// that don't parse (an unexpected field count from an exotic filename, a stat
-// error line on stderr — which is captured separately anyway) are skipped rather
-// than failing the backup: a file we can't index is simply re-captured next time,
-// never silently dropped. Entries are sorted by path for a deterministic index.
-func ParseIndexOutput(out []byte) (VolIndex, error) {
-	var idx VolIndex
-	for _, raw := range strings.Split(string(out), "\n") {
-		line := strings.TrimRight(raw, "\r")
-		if line == "" {
+// parseInventory reads inventoryCmd's output into entries named as the archive
+// names them, without the leading slash. Any record it cannot read, or a missing
+// end, refuses the whole listing: one that is not complete must not be used. Pure.
+func parseInventory(out []byte, marker string) (map[string]walkEntry, int64, error) {
+	body, complete := bytes.CutSuffix(out, []byte(marker+walkEndSuffix+"\n"))
+	if !complete {
+		return nil, 0, errWalkIncomplete
+	}
+	chunks := bytes.Split(body, []byte(marker))
+	walkedAt, err := strconv.ParseInt(strings.TrimSpace(string(chunks[0])), 10, 64)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: unreadable clock", errWalkIncomplete)
+	}
+	walk := make(map[string]walkEntry, len(chunks)-1)
+	for _, chunk := range chunks[1:] {
+		path, entry, ok := parseInventoryRecord(chunk)
+		if !ok {
+			return nil, 0, fmt.Errorf("%w: unreadable record", errWalkIncomplete)
+		}
+		walk[path] = entry
+	}
+	return walk, walkedAt, nil
+}
+
+// parseInventoryRecord reads one walkStatFormat record, whose name is last and may
+// hold anything, including the separator and newlines. Pure.
+func parseInventoryRecord(record []byte) (string, walkEntry, bool) {
+	fields := strings.SplitN(strings.TrimPrefix(strings.TrimSuffix(string(record), "\n"), "|"), "|", walkFieldCount)
+	if len(fields) != walkFieldCount || !strings.HasPrefix(fields[walkFieldCount-1], "/") {
+		return "", walkEntry{}, false
+	}
+	size, sizeErr := strconv.ParseInt(fields[0], 10, 64)
+	mtime, mtimeErr := strconv.ParseInt(fields[1], 10, 64)
+	mode, modeErr := strconv.ParseUint(fields[2], 16, 32)
+	ctime, ctimeErr := strconv.ParseInt(fields[3], 10, 64)
+	uid, uidErr := strconv.ParseUint(fields[4], 10, 32)
+	gid, gidErr := strconv.ParseUint(fields[5], 10, 32)
+	if errors.Join(sizeErr, mtimeErr, modeErr, ctimeErr, uidErr, gidErr) != nil {
+		return "", walkEntry{}, false
+	}
+	entry := walkEntry{size: size, mtime: mtime, ctime: ctime, mode: uint32(mode), uid: uint32(uid), gid: uint32(gid)}
+	return strings.TrimPrefix(fields[walkFieldCount-1], "/"), entry, true
+}
+
+// indexFromWalk is the stored index of a walk: files in Entries, which everything
+// that reads a file list expects, and directories, links and the like in Others.
+// Sockets are left out, since tar cannot archive them. Pure.
+func indexFromWalk(walk map[string]walkEntry, walkedAt int64) VolIndex {
+	idx := VolIndex{Version: volIndexVersion, WalkedAt: walkedAt}
+	for path, entry := range walk {
+		if entry.isSocket() || path == "" {
 			continue
 		}
-		// Split from the RIGHT on the last three '|' so a path containing '|'
-		// still parses (the numeric tail is unambiguous).
-		fields := splitLastN(line, '|', 3)
-		if len(fields) != 4 {
-			continue
+		fe := FileEntry{Path: path, Size: entry.size, MtimeUnix: entry.mtime, Mode: entry.mode, CtimeUnix: entry.ctime, UID: entry.uid, GID: entry.gid}
+		if entry.isRegular() {
+			idx.Entries = append(idx.Entries, fe)
+		} else {
+			idx.Others = append(idx.Others, fe)
 		}
-		path := strings.TrimPrefix(fields[0], "/")
-		if path == "" {
-			continue
-		}
-		size, err1 := strconv.ParseInt(fields[1], 10, 64)
-		mtime, err2 := strconv.ParseInt(fields[2], 10, 64)
-		mode, err3 := strconv.ParseUint(fields[3], 16, 32)
-		if err1 != nil || err2 != nil || err3 != nil {
-			continue
-		}
-		idx.Entries = append(idx.Entries, FileEntry{Path: path, Size: size, MtimeUnix: mtime, Mode: uint32(mode)})
 	}
 	sort.Slice(idx.Entries, func(i, j int) bool { return idx.Entries[i].Path < idx.Entries[j].Path })
-	return idx, nil
+	sort.Slice(idx.Others, func(i, j int) bool { return idx.Others[i].Path < idx.Others[j].Path })
+	return idx
 }
 
-// splitLastN splits s into (n+1) fields on the LAST n occurrences of sep, so the
-// first field (the file path) may itself contain sep. Returns fewer fields if
-// there aren't n separators.
-func splitLastN(s string, sep byte, n int) []string {
-	tail := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		idx := strings.LastIndexByte(s, sep)
-		if idx < 0 {
-			break
+// encodeOddPaths gives a name JSON would alter a form that survives it.
+func encodeOddPaths(entries []FileEntry) {
+	for i := range entries {
+		if !utf8.ValidString(entries[i].Path) {
+			entries[i].PathB64 = base64.StdEncoding.EncodeToString([]byte(entries[i].Path))
 		}
-		tail = append(tail, s[idx+1:])
-		s = s[:idx]
 	}
-	if len(tail) < n {
-		return nil
+}
+
+// decodeOddPaths undoes encodeOddPaths. A value that will not decode leaves the
+// path as stored, which at worst reads as a change and copies the file again.
+func decodeOddPaths(entries []FileEntry) {
+	for i := range entries {
+		if entries[i].PathB64 == "" {
+			continue
+		}
+		if raw, err := base64.StdEncoding.DecodeString(entries[i].PathB64); err == nil {
+			entries[i].Path = string(raw)
+		}
 	}
-	out := make([]string, 0, n+1)
-	out = append(out, s)
-	for i := len(tail) - 1; i >= 0; i-- {
-		out = append(out, tail[i])
-	}
-	return out
+}
+
+// allEntries is every entry an index records, files or not.
+func (idx VolIndex) allEntries() []FileEntry {
+	return append(append(make([]FileEntry, 0, len(idx.Entries)+len(idx.Others)), idx.Entries...), idx.Others...)
+}
+
+// changedSinceIndex is the content-change policy: anything recorded differs. ctime
+// is what catches a write under a preserved mtime, a chmod, a chown and a replaced
+// link, because nothing but the kernel sets it. It counts seconds, so an entry whose
+// ctime reached the parent's own walk could have changed again within that second
+// without showing, and is copied again: the same race git's index has.
+func changedSinceIndex(prev, cur FileEntry, prevWalkedAt int64) bool {
+	return prev.Size != cur.Size || prev.MtimeUnix != cur.MtimeUnix || prev.Mode != cur.Mode ||
+		prev.UID != cur.UID || prev.GID != cur.GID || prev.CtimeUnix != cur.CtimeUnix ||
+		prev.CtimeUnix >= prevWalkedAt
 }
 
 // DiffIndex computes the incremental delta between a parent index and the current
-// one: `changed` = files that are new OR whose size/mtime differs from the parent
-// (these go into `volumes-delta.tar`); `deleted` = files present in the parent but
-// gone now (recorded so restore removes them after applying the delta). Both lists
-// are sorted for determinism. Pure.
+// one: `changed` = entries that are new or differ from the parent (these go into
+// `volumes-delta.tar`); `deleted` = entries in the parent that are gone (removed
+// before the delta is applied). Both sorted for determinism. Pure.
 func DiffIndex(prev, cur VolIndex) (changed, deleted []string) {
-	prevByPath := make(map[string]FileEntry, len(prev.Entries))
-	for _, e := range prev.Entries {
+	prevByPath := make(map[string]FileEntry, len(prev.Entries)+len(prev.Others))
+	for _, e := range prev.allEntries() {
 		prevByPath[e.Path] = e
 	}
-	curByPath := make(map[string]struct{}, len(cur.Entries))
-	for _, e := range cur.Entries {
+	curByPath := make(map[string]struct{}, len(cur.Entries)+len(cur.Others))
+	for _, e := range cur.allEntries() {
 		curByPath[e.Path] = struct{}{}
 		p, ok := prevByPath[e.Path]
-		if !ok || p.Size != e.Size || p.MtimeUnix != e.MtimeUnix {
+		if !ok || changedSinceIndex(p, e, prev.WalkedAt) {
 			changed = append(changed, e.Path)
 		}
 	}
-	for _, e := range prev.Entries {
-		if _, ok := curByPath[e.Path]; !ok {
-			deleted = append(deleted, e.Path)
+	for path := range prevByPath {
+		if _, ok := curByPath[path]; !ok {
+			deleted = append(deleted, path)
 		}
 	}
 	sort.Strings(changed)
 	sort.Strings(deleted)
 	return changed, deleted
+}
+
+// replacedEntries lists the paths that exist in both indexes as different types of
+// entry. Extracting over those fails or merges, so they go before the delta does.
+// Pure.
+func replacedEntries(prev, cur VolIndex) []string {
+	prevMode := make(map[string]uint32, len(prev.Entries)+len(prev.Others))
+	for _, e := range prev.allEntries() {
+		prevMode[e.Path] = e.Mode & modeTypeMask
+	}
+	var replaced []string
+	for _, e := range cur.allEntries() {
+		if mode, ok := prevMode[e.Path]; ok && mode != e.Mode&modeTypeMask {
+			replaced = append(replaced, e.Path)
+		}
+	}
+	sort.Strings(replaced)
+	return replaced
+}
+
+// ContentChangedFiles is the part of a delta the ransomware tripwire judges: files
+// that are new or whose size or mtime moved. An application that runs chown -R at
+// every start touches every ctime, which is worth copying and is no attack. Pure.
+func ContentChangedFiles(prev, cur VolIndex) []string {
+	prevByPath := make(map[string]FileEntry, len(prev.Entries))
+	for _, e := range prev.Entries {
+		prevByPath[e.Path] = e
+	}
+	var changed []string
+	for _, e := range cur.Entries {
+		if p, ok := prevByPath[e.Path]; !ok || p.Size != e.Size || p.MtimeUnix != e.MtimeUnix {
+			changed = append(changed, e.Path)
+		}
+	}
+	return changed
+}
+
+// DeletedFiles is the files among a delta's deleted entries, for the same reason.
+func DeletedFiles(prev VolIndex, deleted []string) []string {
+	gone := make(map[string]bool, len(deleted))
+	for _, path := range deleted {
+		gone[path] = true
+	}
+	var files []string
+	for _, e := range prev.Entries {
+		if gone[e.Path] {
+			files = append(files, e.Path)
+		}
+	}
+	return files
+}
+
+// deltaCannotCarry names why a delta could not faithfully hold these paths, or says
+// nothing when it can. The list handed to tar -T is split on newlines, and the
+// manifest's deleted list is JSON, which would alter a name that is not UTF-8. A
+// full carries any name, so it stands in. Pure.
+func deltaCannotCarry(changed, removed []string) string {
+	for _, path := range changed {
+		if strings.Contains(path, "\n") {
+			return "a changed name holds a newline"
+		}
+	}
+	for _, path := range removed {
+		if strings.Contains(path, "\n") || !utf8.ValidString(path) {
+			return "a removed name cannot be recorded exactly"
+		}
+	}
+	return ""
 }
 
 // resolveChain walks parent pointers from `target` up to the FULL baseline,
@@ -245,8 +384,7 @@ func resolveChain(target string, byID map[string]*Manifest) ([]*Manifest, error)
 func sanitizeVolPaths(paths []string) []string {
 	out := make([]string, 0, len(paths))
 	for _, p := range paths {
-		p = strings.TrimSpace(p)
-		if p == "" || strings.HasPrefix(p, "/") {
+		if strings.TrimSpace(p) == "" || strings.HasPrefix(p, "/") {
 			continue
 		}
 		bad := false

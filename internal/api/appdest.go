@@ -169,7 +169,7 @@ func (s *Server) appExternalBackupCore(parent context.Context) (fname string, pu
 	}
 	af.Close()
 
-	fname = fmt.Sprintf("dockback-config-%s.dback", time.Now().UTC().Format("20060102-150405"))
+	fname = appbackup.NewName(time.Now())
 	key := appRemotePrefix + "/" + fname
 	pushed = []string{}
 	failed = map[string]string{}

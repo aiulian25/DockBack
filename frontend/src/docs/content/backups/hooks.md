@@ -9,7 +9,7 @@ Some apps need a moment of quiet to guarantee a consistent snapshot: flush cache
 ## Pre vs post
 
 - **Pre-hooks** run before data capture. If a pre-hook fails, the backup is aborted (so you never store an inconsistent snapshot).
-- **Post-hooks** always run afterward — including on failure — so the app is never left in maintenance mode. Example: turn Nextcloud maintenance mode **on** in pre, **off** in post.
+- **Post-hooks** always run once any pre-hook has started — including when a pre-hook fails, since it may already have changed something — and as soon as the capture is done, not after the upload, so the app is out of maintenance before compression and upload begin. If DockBack dies inside the window, they run when it next starts, so write them to be safe to run twice. A post-hook that fails doesn't fail the backup, but it does raise an alert. This way the app is never left in maintenance mode unnoticed. Example: turn Nextcloud maintenance mode **on** in pre, **off** in post.
 
 ## Configuring hooks
 

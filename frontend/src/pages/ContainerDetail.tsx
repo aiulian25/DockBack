@@ -10,6 +10,7 @@ import {
   CheckCircle2, XCircle, Loader2, AlertTriangle, ShieldCheck, HardDrive, X, ScrollText, History, Lock, Undo2,
 } from "lucide-react";
 import { followRun } from "../lib/logStream";
+import { newExecutionId } from "../lib/runDone";
 import { api, Backup, ContainerInfo, ContainerSizes, DrillStatus, RestoreCompatError, RestoreReadiness, StepUpError, fmtBytes, fmtAgo } from "../api";
 import { isRestoreProgressLine } from "../lib/restoreLogFilter";
 import { Button, Card, Chip, Modal } from "../components/ui";
@@ -240,8 +241,10 @@ export default function ContainerDetail() {
     // shows them, which is why this dialog carries its own view of the run.
     const start = Date.now();
     qrEsRef.current?.();
+    const executionId = newExecutionId();
     qrEsRef.current = followRun(b.id, {
       mode: "one",
+      executionId,
       since: start - 2000, // skip replayed history
       filter: isRestoreProgressLine,
       onLine: (l) => setQrLines((p) => [...p.slice(-60), { level: l.level, msg: l.msg }]),
@@ -254,7 +257,7 @@ export default function ContainerDetail() {
     });
     try {
       await api.restore(b.id, {
-        node_id: id, target_id: cid, volumes: true, database: true, confirm: true, snapshot: qrSnapshot,
+        execution_id: executionId, node_id: id, target_id: cid, volumes: true, database: true, confirm: true, snapshot: qrSnapshot,
         ...(confirmIncompatible ? { confirm_incompatible: true } : {}),
         ...(stepUp ? { password: stepUp.password, code: stepUp.code } : {}),
       });
@@ -474,10 +477,10 @@ export default function ContainerDetail() {
                     <td className="px-4 py-3">
                       <div className="flex flex-wrap gap-1">
                         {backupLocations(b).map((l, j) => (
-                          l.status === "failed" ? (
-                            // Intended offsite copy that did NOT upload — show it as failed, never as a real copy.
+                          l.status === "failed" || l.status === "incomplete" ? (
+                            // Intended offsite copy that did NOT fully upload — show it as such, never as a real copy.
                             <span key={j} title={l.detail || "offsite upload failed"} className="inline-flex items-center gap-1 rounded bg-error/10 px-1.5 py-0.5 text-[10px] text-error">
-                              <CloudUpload size={10} /> {l.name} failed
+                              <CloudUpload size={10} /> {l.name} {l.status}
                             </span>
                           ) : (
                             <span key={j} className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${l.kind === "local" ? "bg-surface-high text-on-surface-variant" : "bg-secondary/10 text-secondary"}`}>

@@ -13,7 +13,7 @@ import (
 
 	"dockback/internal/egress"
 
-	"github.com/hirochachacha/go-smb2"
+	"github.com/cloudsoda/go-smb2"
 )
 
 // smbIdleTimeout bounds INACTIVITY on the SMB connection, not total transfer
@@ -99,7 +99,8 @@ func (s *SMB) session() (*smb2.Share, net.Conn, func(), error) {
 	// streaming ops refresh it per chunk so it never caps a long transfer.
 	_ = conn.SetDeadline(time.Now().Add(smbIdleTimeout))
 	d := &smb2.Dialer{Initiator: &smb2.NTLMInitiator{User: s.user, Password: s.pass, Domain: s.domain}}
-	sess, err := d.Dial(conn)
+	// The connection's own deadline bounds the handshake, so no context deadline.
+	sess, err := d.DialConn(context.Background(), conn, s.addr)
 	if err != nil {
 		conn.Close()
 		return nil, nil, nil, fmt.Errorf("smb auth: %w", err)
@@ -336,10 +337,26 @@ func (s *SMB) Ping(ctx context.Context) error {
 	return err
 }
 
+// errMalformedListing is a directory listing the SMB library could not parse.
+var errMalformedListing = errors.New("smb: the server sent a malformed directory listing")
+
+// recoverListing runs one directory listing and turns a panic into
+// errMalformedListing. go-smb2 parses the server's QUERY_DIRECTORY reply without
+// bounds checks (GO-2026-5051, no fixed release of this module), so a hostile or
+// tampered server could otherwise crash DockBack from inside runCtx's goroutine.
+func recoverListing(dir string, list func() ([]fs.FileInfo, error)) (entries []fs.FileInfo, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			entries, err = nil, fmt.Errorf("%w for %q: %v", errMalformedListing, dir, r)
+		}
+	}()
+	return list()
+}
+
 // List returns object keys directly under prefix (non-recursive, files only).
 func (s *SMB) List(ctx context.Context, prefix string) ([]string, error) {
 	return runCtx(ctx, func() ([]string, error) {
-		fs, _, cleanup, err := s.session()
+		share, _, cleanup, err := s.session()
 		if err != nil {
 			return nil, err
 		}
@@ -352,7 +369,11 @@ func (s *SMB) List(ctx context.Context, prefix string) ([]string, error) {
 		for len(queue) > 0 {
 			rel := queue[0]
 			queue = queue[1:]
-			des, derr := fs.ReadDir(s.full(rel))
+			dir := s.full(rel)
+			des, derr := recoverListing(dir, func() ([]fs.FileInfo, error) { return share.ReadDir(dir) })
+			if errors.Is(derr, errMalformedListing) {
+				return nil, derr
+			}
 			if derr != nil {
 				continue // missing/inaccessible dir → skip (empty for the start prefix)
 			}

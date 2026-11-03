@@ -20,7 +20,6 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 
-	"dockback/internal/crypto"
 	"dockback/internal/dockercli"
 	"dockback/internal/notify"
 	"dockback/internal/store"
@@ -83,11 +82,16 @@ type RestoreOptions struct {
 	// original is never touched: no in-place overwrite, no safety snapshot.
 	AsName string
 	// Isolated (clone mode) gives the clone fresh empty volumes, no published
-	// ports, and a throwaway network, so it can't clash with or affect the original.
+	// ports, no host powers and no network, so it can't clash with or affect the
+	// original or anything else.
 	Isolated bool
+	// OnCloneCreated receives the id of the clone this restore created, the moment
+	// it exists. A caller that cleans up removes exactly that id, never a name:
+	// whatever a name points at may not be its own.
+	OnCloneCreated func(containerID string)
 	// TestCloneTTL, when set, stamps the clone with an expiry label so the reaper
 	// removes it (and the volumes Docker made for it) once the time is up — F219.
-	// Only meaningful alongside AsName + Isolated; a clone the operator named
+	// Only meaningful alongside AsName; a clone the operator named
 	// themselves is theirs to keep, and nothing sweeps it.
 	TestCloneTTL time.Duration
 
@@ -274,6 +278,16 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 	// path) and NEVER resolve/overwrite the original container.
 	clone := opts.AsName != ""
 	if clone {
+		// Create-only, for every caller. A copy that is not isolated keeps the
+		// original's mounts, and one that takes over a name writes into, or removes,
+		// a container that is somebody else's. This check gives the clear refusal;
+		// the create's name conflict is what closes the race.
+		if !opts.Isolated {
+			return fmt.Errorf("a copy must be isolated: without that it would write into the original's data")
+		}
+		if _, taken := dockercli.FindContainerByName(ctx, cli, opts.AsName); taken {
+			return fmt.Errorf("a container named %q already exists on this node, and a copy never replaces one — choose another name", opts.AsName)
+		}
 		e.logf(b.ID, "INFO", "Restore as a copy: bringing %q up as an isolated clone of %q — the original is left untouched", opts.AsName, b.TargetName)
 		opts.TargetID = opts.AsName
 	}
@@ -303,6 +317,10 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		if info, ierr := cli.ContainerInspect(ctx, opts.TargetID); ierr == nil && info.State != nil && info.State.Running {
 			wasRunning = true
 		}
+	}
+
+	if !clone && !opts.rollback {
+		defer e.journalRestore(b, opts.NodeID)()
 	}
 
 	// Safety snapshot before an in-place overwrite: back up the target's
@@ -335,6 +353,7 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 				return fmt.Errorf("pre-restore safety snapshot failed; aborting to avoid an unreversible overwrite: %w", serr)
 			}
 			snapID = sid
+			e.noteRestoreSnapshot(b, snapID)
 			e.logf(b.ID, "INFO", "Safety snapshot created (%s) — restore it to roll back this restore", short(snapID))
 			if opts.SnapshotLogID != "" {
 				e.logf(opts.SnapshotLogID, "INFO", "Safety snapshot of %q created (%s) — restore it to roll %q back", b.TargetName, short(snapID), b.TargetName)
@@ -352,7 +371,12 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 	// container that was there all along. An unanswered question is not an
 	// absent container, so it fails instead.
 	_, ierr := cli.ContainerInspect(ctx, opts.TargetID)
-	missing := ierr != nil && client.IsErrNotFound(ierr)
+	// A clone is always created: inspect also resolves id prefixes and a name taken
+	// since the check above, and neither may turn it into an in-place restore.
+	missing := clone || (ierr != nil && client.IsErrNotFound(ierr))
+	// Set once a recreate has replaced an existing container: from then on the
+	// image and configuration it had exist only in its safety snapshot.
+	replaced := false
 	if ierr != nil && !missing {
 		return fmt.Errorf("inspect %s: %w", opts.TargetID, ierr)
 	}
@@ -466,7 +490,7 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		}
 		var cloneOpts *dockercli.CloneOptions
 		if clone {
-			cloneOpts = &dockercli.CloneOptions{NewName: opts.AsName, Isolate: opts.Isolated}
+			cloneOpts = &dockercli.CloneOptions{NewName: opts.AsName}
 			// F219: the clone carries its own expiry. Stamped at CREATE time, from
 			// the moment the container actually comes into being rather than from
 			// when the request was accepted — a restore that spent twenty minutes
@@ -475,11 +499,20 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 				cloneOpts.Labels = TestCloneLabels(time.Now().Add(opts.TestCloneTTL))
 			}
 		}
+		if clone {
+			if removed := dockercli.CloneSandboxRemovals(inspectBytes); len(removed) > 0 {
+				e.logf(b.ID, "WARN", "This copy runs in a sandbox without what the original has: %s. If it needs them it will not work here, which says nothing about the backup", strings.Join(removed, "; "))
+			}
+		}
 		// #37: refuse a restore that would fill the destination's filesystem, before
 		// a single volume, directory or file is created. A refusal issued after 58
 		// GB has landed is not a refusal.
-		if cerr := e.guardRestoreCapacity(ctx, cli, b, man, opts, clone); cerr != nil {
-			return cerr
+		// Not a rollback: going back to the state that was already here is not the
+		// new data landing, and refusing it would strand the failed restore.
+		if !opts.rollback {
+			if cerr := e.guardRestoreCapacity(ctx, cli, b, man, opts, clone); cerr != nil {
+				return cerr
+			}
 		}
 
 		// F90: create named volumes with their RECORDED driver options first.
@@ -487,6 +520,10 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		// moment the container references it — which is how an NFS/CIFS-backed
 		// volume silently became local disk. Creating them up front, with their
 		// options, is what makes the backing store survive.
+		// Set once the host has been changed ahead of the recreate: the target
+		// stopped, or a file bind written. A failure after that is no longer
+		// "nothing happened", so it goes to the same recovery a later one does.
+		hostTouched := false
 		if !clone {
 			for _, w := range e.ensureRecordedVolumes(ctx, cli, man) {
 				e.logf(b.ID, "WARN", "Volume: %s", w)
@@ -495,8 +532,12 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 			// container exists — it cannot be restored afterwards through its own
 			// mount point. Ahead of the preflight below on purpose: the file it
 			// writes is one of the sources that preflight would otherwise report
-			// as missing.
-			e.restoreBindFiles(ctx, cli, b, man, opts)
+			// as missing. Written where the configuration being created mounts it.
+			touched, berr := e.putBackFileBinds(ctx, cli, b, man, opts, inspectBytes)
+			hostTouched = touched
+			if berr != nil {
+				return e.failBeforeReplace(ctx, cli, b, opts, snapID, wasRunning, hostTouched, berr)
+			}
 			// Every bind source has to exist on THIS host before the create, or the
 			// daemon will either refuse it one path at a time or invent empty
 			// directories in their place — including where a file belongs. The ones
@@ -504,7 +545,7 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 			// the whole list. A clone is exempt: stripForClone drops every bind, so
 			// it has no host paths to need.
 			if err := e.materializeBindSources(ctx, cli, b, man, inspectBytes); err != nil {
-				return err
+				return e.failBeforeReplace(ctx, cli, b, opts, snapID, wasRunning, hostTouched, err)
 			}
 		}
 
@@ -518,7 +559,21 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		}
 		newID, name, netWarnings, err := dockercli.RecreateContainer(ctx, cli, inspectBytes, man.ImageDigest, cloneOpts, netSpecs, opts.AllowDifferentImage)
 		if err != nil {
-			return fmt.Errorf("recreate container: %w", err)
+			err = fmt.Errorf("recreate container: %w", err)
+			// Not replaced, so there is nothing to recover from unless the host was
+			// already changed. Otherwise the original lost its name and could not
+			// get it back.
+			if clone || opts.rollback {
+				return err
+			}
+			if errors.Is(err, dockercli.ErrNothingReplaced) {
+				return e.failBeforeReplace(ctx, cli, b, opts, snapID, wasRunning, hostTouched, err)
+			}
+			return e.recoverFromFailedRestore(ctx, cli, b, opts, snapID, wasRunning, true, err)
+		}
+		replaced = !missing
+		if opts.OnCloneCreated != nil {
+			opts.OnCloneCreated(newID)
 		}
 		// Anything that could not be honored is stated plainly — a silently
 		// different network is exactly the failure this feature exists to end.
@@ -530,7 +585,10 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		// container missing the variable that gives its bind mount meaning starts
 		// perfectly well and is wrong.
 		if eerr := e.assertEnvRestored(ctx, cli, b, man, newID, capturedEnv, changedEnvKeys(capturedEnv, dockercli.ContainerEnv(inspectBytes))); eerr != nil {
-			return eerr
+			if clone || opts.rollback {
+				return eerr
+			}
+			return e.recoverFromFailedRestore(ctx, cli, b, opts, snapID, wasRunning, replaced, eerr)
 		}
 		if clone {
 			e.logf(b.ID, "INFO", "Created isolated clone %q (%s)", name, short(newID))
@@ -546,7 +604,7 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 			// stack restore writes a single merged file once, after every member
 			// is in place.
 			if opts.ReconstructHost && !opts.stackMember {
-				e.reconstructHostStack(ctx, cli, b, man, opts, inspectBytes)
+				_ = e.reconstructHostStack(ctx, cli, b, man, opts, inspectBytes)
 			}
 			if !opts.stackMember {
 				e.noteUnwrittenOriginals(b.ID, man, opts.ReconstructHost)
@@ -563,9 +621,13 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 	// including where a secret file belonged.
 	if !missing && !opts.Recreate && !clone && opts.Volumes {
 		if _, raw, ierr := cli.ContainerInspectWithRaw(ctx, opts.TargetID, false); ierr == nil {
-			e.restoreBindFiles(ctx, cli, b, man, opts)
+			// raw is what the container mounts now, so a file bind lands where it
+			// is read, not where the backup's machine had it.
+			if touched, berr := e.putBackFileBinds(ctx, cli, b, man, opts, raw); berr != nil {
+				return e.failBeforeReplace(ctx, cli, b, opts, snapID, wasRunning, touched, berr)
+			}
 			if berr := e.materializeBindSources(ctx, cli, b, man, raw); berr != nil {
-				return e.recoverFromFailedRestore(ctx, cli, b, opts, snapID, wasRunning, berr)
+				return e.recoverFromFailedRestore(ctx, cli, b, opts, snapID, wasRunning, replaced, berr)
 			}
 		}
 	}
@@ -595,7 +657,7 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 		if opts.rollback || clone {
 			return rerr // an internal rollback must not recurse; a clone touched nothing
 		}
-		return e.recoverFromFailedRestore(ctx, cli, b, opts, snapID, wasRunning, rerr)
+		return e.recoverFromFailedRestore(ctx, cli, b, opts, snapID, wasRunning, replaced, rerr)
 	}
 
 	// F140: post-restore application steps, BEFORE the health gate. For Nextcloud
@@ -610,9 +672,9 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 	// rollback) don't apply. Report the clone as done; the original is untouched.
 	if clone {
 		if opts.TestCloneTTL > 0 && opts.Isolated {
-			e.logf(b.ID, "INFO", "Restore completed — test clone %q is up with the restored data (no published ports; on the %q network). The original container was not touched, and this clone is removed automatically in %s along with the volumes created for it.", opts.AsName, "dockback-restore", humanDuration(opts.TestCloneTTL))
+			e.logf(b.ID, "INFO", "Restore completed — test clone %q is up with the restored data (no published ports, no network, no host powers). The original container was not touched, and this clone is removed automatically in %s along with the volumes created for it.", opts.AsName, humanDuration(opts.TestCloneTTL))
 		} else {
-			e.logf(b.ID, "INFO", "Restore completed — isolated clone %q is up with the restored data (no published ports; on the %q network). The original container was not touched.", opts.AsName, "dockback-restore")
+			e.logf(b.ID, "INFO", "Restore completed — isolated clone %q is up with the restored data (no published ports, no network, no host powers). The original container was not touched.", opts.AsName)
 		}
 		return nil
 	}
@@ -625,7 +687,7 @@ func (e *Engine) Restore(ctx context.Context, opts RestoreOptions) error {
 	if opts.rollback {
 		return nil
 	}
-	if gerr := e.gateRestoreHealth(ctx, cli, b, man, opts, snapID); gerr != nil {
+	if gerr := e.gateRestoreHealth(ctx, cli, b, man, opts, snapID, replaced); gerr != nil {
 		return gerr
 	}
 	// F113/F114: only once the restore is actually green. The app's own CLI needs
@@ -828,33 +890,42 @@ const (
 // failedRestoreAction decides it. A cancel is the operator's own stop, not a
 // failure: it stops where it is and never rolls back behind their back. With a
 // safety snapshot, roll back to it. Without one, an application that was
-// running is started again rather than left down.
-func failedRestoreAction(haveSnapshot, wasRunning, canceled bool) failedRestoreStep {
+// running is started again rather than left down, unless the container was
+// replaced: starting that would run another image over data it did not write.
+func failedRestoreAction(haveSnapshot, wasRunning, canceled, replaced bool) failedRestoreStep {
 	if canceled {
 		return failedRestoreLeave
 	}
 	if haveSnapshot {
 		return failedRestoreRollBack
 	}
-	if wasRunning {
+	if wasRunning && !replaced {
 		return failedRestoreRestart
 	}
 	return failedRestoreLeave
+}
+
+// rollbackOptions restores a safety snapshot over a failed restore. When the
+// container was replaced it is rebuilt from the snapshot too, with the image and
+// configuration it had: the snapshot's bytes belong to them, not to whatever the
+// failed restore brought up.
+func rollbackOptions(opts RestoreOptions, snapID string, replaced bool) RestoreOptions {
+	return RestoreOptions{
+		BackupID: snapID, NodeID: opts.NodeID, TargetID: opts.TargetID,
+		Volumes: true, Database: true, Source: "local", rollback: true, Recreate: replaced,
+	}
 }
 
 // recoverFromFailedRestore handles a restore that failed BEFORE the health
 // gate. It used to return the error and nothing else, so a restore that died
 // half-way left the container stopped on partly-overwritten data with nothing
 // said about it. The rollback here is the same one the health gate performs.
-func (e *Engine) recoverFromFailedRestore(ctx context.Context, cli *client.Client, b *store.Backup, opts RestoreOptions, snapID string, wasRunning bool, cause error) error {
+func (e *Engine) recoverFromFailedRestore(ctx context.Context, cli *client.Client, b *store.Backup, opts RestoreOptions, snapID string, wasRunning, replaced bool, cause error) error {
 	canceled := errors.Is(cause, ErrRestoreCanceled) || ctx.Err() != nil
-	switch failedRestoreAction(snapID != "", wasRunning, canceled) {
+	switch failedRestoreAction(snapID != "", wasRunning, canceled, replaced) {
 	case failedRestoreRollBack:
 		e.logf(b.ID, "WARN", "Restore failed (%v) — rolling back to the pre-restore snapshot (%s)", cause, short(snapID))
-		rbErr := e.Restore(ctx, RestoreOptions{
-			BackupID: snapID, NodeID: opts.NodeID, TargetID: opts.TargetID,
-			Volumes: true, Database: true, Source: "local", rollback: true,
-		})
+		rbErr := e.Restore(ctx, rollbackOptions(opts, snapID, replaced))
 		if rbErr != nil {
 			e.logf(b.ID, "WARN", "Rollback to the safety snapshot FAILED: %v", rbErr)
 			e.notify(notify.KindRestoreFailed, "Restore FAILED and rollback FAILED: "+b.TargetName,
@@ -873,7 +944,13 @@ func (e *Engine) recoverFromFailedRestore(ctx context.Context, cli *client.Clien
 		e.logf(b.ID, "WARN", "Restore failed (%v). No safety snapshot was taken, so nothing could be rolled back. %s was running before, so it has been started again — on whatever its mounts hold now, which may be PARTLY restored. Check its data before relying on it.", cause, b.TargetName)
 		return fmt.Errorf("restore failed (%v) — no safety snapshot to roll back to; the container was started again and its data may be partly restored", cause)
 	default:
-		return cause
+		if !replaced || canceled {
+			return cause
+		}
+		e.logf(b.ID, "ERR", "Restore failed (%v). The original container was already replaced and no safety snapshot was taken, so it cannot be brought back. %s has been left stopped: starting it would run the backup's image over data it did not write", cause, b.TargetName)
+		e.notify(notify.KindRestoreFailed, "Restore FAILED, recovery needed: "+b.TargetName,
+			fmt.Sprintf("Restoring %s failed (%v) after its container was replaced, and no safety snapshot was taken. It has been left stopped, and its data may be partly restored. Restore a backup of it to recover.", b.TargetName, cause))
+		return fmt.Errorf("restore failed (%v) — RECOVERY NEEDED: the original container was replaced and there is no safety snapshot; %s was left stopped", cause, b.TargetName)
 	}
 }
 
@@ -882,7 +959,7 @@ func (e *Engine) recoverFromFailedRestore(ctx context.Context, cli *client.Clien
 // taken) or reports the unhealthy outcome — never silent success (F4). It returns
 // a non-nil error in every non-healthy case so the caller (and the UI) sees the
 // restore as failed.
-func (e *Engine) gateRestoreHealth(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, snapID string) error {
+func (e *Engine) gateRestoreHealth(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, snapID string, replaced bool) error {
 	e.logf(b.ID, "INFO", "Verifying the restored container comes up healthy…")
 	// #35: if the probe about to be trusted cannot fail, say so before its
 	// verdict is reported as proof. The gate itself is unchanged — rewriting an
@@ -927,10 +1004,7 @@ func (e *Engine) gateRestoreHealth(ctx context.Context, cli *client.Client, b *s
 		// the evidence of why the restore failed with it.
 		excerpt := e.restoreForensics(ctx, cli, b, opts.TargetID, b.TargetName)
 		e.logf(b.ID, "WARN", "Restored data did not become healthy — rolling back to the pre-restore snapshot (%s)", short(snapID))
-		rbErr := e.Restore(ctx, RestoreOptions{
-			BackupID: snapID, NodeID: opts.NodeID, TargetID: opts.TargetID,
-			Volumes: true, Database: true, Source: "local", rollback: true,
-		})
+		rbErr := e.Restore(ctx, rollbackOptions(opts, snapID, replaced))
 		if rbErr != nil {
 			// Worst case: the container is unhealthy AND the rollback failed, so the
 			// data may be in an intermediate state. Surface it as loudly as possible.
@@ -2267,6 +2341,8 @@ func (e *Engine) logStackFolder(logID string, res *dockercli.HostReconstructResu
 	switch {
 	case res.Path == "":
 		e.logf(logID, "INFO", "Wrote no compose file under the stack's name in %s; the rebuilt one is beside it as %s.", res.Dir, reconstructionComposeName)
+	case slices.Contains(res.Kept, res.Path):
+		e.logf(logID, "INFO", "The compose file at %s is already there — kept as it is", res.Path)
 	case res.Unchanged:
 		e.logf(logID, "INFO", "The compose file at %s already matches — left exactly as it is", res.Path)
 	case layout.PrimaryOriginal:
@@ -2296,6 +2372,12 @@ func (e *Engine) logStackFolder(logID string, res *dockercli.HostReconstructResu
 	if len(res.BesideDisplaced) > 0 {
 		e.logf(logID, "INFO", "Files that were in the way are kept as %s — nothing was deleted.", strings.Join(res.BesideDisplaced, ", "))
 	}
+	if len(res.Kept) > 0 {
+		e.logf(logID, "INFO", "Already there, so kept exactly as they are: %s. A files-only restore changes nothing that exists; the backup's copies stay in the archive.", strings.Join(res.Kept, ", "))
+	}
+	if len(res.Failed) > 0 {
+		e.logf(logID, "WARN", "Could not write: %s", strings.Join(res.Failed, "; "))
+	}
 }
 
 // warnDuplicateEnvKeys names every variable the .env about to be written
@@ -2318,10 +2400,11 @@ func (e *Engine) warnDuplicateEnvKeys(logID string, env []byte) {
 // RestoreOptions.ReconstructHost). It resolves the target directory from the
 // backup's recorded compose working_dir — falling back to the container's own
 // compose labels in inspect.json for older backups, or, for a NON-compose
-// container, to HostBaseDir + the container name. Everything here is best-effort
-// and logged: the container has already been recreated, so failing to lay down
-// the folder never fails the restore.
-func (e *Engine) reconstructHostStack(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, inspectBytes []byte) {
+// container, to HostBaseDir + the container name. Everything here is logged, and
+// what could not be written is also returned: a full restore treats it as
+// best-effort, because the container has already been recreated, while a
+// files-only restore exists only to write these files and fails without them.
+func (e *Engine) reconstructHostStack(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, inspectBytes []byte) error {
 	workingDir, composeFile := man.StackWorkingDir, man.ComposeFile
 	name := man.TargetName
 	if name == "" {
@@ -2356,7 +2439,7 @@ func (e *Engine) reconstructHostStack(ctx context.Context, cli *client.Client, b
 	stackDir := ResolveStackDir(workingDir, name, opts.HostBaseDir, "", "")
 	if stackDir == "" {
 		e.logf(b.ID, "INFO", "Skipping host stack reconstruction — %q has no recorded compose directory and no base directory was provided", name)
-		return
+		return nil
 	}
 	// F81: relocate the stack folder itself under the new base, so the compose
 	// file and the data land together on the target machine's layout.
@@ -2383,7 +2466,7 @@ func (e *Engine) reconstructHostStack(ctx context.Context, cli *client.Client, b
 		composeBytes, err = e.extractEntry(ctx, b, opts.Source, "config/docker-compose.yml")
 		if err != nil || len(composeBytes) == 0 {
 			e.logf(b.ID, "WARN", "Cannot reconstruct host stack — no reconstructed compose file in this backup (%v)", err)
-			return
+			return fmt.Errorf("the backup holds no compose file to put back")
 		}
 		// Keep the written compose consistent with the remapped container config.
 		// One helper applies all three remaps (RemapEnvFile is generic text remap —
@@ -2441,19 +2524,39 @@ func (e *Engine) reconstructHostStack(ctx context.Context, cli *client.Client, b
 	project := firstNonEmpty(b.Stack, composeProjectName(name))
 	layout = e.guardReconstruction(ctx, checker, layout, envFile, project, b.ID)
 	res, rerr := dockercli.ReconstructStackDirWithEnv(ctx, cli, stackDir, composeFile, layout.Primary, envFile,
-		HostFileOwner(uid, gid, pinned, dockercli.ContainerEnv(inspectBytes)), layout.Beside...)
+		HostFileOwner(uid, gid, pinned, dockercli.ContainerEnv(inspectBytes)), hostWritePolicy(opts.FilesOnly), layout.Beside...)
 	if rerr != nil {
 		e.logf(b.ID, "WARN", "Host stack reconstruction skipped: %v", rerr)
-		return
+		return fmt.Errorf("the stack folder %s was not written: %w", stackDir, rerr)
 	}
 	e.logStackFolder(b.ID, res, layout, movedSecrets)
-	e.restoreProjectFolder(ctx, cli, b, man, opts.Source, b.ID, res.Dir)
+	folderErr := e.restoreProjectFolder(ctx, cli, b, man, opts.Source, b.ID, res.Dir)
 	e.reportComposeCheck(ctx, cli, checker, res, layout, project, b.Stack != "", b.ID)
 	if res.Owner != "" && res.Owner != "0:0" {
 		e.logf(b.ID, "INFO", "Reconstructed folder ownership set to %s (matched to its parent directory)", res.Owner)
 	} else {
 		e.logf(b.ID, "INFO", "Reconstructed folder is root-owned (its parent was absent or root-owned) — chown it to your user if needed")
 	}
+	return errors.Join(unwrittenFiles(res), folderErr)
+}
+
+// hostWritePolicy is how a restore treats the stack folder's files that are
+// already there: a full restore puts back what the stack ran from, a files-only
+// restore changes nothing that exists.
+func hostWritePolicy(filesOnly bool) dockercli.HostWritePolicy {
+	if filesOnly {
+		return dockercli.KeepExisting
+	}
+	return dockercli.ReplaceExisting
+}
+
+// unwrittenFiles is the error naming the stack-folder files that could not be
+// written, nil when every one was.
+func unwrittenFiles(res *dockercli.HostReconstructResult) error {
+	if len(res.Failed) == 0 {
+		return nil
+	}
+	return fmt.Errorf("these files could not be written: %s", strings.Join(res.Failed, "; "))
 }
 
 // ResolveStackDir resolves where a service's stack folder lands on the host:
@@ -2678,6 +2781,15 @@ func (e *Engine) restoreFiles(ctx context.Context, cli *client.Client, b *store.
 			if gman.Incremental {
 				member = volumeDeltaMember
 			}
+			// Before extracting, while the tree is still the parent's: a directory
+			// this delta turns into a link would otherwise carry a removal through
+			// that link and into whatever it points at.
+			if removed := sanitizeVolPaths(append(append([]string(nil), gman.Replaced...), gman.Deleted...)); len(removed) > 0 {
+				e.logf(b.ID, "INFO", "Removing %d path(s) deleted or replaced since the previous generation", len(removed))
+				if derr := dockercli.DeleteVolumePaths(ctx, cli, opts.TargetID, removed); derr != nil {
+					return fmt.Errorf("applying removals: %w", derr)
+				}
+			}
 			if rerr := e.streamArchive(ctx, gen, src, func(tr *tar.Reader, hdr *tar.Header) (bool, error) {
 				if hdr.Name != member {
 					return true, nil
@@ -2693,13 +2805,6 @@ func (e *Engine) restoreFiles(ctx context.Context, cli *client.Client, b *store.
 				return false, nil // stop after the payload
 			}); rerr != nil {
 				return rerr
-			}
-			// Remove files deleted since the parent (deltas only), validated.
-			if del := sanitizeVolPaths(gman.Deleted); len(del) > 0 {
-				e.logf(b.ID, "INFO", "Removing %d path(s) deleted since the previous generation", len(del))
-				if derr := dockercli.DeleteVolumePaths(ctx, cli, opts.TargetID, del); derr != nil {
-					return fmt.Errorf("applying deletions: %w", derr)
-				}
 			}
 			// F22: lay this generation's consistent SQLite snapshot(s) over the raw
 			// file(s) it just restored. Applied per generation in chain order so the
@@ -3654,20 +3759,17 @@ func (e *Engine) DecryptTo(ctx context.Context, backupID string, w io.Writer) er
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
-
 	ak, algo, err := e.archiveCodec(b)
 	if err != nil {
+		rc.Close()
 		return err
 	}
-	pr, pw := io.Pipe()
-	go func() { pw.CloseWithError(crypto.Decrypt(pw, rc, ak)) }()
-	zr, err := newDecompressReader(pr, algo)
+	stream, err := openArchiveStream(ctx, rc, ak, algo)
 	if err != nil {
 		return err
 	}
-	defer zr.Close()
-	_, err = io.Copy(w, zr)
+	defer stream.Close()
+	_, err = io.Copy(w, stream)
 	return err
 }
 
@@ -3735,7 +3837,7 @@ func (e *Engine) ListEntries(ctx context.Context, b *store.Backup, source string
 		_ = unmarshal(b.ManifestJSON, man)
 	}
 	if man.VolIndex != "" {
-		idx, err := e.loadVolIndex(ctx, b)
+		idx, err := e.loadVolIndex(ctx, b, source)
 		if err != nil {
 			return nil, fmt.Errorf("read file index: %w", err)
 		}
@@ -3939,8 +4041,40 @@ const (
 	bindFileArchivePrefix = "config/bind-files/"
 )
 
+// putBackFileBinds stops the target if it is running, then writes every
+// captured file bind to where config mounts it (restoreBindFiles). A stop that
+// is refused returns before a single file is written, so the running
+// application keeps the files it has. hostTouched reports whether anything
+// changed: the target stopped or a file written.
+func (e *Engine) putBackFileBinds(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, config []byte) (hostTouched bool, err error) {
+	if man == nil || len(fileBinds(man)) == 0 {
+		return false, nil
+	}
+	stopped := false
+	if info, ierr := cli.ContainerInspect(ctx, opts.TargetID); ierr == nil && info.State != nil && info.State.Running {
+		e.logf(b.ID, "INFO", "Stopping %s before writing its file binds", b.TargetName)
+		if serr := stopBeforeOverwrite(ctx, cli, opts.TargetID, b.TargetName); serr != nil {
+			return false, serr
+		}
+		stopped = true
+	}
+	written, werr := e.restoreBindFiles(ctx, cli, b, man, opts, config)
+	return stopped || written > 0, werr
+}
+
+// failBeforeReplace ends a restore that failed before its container was
+// replaced. Untouched, the error says it all. Once the target was stopped or a
+// file bind written, it gets the recovery a later failure gets: the safety
+// snapshot, or a restart of a container that was running.
+func (e *Engine) failBeforeReplace(ctx context.Context, cli *client.Client, b *store.Backup, opts RestoreOptions, snapID string, wasRunning, hostTouched bool, cause error) error {
+	if !hostTouched || opts.rollback {
+		return cause
+	}
+	return e.recoverFromFailedRestore(ctx, cli, b, opts, snapID, wasRunning, false, cause)
+}
+
 // restoreBindFiles writes every captured file-bind onto the target host, before
-// the container that mounts them is created (F81).
+// the container that mounts them is created or started (F81).
 //
 // This is the other half of splitFileBinds. A file bind cannot be restored the
 // way every other mount is — the volume archive is extracted in a sidecar where
@@ -3948,24 +4082,49 @@ const (
 // the kernel refuses — so its bytes travel as their own archive member and land
 // here, on the host, while nothing has them open.
 //
-// Never fatal. A file that cannot be written leaves its path absent, and the
-// bind-source preflight immediately after names every absent path at once with
-// what to do about it — which is a better report than failing here with the
-// first one. What must not happen is a restore that reports success having
-// silently skipped an application's key, so every failure is logged.
-func (e *Engine) restoreBindFiles(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions) {
+// Each file goes to the source of the bind config mounts at the file's
+// destination, never to the path the backup recorded: a deployment that moved
+// the file would otherwise have its old path written and the one it reads left
+// wrong. A destination config no longer mounts is named and skipped. Every
+// file that could not be written is returned, so the restore cannot report
+// success having silently skipped an application's key.
+func (e *Engine) restoreBindFiles(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, config []byte) (int, error) {
 	if man == nil {
-		return
+		return 0, nil
 	}
+	mounts := dockercli.ContainerBindMounts(config)
 	written := 0
+	var unwritten []string
 	for _, v := range fileBinds(man) {
-		if e.writeBindFile(ctx, cli, b, v, opts, b.ID) {
-			written++
+		host, ok := bindFileTarget(mounts, v.Destination)
+		if !ok {
+			e.logf(b.ID, "WARN", "The container no longer mounts a file at %s, so the backup's copy was not written to its old path %s", v.Destination, v.Source)
+			continue
 		}
+		if !e.writeBindFile(ctx, cli, b, v, host, opts.Source, b.ID) {
+			unwritten = append(unwritten, host)
+			continue
+		}
+		written++
 	}
 	if written > 0 {
 		e.logf(b.ID, "INFO", "Wrote %d file bind(s) to this host before starting the container", written)
 	}
+	if len(unwritten) > 0 {
+		return written, fmt.Errorf("these file binds could not be written: %s", strings.Join(unwritten, ", "))
+	}
+	return written, nil
+}
+
+// bindFileTarget is the host path a file bind is written to: the source of the
+// bind mounted at destination. ok is false when nothing is mounted there.
+func bindFileTarget(mounts []dockercli.BindMount, destination string) (string, bool) {
+	for _, m := range mounts {
+		if m.Destination == destination {
+			return m.Source, true
+		}
+	}
+	return "", false
 }
 
 // fileBinds are the recorded binds whose root is a file the archive carries.
@@ -3979,15 +4138,14 @@ func fileBinds(man *Manifest) []VolumeRef {
 	return out
 }
 
-// writeBindFile writes one file bind to the host, with its recorded owner and
-// mode, logging under logID. Reports whether it was written.
-func (e *Engine) writeBindFile(ctx context.Context, cli *client.Client, b *store.Backup, v VolumeRef, opts RestoreOptions, logID string) bool {
-	data, err := e.extractEntry(ctx, b, opts.Source, v.Archive)
+// writeBindFile writes one file bind to host, with its recorded owner and mode,
+// logging under logID. Reports whether it was written.
+func (e *Engine) writeBindFile(ctx context.Context, cli *client.Client, b *store.Backup, v VolumeRef, host, source, logID string) bool {
+	data, err := e.extractEntry(ctx, b, source, v.Archive)
 	if err != nil {
 		e.logf(logID, "WARN", "This backup records the file mounted at %s but the archive does not hold it (%v) — the application will start without it", v.Destination, err)
 		return false
 	}
-	host := dockercli.RemapHostPath(v.Source, opts.RemapFromPath, opts.RemapToPath)
 	if werr := dockercli.WriteHostFile(ctx, cli, host, data, v.Owner, v.Mode); werr != nil {
 		e.logf(logID, "WARN", "Could not write the file mounted at %s to %s (%v) — put it there yourself before starting the container, or it will come up without it", v.Destination, host, werr)
 		return false
@@ -4009,16 +4167,20 @@ func (e *Engine) restoreFilesOnly(ctx context.Context, b *store.Backup, man *Man
 	}
 	logID := firstNonEmpty(opts.SnapshotLogID, b.ID)
 	e.logf(logID, "INFO", "Files-only restore of %s: putting back the files it keeps on the host. No container is stopped or changed, and nothing that exists is overwritten.", b.TargetName)
+	var folderErr error
 	if !opts.stackMember {
 		inspectBytes, ierr := e.liveOrArchivedInspect(ctx, cli, b, man, opts)
 		if ierr != nil {
 			return fmt.Errorf("reading the container's configuration: %w", ierr)
 		}
 		opts.ReconstructHost = true
-		e.reconstructHostStack(ctx, cli, b, man, opts, inspectBytes)
+		folderErr = e.reconstructHostStack(ctx, cli, b, man, opts, inspectBytes)
 	}
-	e.restoreMissingBindFiles(ctx, cli, b, man, opts, logID)
+	bindErr := e.restoreMissingBindFiles(ctx, cli, b, man, opts, logID)
 	e.reportMissingDataFolders(ctx, cli, man, opts, logID)
+	if err := errors.Join(folderErr, bindErr); err != nil {
+		return fmt.Errorf("files-only restore of %s did not put back every file: %w", b.TargetName, err)
+	}
 	e.logf(logID, "INFO", "Files-only restore of %s finished", b.TargetName)
 	return nil
 }
@@ -4037,28 +4199,71 @@ func (e *Engine) liveOrArchivedInspect(ctx context.Context, cli *client.Client, 
 
 // restoreMissingBindFiles writes back the single-file binds that are missing,
 // or that Docker replaced with an empty directory, and keeps every one that is
-// there: a key that exists may be newer than the backup.
-func (e *Engine) restoreMissingBindFiles(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, logID string) {
-	binds := fileBinds(man)
-	if len(binds) == 0 {
-		return
+// there: a key that exists may be newer than the backup. The error names every
+// one that could not be checked or written.
+func (e *Engine) restoreMissingBindFiles(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions, logID string) error {
+	recorded := fileBinds(man)
+	if len(recorded) == 0 {
+		return nil
 	}
-	hosts := make([]string, len(binds))
-	for i, v := range binds {
-		hosts[i] = dockercli.RemapHostPath(v.Source, opts.RemapFromPath, opts.RemapToPath)
+	config, cerr := e.fileBindConfig(ctx, cli, b, man, opts)
+	if cerr != nil {
+		return fmt.Errorf("reading where the file binds are mounted: %w", cerr)
+	}
+	mounts := dockercli.ContainerBindMounts(config)
+	var binds []VolumeRef
+	var hosts []string
+	for _, v := range recorded {
+		host, ok := bindFileTarget(mounts, v.Destination)
+		if !ok {
+			e.logf(logID, "WARN", "The container no longer mounts a file at %s, so the backup's copy was not written to its old path %s", v.Destination, v.Source)
+			continue
+		}
+		binds = append(binds, v)
+		hosts = append(hosts, host)
+	}
+	if len(binds) == 0 {
+		return nil
 	}
 	kinds, err := dockercli.ProbeHostPaths(ctx, cli, hosts)
 	if err != nil {
 		e.logf(logID, "WARN", "Could not check which file binds are missing (%v), so none were written", err)
-		return
+		return fmt.Errorf("could not check which file binds are missing: %w", err)
 	}
+	var unwritten []string
 	for i, v := range binds {
 		if kinds[hosts[i]] == dockercli.HostPathFile {
 			e.logf(logID, "INFO", "File bind %s is there — kept as it is", hosts[i])
 			continue
 		}
-		e.writeBindFile(ctx, cli, b, v, opts, logID)
+		if !e.writeBindFile(ctx, cli, b, v, hosts[i], opts.Source, logID) {
+			unwritten = append(unwritten, hosts[i])
+		}
 	}
+	if len(unwritten) > 0 {
+		return fmt.Errorf("these file binds could not be written: %s", strings.Join(unwritten, ", "))
+	}
+	return nil
+}
+
+// fileBindConfig is the configuration that says where a files-only restore
+// writes each file bind: the running container's, because that is where it
+// reads them, else the backup's with the path remap applied.
+func (e *Engine) fileBindConfig(ctx context.Context, cli *client.Client, b *store.Backup, man *Manifest, opts RestoreOptions) ([]byte, error) {
+	if id, ok := dockercli.FindContainerByName(ctx, cli, firstNonEmpty(man.TargetName, b.TargetName)); ok {
+		if _, raw, err := cli.ContainerInspectWithRaw(ctx, id, false); err == nil {
+			return raw, nil
+		}
+	}
+	archived, err := e.extractEntry(ctx, b, opts.Source, "config/inspect.json")
+	if err != nil {
+		return nil, err
+	}
+	if opts.RemapFromPath == "" || opts.RemapToPath == "" || opts.RemapFromPath == opts.RemapToPath {
+		return archived, nil
+	}
+	remapped, _, err := dockercli.RemapContainerHostPath(archived, opts.RemapFromPath, opts.RemapToPath)
+	return remapped, err
 }
 
 // reportMissingDataFolders names the bind-mounted folders that are gone from
@@ -4182,27 +4387,22 @@ func (e *Engine) streamArchive(ctx context.Context, b *store.Backup, source stri
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
-
 	ak, algo, err := e.archiveCodec(b)
 	if err != nil {
+		rc.Close()
 		return err
 	}
-	// Handing ctx to the backend is not enough on its own: a local copy is an
-	// os.File, which does not watch a context, so a cancelled restore would keep
-	// decrypting the whole archive to the end. ctxReader stops the read itself,
-	// and the check below stops the walk between members — so a cancel lands
+	// Handing ctx to the backend is not enough on its own: the stream stops the read
+	// itself, and the check below stops the walk between members — so a cancel lands
 	// within one buffer either way, which is what "stops at the next safe point"
 	// has to mean for the longest step in a restore.
-	pr, pw := io.Pipe()
-	go func() { pw.CloseWithError(crypto.Decrypt(pw, ctxReader(ctx, rc), ak)) }()
-	zr, err := newDecompressReader(pr, algo)
+	stream, err := openArchiveStream(ctx, rc, ak, algo)
 	if err != nil {
 		return err
 	}
-	defer zr.Close()
+	defer stream.Close()
 
-	tr := tar.NewReader(zr)
+	tr := tar.NewReader(stream)
 	for {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr

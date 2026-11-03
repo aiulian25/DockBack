@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -40,6 +41,14 @@ const (
 const (
 	dialTimeout  = 10 * time.Second
 	tcpKeepAlive = 30 * time.Second
+	// sshHandshakeTimeout bounds key exchange and authentication together. x/crypto's
+	// NewClientConn applies no timeout of its own, and a server that accepts TCP and
+	// then says nothing would otherwise hold the caller for ever.
+	sshHandshakeTimeout = 30 * time.Second
+	// sshChannelTimeout bounds opening one channel on an established connection.
+	// Expiring closes that connection, and with it any stream sharing it, so this is
+	// long enough that only a connection that is truly gone reaches it.
+	sshChannelTimeout = 30 * time.Second
 )
 
 // Reconnect back-off bounds (PLAN §4.13). After a node fails to respond the
@@ -108,20 +117,33 @@ func NewRegistry() *Registry {
 	return r
 }
 
-// closeNodeLocked tears down the cached client and SSH tunnel for a node.
-// It deliberately does NOT clear back-off state: Drop uses it to discard a
-// broken client for reconnect, and the failure count must keep accumulating so
-// the cooldown grows. Back-off is reset only on Set/Remove (a spec change or
-// deletion). Caller must hold r.mu.
-func (r *Registry) closeNodeLocked(id string) {
-	if c, ok := r.clients[id]; ok {
-		c.Close()
-		delete(r.clients, id)
+// detachedNode is a node's client and tunnel, out of the registry and ready to close.
+type detachedNode struct {
+	client *client.Client
+	tunnel *sshTunnel
+}
+
+// close shuts down what was detached. It talks to a network that may not answer, so
+// it runs after r.mu is released: one dead node must not hold up the whole fleet.
+func (d detachedNode) close() {
+	if d.client != nil {
+		d.client.Close()
 	}
-	if t, ok := r.tunnels[id]; ok {
-		t.close()
-		delete(r.tunnels, id)
+	if d.tunnel != nil {
+		d.tunnel.close()
 	}
+}
+
+// detachNodeLocked takes the cached client and SSH tunnel for a node out of the
+// registry for the caller to close once r.mu is released. It deliberately does NOT
+// clear back-off state: Drop uses it to discard a broken client for reconnect, and
+// the failure count must keep accumulating so the cooldown grows. Back-off is reset
+// only on Set/Remove (a spec change or deletion). Caller must hold r.mu.
+func (r *Registry) detachNodeLocked(id string) detachedNode {
+	detached := detachedNode{client: r.clients[id], tunnel: r.tunnels[id]}
+	delete(r.clients, id)
+	delete(r.tunnels, id)
+	return detached
 }
 
 // Backoff reports whether a node is currently in connection back-off — i.e. it
@@ -168,19 +190,21 @@ func (r *Registry) RecordHealth(id string, err error) {
 // so the next Get rebuilds it.
 func (r *Registry) Set(spec NodeConn) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.closeNodeLocked(spec.ID)
+	detached := r.detachNodeLocked(spec.ID)
 	delete(r.health, spec.ID) // a (re)configured node is probed immediately
 	r.specs[spec.ID] = spec
+	r.mu.Unlock()
+	detached.close()
 }
 
 // Remove drops a node and closes its client.
 func (r *Registry) Remove(id string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.closeNodeLocked(id)
+	detached := r.detachNodeLocked(id)
 	delete(r.health, id)
 	delete(r.specs, id)
+	r.mu.Unlock()
+	detached.close()
 }
 
 // Get returns a pooled client for the node, building it on first use.
@@ -208,8 +232,9 @@ func (r *Registry) Get(id string) (*client.Client, error) {
 // Drop discards a possibly-broken cached client so the next Get reconnects.
 func (r *Registry) Drop(id string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.closeNodeLocked(id)
+	detached := r.detachNodeLocked(id)
+	r.mu.Unlock()
+	detached.close()
 }
 
 // Ping checks reachability with a short timeout, reconnecting once on failure.
@@ -435,11 +460,20 @@ func ParseSSHSecret(b []byte) (key []byte, passphrase string) {
 // slow links — the old per-request full SSH dial does not scale. The host key is
 // verified/pinned via the cfg.HostKeyCallback supplied at construction (F1).
 type sshTunnel struct {
-	cfg          *ssh.ClientConfig
-	hostport     string
-	remoteSocket string
+	cfg              *ssh.ClientConfig
+	hostport         string
+	remoteSocket     string
+	handshakeTimeout time.Duration
+	channelTimeout   time.Duration
 
-	mu     sync.Mutex
+	// closed ends every dial in progress when the tunnel is closed.
+	closed context.Context
+	cancel context.CancelFunc
+	// connecting is a slot for the one connect in progress. A channel rather than a
+	// mutex, so a request waiting behind a stalled connect can still give up.
+	connecting chan struct{}
+
+	mu     sync.Mutex // guards client only: never held across network I/O
 	client *ssh.Client
 }
 
@@ -501,6 +535,7 @@ func newSSHTunnel(address string, creds SSHCreds, verifier ssh.HostKeyCallback) 
 	if p := u.Path; p != "" && p != "/" {
 		remoteSocket = p
 	}
+	closed, cancel := context.WithCancel(context.Background())
 	return &sshTunnel{
 		cfg: &ssh.ClientConfig{
 			User:            user,
@@ -508,8 +543,13 @@ func newSSHTunnel(address string, creds SSHCreds, verifier ssh.HostKeyCallback) 
 			HostKeyCallback: verifier, // trust-on-first-use pinning (F1)
 			Timeout:         10 * time.Second,
 		},
-		hostport:     hostport,
-		remoteSocket: remoteSocket,
+		hostport:         hostport,
+		remoteSocket:     remoteSocket,
+		handshakeTimeout: sshHandshakeTimeout,
+		channelTimeout:   sshChannelTimeout,
+		closed:           closed,
+		cancel:           cancel,
+		connecting:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -545,60 +585,201 @@ func SSHHostPort(address string) string {
 
 // dial opens a new channel to the remote Docker socket, reusing the persistent
 // SSH client and (re)connecting it only when needed.
-func (t *sshTunnel) dial(_ context.Context) (net.Conn, error) {
-	// Fast path: reuse the live SSH client (no connect lock held).
-	t.mu.Lock()
-	cli := t.client
-	t.mu.Unlock()
-	if cli != nil {
-		if conn, err := cli.Dial("unix", t.remoteSocket); err == nil {
-			return conn, nil
+func (t *sshTunnel) dial(ctx context.Context) (net.Conn, error) {
+	ctx, cancel := t.untilClosed(ctx)
+	defer cancel()
+	stale := t.currentClient()
+	if stale != nil {
+		conn, err := t.openChannel(ctx, stale)
+		if err == nil || ctx.Err() != nil {
+			return conn, err
 		}
 		// Channel open failed — the SSH connection is likely dead; reconnect.
 	}
+	cli, err := t.connectedClient(ctx, stale)
+	if err != nil {
+		return nil, err
+	}
+	return t.openChannel(ctx, cli)
+}
 
+// sshClient returns the tunnel's live *ssh.Client, connecting it if needed. Used to
+// open an ancillary session (F57 host-file read) over the same pinned connection.
+func (t *sshTunnel) sshClient(ctx context.Context) (*ssh.Client, error) {
+	ctx, cancel := t.untilClosed(ctx)
+	defer cancel()
+	return t.connectedClient(ctx, nil)
+}
+
+// untilClosed is ctx, also ended by the tunnel closing.
+func (t *sshTunnel) untilClosed(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(t.closed, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func (t *sshTunnel) currentClient() *ssh.Client {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	// Another goroutine may have reconnected while we waited for the lock.
-	if t.client != nil && t.client != cli {
-		if conn, err := t.client.Dial("unix", t.remoteSocket); err == nil {
-			return conn, nil
-		}
+	return t.client
+}
+
+// connectedClient returns a client other than stale, connecting one if nobody else
+// has. Only one connect runs at a time, and a request waiting for it can leave.
+func (t *sshTunnel) connectedClient(ctx context.Context, stale *ssh.Client) (*ssh.Client, error) {
+	select {
+	case t.connecting <- struct{}{}:
+		defer func() { <-t.connecting }()
+	case <-ctx.Done():
+		return nil, fmt.Errorf("ssh connect %s: %w", t.hostport, ctx.Err())
 	}
-	if t.client != nil {
-		t.client.Close()
-		t.client = nil
+	// Another goroutine may have reconnected while we waited for the slot.
+	if cli := t.currentClient(); cli != nil && cli != stale {
+		return cli, nil
 	}
-	// Dial the TCP layer ourselves with a bounded timeout + TCP keep-alive (so a
-	// silently-dropped link is detected and the persistent client reconnects),
-	// then layer SSH on top — ssh.Dial gives no control over the net.Dialer.
-	tcp, err := (&net.Dialer{Timeout: dialTimeout, KeepAlive: tcpKeepAlive}).Dial("tcp", t.hostport)
+	t.discardClient()
+	cli, err := t.connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return cli, t.storeClient(cli)
+}
+
+// connect runs the TCP and SSH phases. The deadline covers a server that goes silent
+// and the AfterFunc covers a caller that gives up, since neither reaches a blocked
+// read on its own. On success the deadline is cleared, because the connection is
+// long-lived and idles between requests.
+func (t *sshTunnel) connect(ctx context.Context) (*ssh.Client, error) {
+	dialer := net.Dialer{Timeout: dialTimeout, KeepAlive: tcpKeepAlive}
+	tcp, err := dialer.DialContext(ctx, "tcp", t.hostport)
 	if err != nil {
 		return nil, fmt.Errorf("ssh dial %s: %w", t.hostport, err)
+	}
+	stop := context.AfterFunc(ctx, func() { tcp.Close() })
+	defer stop()
+	if err := tcp.SetDeadline(time.Now().Add(t.handshakeTimeout)); err != nil {
+		tcp.Close()
+		return nil, fmt.Errorf("ssh handshake %s: %w", t.hostport, err)
 	}
 	sshConn, chans, reqs, err := ssh.NewClientConn(tcp, t.hostport, t.cfg)
 	if err != nil {
 		tcp.Close()
+		return nil, t.handshakeError(ctx, err)
+	}
+	if err := tcp.SetDeadline(time.Time{}); err != nil {
+		sshConn.Close()
 		return nil, fmt.Errorf("ssh handshake %s: %w", t.hostport, err)
 	}
-	newCli := ssh.NewClient(sshConn, chans, reqs)
-	conn, err := newCli.Dial("unix", t.remoteSocket)
+	if !stop() {
+		sshConn.Close()
+		return nil, fmt.Errorf("ssh handshake %s: %w", t.hostport, ctx.Err())
+	}
+	return ssh.NewClient(sshConn, chans, reqs), nil
+}
+
+// handshakeError names what actually ended a handshake. Closing the connection to
+// stop it surfaces as a confusing "use of closed network connection".
+func (t *sshTunnel) handshakeError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("ssh handshake %s: %w", t.hostport, ctx.Err())
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return fmt.Errorf("ssh handshake %s: no answer within %s: %w", t.hostport, t.handshakeTimeout, err)
+	}
+	return fmt.Errorf("ssh handshake %s: %w", t.hostport, err)
+}
+
+// storeClient publishes a new client, unless the tunnel closed while it connected.
+func (t *sshTunnel) storeClient(cli *ssh.Client) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.closed.Err(); err != nil {
+		cli.Close()
+		return fmt.Errorf("ssh tunnel closed: %w", err)
+	}
+	t.client = cli
+	return nil
+}
+
+// discardClient closes the current client, if any.
+func (t *sshTunnel) discardClient() {
+	t.mu.Lock()
+	cli := t.client
+	t.client = nil
+	t.mu.Unlock()
+	if cli != nil {
+		cli.Close()
+	}
+}
+
+// openChannel opens one channel to the Docker socket, bounded.
+func (t *sshTunnel) openChannel(ctx context.Context, cli *ssh.Client) (net.Conn, error) {
+	conn, err := openBounded(ctx, cli, t.channelTimeout, func() (net.Conn, error) { return cli.Dial("unix", t.remoteSocket) })
 	if err != nil {
-		newCli.Close()
 		return nil, fmt.Errorf("ssh->unix %s: %w", t.remoteSocket, err)
 	}
-	t.client = newCli
 	return conn, nil
 }
 
-// close tears down the persistent SSH client.
-func (t *sshTunnel) close() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.client != nil {
-		t.client.Close()
-		t.client = nil
+// openSession opens one exec session, bounded.
+func (t *sshTunnel) openSession(ctx context.Context, cli *ssh.Client) (*ssh.Session, error) {
+	sess, err := openBounded(ctx, cli, t.channelTimeout, cli.NewSession)
+	if err != nil {
+		return nil, fmt.Errorf("ssh session %s: %w", t.hostport, err)
 	}
+	return sess, nil
+}
+
+// openBounded runs one channel open on cli. The ssh package takes no context here, so
+// it runs aside. A caller that gives up returns at once, while a client that never
+// answers is closed when the timeout expires, which also ends the open and tells every
+// other user of that connection it is dead. What opens after its caller has gone is
+// closed rather than leaked.
+func openBounded[T io.Closer](ctx context.Context, cli *ssh.Client, timeout time.Duration, open func() (T, error)) (T, error) {
+	type opened struct {
+		channel T
+		err     error
+	}
+	var none T
+	result := make(chan opened, 1)
+	go func() {
+		channel, err := open()
+		result <- opened{channel, err}
+	}()
+	timer := time.NewTimer(timeout)
+	settle := func() {
+		defer timer.Stop()
+		select {
+		case late := <-result:
+			if late.err == nil {
+				late.channel.Close()
+			}
+		case <-timer.C:
+			cli.Close()
+		}
+	}
+	select {
+	case got := <-result:
+		timer.Stop()
+		return got.channel, got.err
+	case <-timer.C:
+		cli.Close()
+		return none, fmt.Errorf("no answer within %s", timeout)
+	case <-ctx.Done():
+		go settle()
+		return none, ctx.Err()
+	}
+}
+
+// close tears down the persistent SSH client and ends any connect in progress. It
+// does not wait for that connect, so it is safe with a server that has gone silent.
+func (t *sshTunnel) close() {
+	t.cancel()
+	t.discardClient()
 }
 
 // mtlsConfig builds a tls.Config from a PEM bundle (CA + client cert + key).

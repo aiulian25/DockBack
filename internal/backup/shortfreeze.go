@@ -45,17 +45,15 @@ const (
 	// frozenCopyMember is the second pass's archive while it waits to be merged;
 	// it never reaches the backup itself.
 	frozenCopyMember = "volumes-frozen.tar"
-	// walkCompleteMarker ends a walk that listed every entry without an error.
-	walkCompleteMarker = "DOCKBACK-WALK-COMPLETE"
-	// walkStatFormat is one walk line: path, size, mtime, raw mode in hex, ctime.
-	walkStatFormat = "%n|%s|%Y|%f|%Z"
-	// walkFieldSeparators is how many separators walkStatFormat puts after the path.
-	walkFieldSeparators = 4
-	// stat's raw mode bits for the entry types the merge tells apart.
-	modeTypeMask = 0o170000
-	modeDir      = 0o040000
-	modeRegular  = 0o100000
-	modeSocket   = 0o140000
+	// walkEndSuffix follows the marker on the line that ends a complete walk.
+	walkEndSuffix = "-END"
+	// walkMarkerChars is how much of a random id a walk's marker takes.
+	walkMarkerChars = 16
+	// walkStatFormat is one record after its marker: size, mtime, raw mode in hex,
+	// ctime, uid, gid, and the name last, so that it can hold the separator.
+	walkStatFormat = "|%s|%Y|%f|%Z|%u|%g|%n"
+	// walkFieldCount is how many fields a record holds after its marker's separator.
+	walkFieldCount = 7
 	// tarBlockSize is the unit every tar header and run of data is padded to.
 	tarBlockSize = 512
 	// tarEndBlocks is how many zero blocks end an archive.
@@ -70,7 +68,7 @@ var errWalkIncomplete = errors.New("find or stat reported an error, so the listi
 // path.
 type walkEntry struct {
 	size, mtime, ctime int64
-	mode               uint32
+	mode, uid, gid     uint32
 }
 
 func (w walkEntry) isDir() bool     { return w.mode&modeTypeMask == modeDir }
@@ -80,11 +78,12 @@ func (w walkEntry) isSocket() bool  { return w.mode&modeTypeMask == modeSocket }
 // liveCopy is a two-pass copy in progress: the first pass, taken while the
 // application ran, and once it is held, what changed meanwhile.
 type liveCopy struct {
-	since  int64             // node time the live copy began, less the clock margin
-	sha    string            // the live archive's SHA-256 and per-file MD5s — still
-	hashes map[string]string // the answer when nothing changed during it
-	walk   map[string]walkEntry
-	recopy []string // the entries copied again while held, named as the walk names them
+	since    int64             // node time the live copy began, less the clock margin
+	sha      string            // the live archive's SHA-256 and per-file MD5s — still
+	hashes   map[string]string // the answer when nothing changed during it
+	walk     map[string]walkEntry
+	walkedAt int64    // the node's clock when that walk began
+	recopy   []string // the entries copied again while held, named as the walk names them
 }
 
 // shortFreezeFits says whether this capture can take its bulk while the
@@ -133,12 +132,16 @@ func (e *Engine) copyFrozen(ctx context.Context, cli *client.Client, containerID
 	if live == nil {
 		return nil
 	}
-	walk, err := walkHeld(ctx, cli, containerID, dests, excludes)
+	walk, walkedAt, err := walkInventory(ctx, cli, containerID, dests, excludes)
 	if err != nil {
 		e.logf(id, "WARN", "Could not list the files while the container was held (%v), so everything is copied again now", err)
 		return nil
 	}
-	live.walk, live.recopy = walk, changedSince(walk, live.since)
+	live.walk, live.walkedAt, live.recopy = walk, walkedAt, changedSince(walk, live.since)
+	if reason := deltaCannotCarry(live.recopy, nil); reason != "" {
+		e.logf(id, "INFO", "%s, and the list of what to copy again cannot hold that, so everything is copied again now", reason)
+		return nil
+	}
 	if len(live.recopy) == 0 {
 		e.logf(id, "INFO", "Nothing changed during the live copy")
 		return live
@@ -169,7 +172,7 @@ func (e *Engine) recordShortFreeze(man *Manifest, opts Options, work, id string,
 	if !e.indexAlways() {
 		return nil
 	}
-	idx := frozenIndex(live.walk, man.Image)
+	idx := frozenIndex(live.walk, live.walkedAt, man.Image)
 	e.stampIndexHashes(&idx, hashes, id)
 	e.storeVolIndex(man, work, id, idx)
 	return nil
@@ -198,11 +201,6 @@ func (lc *liveCopy) settle(work string) (string, map[string]string, error) {
 // that still exists stays — a second entry for it, copied again, only sets its
 // attributes again. Pure.
 func (lc *liveCopy) superseded(name string, dir bool, recopied map[string]bool) bool {
-	// ponytail: a name holding a newline cannot travel in the line-based walk,
-	// so it keeps the live copy's version; a NUL-separated walk would cover it.
-	if strings.Contains(name, "\n") {
-		return false
-	}
 	entry, exists := lc.walk[name]
 	if dir {
 		return !exists || !entry.isDir()
@@ -221,34 +219,15 @@ func (e *Engine) nodeClock(ctx context.Context, cli *client.Client, containerID 
 	return strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
 }
 
-// walkHeld lists every entry under dests while the container is held.
-func walkHeld(ctx context.Context, cli *client.Client, containerID string, dests, excludes []string) (map[string]walkEntry, error) {
-	out, err := dockercli.CaptureSidecarRO(ctx, cli, containerID, frozenWalkCmd(dests, excludes))
+// walkInventory lists every entry under dests, or fails: a listing that missed an
+// entry would read as that entry deleted.
+func walkInventory(ctx context.Context, cli *client.Client, containerID string, dests, excludes []string) (map[string]walkEntry, int64, error) {
+	marker := "DOCKBACK-" + newID()[:walkMarkerChars]
+	out, err := dockercli.CaptureSidecarRO(ctx, cli, containerID, inventoryCmd(dests, excludes, marker))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	walk, complete := parseFrozenWalk(out)
-	if !complete {
-		return nil, errWalkIncomplete
-	}
-	return walk, nil
-}
-
-// frozenWalkCmd lists every entry under dests — files, directories, links —
-// as walkStatFormat lines, leaving the excluded sub-paths out, and ends with
-// walkCompleteMarker only when find and stat both finished without a word on
-// stderr: a listing that missed an entry would read as that entry deleted. The
-// destinations travel as literal argv, never through the shell. Pure.
-func frozenWalkCmd(dests, excludes []string) []string {
-	script := `"$@" 2>/tmp/dockback-walk.err && [ ! -s /tmp/dockback-walk.err ] && echo ` + walkCompleteMarker
-	cmd := []string{"/bin/sh", "-c", script, "sh", "find"}
-	for _, dest := range dests {
-		if dest != "" {
-			cmd = append(cmd, dest)
-		}
-	}
-	cmd = append(cmd, pruneExpression(excludes)...)
-	return append(cmd, "-exec", "stat", "-c", walkStatFormat, "{}", "+")
+	return parseInventory(out, marker)
 }
 
 // pruneExpression is find's "( -path A -o -path B ) -prune -o" for the
@@ -267,41 +246,6 @@ func pruneExpression(excludes []string) []string {
 	return append(expression, ")", "-prune", "-o")
 }
 
-// parseFrozenWalk reads frozenWalkCmd's listing into entries named as the
-// archive names them, without the leading slash. complete is false unless the
-// listing ends with walkCompleteMarker. Pure.
-func parseFrozenWalk(out []byte) (map[string]walkEntry, bool) {
-	lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
-	last := len(lines) - 1
-	if lines[last] != walkCompleteMarker {
-		return nil, false
-	}
-	walk := make(map[string]walkEntry, last)
-	for _, line := range lines[:last] {
-		if path, entry, ok := parseWalkLine(line); ok {
-			walk[path] = entry
-		}
-	}
-	return walk, true
-}
-
-// parseWalkLine reads one walkStatFormat line. A line that is not one — the
-// tail of a name holding a newline — is refused rather than guessed at. Pure.
-func parseWalkLine(line string) (string, walkEntry, bool) {
-	fields := splitLastN(line, '|', walkFieldSeparators)
-	if len(fields) != walkFieldSeparators+1 || !strings.HasPrefix(fields[0], "/") {
-		return "", walkEntry{}, false
-	}
-	size, sizeErr := strconv.ParseInt(fields[1], 10, 64)
-	mtime, mtimeErr := strconv.ParseInt(fields[2], 10, 64)
-	mode, modeErr := strconv.ParseUint(fields[3], 16, 32)
-	ctime, ctimeErr := strconv.ParseInt(fields[4], 10, 64)
-	if errors.Join(sizeErr, mtimeErr, modeErr, ctimeErr) != nil {
-		return "", walkEntry{}, false
-	}
-	return strings.TrimPrefix(fields[0], "/"), walkEntry{size: size, mtime: mtime, ctime: ctime, mode: uint32(mode)}, true
-}
-
 // changedSince lists the entries changed at or after since, by either time —
 // a filesystem that keeps no ctime still moves mtime — sorted so a directory
 // comes before what it holds. Sockets are left out: tar cannot archive them.
@@ -317,16 +261,9 @@ func changedSince(walk map[string]walkEntry, since int64) []string {
 	return changed
 }
 
-// frozenIndex is the stored file index of the held moment: every regular file
-// the walk saw, recorded as buildVolIndex records one. Pure.
-func frozenIndex(walk map[string]walkEntry, image string) VolIndex {
-	var idx VolIndex
-	for path, entry := range walk {
-		if entry.isRegular() {
-			idx.Entries = append(idx.Entries, FileEntry{Path: path, Size: entry.size, MtimeUnix: entry.mtime, Mode: entry.mode})
-		}
-	}
-	sort.Slice(idx.Entries, func(i, j int) bool { return idx.Entries[i].Path < idx.Entries[j].Path })
+// frozenIndex is the stored index of the held moment. Pure.
+func frozenIndex(walk map[string]walkEntry, walkedAt int64, image string) VolIndex {
+	idx := indexFromWalk(walk, walkedAt)
 	markVolatileFiles(&idx, volatileFileGlobs(image))
 	return idx
 }

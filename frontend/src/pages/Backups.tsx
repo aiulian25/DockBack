@@ -2,7 +2,9 @@
 // see all its backups. Detail drawer shows the verification report, manifest,
 // and destructive restore / download / delete actions.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { locations, rowSummary, failedCopies, parseBlob as safe } from "../lib/backupRows";
+import { locations, rowSummary, failedCopies, LOCATION_INCOMPLETE, parseBlob as safe } from "../lib/backupRows";
+import { FileSearchProgress, mergeFileSearch } from "../lib/fileSearchProgress";
+import { verificationScope } from "../lib/verificationScope";
 import { ipFromNodeAddr } from "../lib/nodeAddress";
 import {
   ShieldCheck, ShieldAlert, ShieldX, Download, Trash2, RotateCcw, X,
@@ -12,7 +14,8 @@ import {
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { baseDirProblem } from "../lib/absoluteBase";
 import { followRun, subscribeLines } from "../lib/logStream";
-import { api, StepUpError, AppPreconditions, ArchiveEntry, Backup, BackupPage, BackupDiffResp, CertRef, DrillStatus, Destination, FileSearchResp, Finding, Node, RestoreCompatError, RestoreNeedsConfirmError, RestoreReadiness, RestoreVerifyFailedError, RunningRestore, TestClone, fmtAgo, fmtBytes } from "../api";
+import { newExecutionId } from "../lib/runDone";
+import { api, StepUpError, AppPreconditions, ArchiveEntry, Backup, BackupPage, BackupDiffResp, CertRef, DrillStatus, Destination, Finding, Node, RestoreCompatError, RestoreNeedsConfirmError, RestoreReadiness, RestoreVerifyFailedError, RunningRestore, TestClone, fmtAgo, fmtBytes } from "../api";
 import { isRestoreProgressLine } from "../lib/restoreLogFilter";
 import { Button, Card, Chip, Label, Select } from "../components/ui";
 import BackupCloudIcon from "../components/BackupCloudIcon";
@@ -30,9 +33,10 @@ import StepUpPrompt from "../components/StepUpPrompt";
 
 
 function verifyChip(v: string) {
-  if (v === "verified") return <Chip kind="ok"><ShieldCheck size={12} /> Verified</Chip>;
-  if (v === "failed") return <Chip kind="err"><ShieldX size={12} /> Failed</Chip>;
-  return <Chip kind="warn"><ShieldAlert size={12} /> Unverified</Chip>;
+  const chip = v === "verified" ? <Chip kind="ok"><ShieldCheck size={12} /> Verified</Chip>
+    : v === "failed" ? <Chip kind="err"><ShieldX size={12} /> Failed</Chip>
+    : <Chip kind="warn"><ShieldAlert size={12} /> Unverified</Chip>;
+  return <span title={verificationScope(v)}>{chip}</span>;
 }
 function statusChip(s: string) {
   if (s === "success") return <Chip kind="ok">Success</Chip>;
@@ -105,13 +109,24 @@ export default function Backups() {
   const [fsOpen, setFsOpen] = useState(false);
   const [fsQ, setFsQ] = useState("");
   const [fsBusy, setFsBusy] = useState(false);
-  const [fsRes, setFsRes] = useState<FileSearchResp | null>(null);
+  const [fsRes, setFsRes] = useState<FileSearchProgress | null>(null);
   const [fsErr, setFsErr] = useState("");
   useEffect(() => { setFsOpen(false); setFsQ(""); setFsRes(null); setFsErr(""); }, [selected]);
   const runFileSearch = async () => {
     if (!selected || !fsQ.trim() || fsBusy) return;
     setFsBusy(true); setFsErr(""); setFsRes(null);
-    try { setFsRes(await api.searchFile(selected, fsQ.trim())); }
+    try { setFsRes(mergeFileSearch(null, await api.searchFile(selected, fsQ.trim()))); }
+    catch (e) { setFsErr((e as Error).message); }
+    finally { setFsBusy(false); }
+  };
+  // Carry the same search on into older backups, keeping what was already found.
+  const searchOlderBackups = async () => {
+    if (!selected || !fsRes?.nextCursor || fsBusy) return;
+    setFsBusy(true); setFsErr("");
+    try {
+      const page = await api.searchFile(selected, fsQ.trim(), undefined, fsRes.nextCursor);
+      setFsRes((sofar) => mergeFileSearch(sofar, page));
+    }
     catch (e) { setFsErr((e as Error).message); }
     finally { setFsBusy(false); }
   };
@@ -353,7 +368,7 @@ export default function Backups() {
   return (
     <div>
       <h1 className="text-2xl font-bold">Backups</h1>
-      <p className="mb-6 mt-1 text-on-surface-variant">Every backup is verified by test-restore before it is trusted.</p>
+      <p className="mb-6 mt-1 text-on-surface-variant">Every backup is read back end to end and integrity-checked before it is marked verified. Test restores and restore drills, where you run them, prove a restore works.</p>
 
       {/* F100: a restore outlives the page that started it. Without this, reloading
           mid-restore left a UI that looked idle while a destructive operation ran
@@ -450,7 +465,7 @@ export default function Backups() {
                 </Button>
               </div>
               <p className="mt-1.5 text-[11px] text-on-surface-variant">
-                Searches the stored file index of every successful backup on this node — every generation of a matching file is listed, with a one-click single-file download. Backups made before file indexing existed are skipped.
+                Searches the stored file index of every successful backup on this node, newest first and a thousand backups at a time — every generation of a matching file is listed, with a one-click single-file download. Backups made before file indexing existed are skipped.
               </p>
               {fsErr && <p className="mt-2 text-xs text-error">Search failed: {fsErr}</p>}
               {fsRes && fsRes.results.length === 0 && (
@@ -488,6 +503,14 @@ export default function Backups() {
                   </p>
                 </>
               )}
+              {fsRes?.moreHistory && (
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-warning">
+                  <span>Searched the newest {fsRes.scanned} backups — older backups on this node have not been searched yet.</span>
+                  <Button variant="secondary" size="sm" onClick={searchOlderBackups} disabled={fsBusy}>
+                    {fsBusy ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />} Search older backups
+                  </Button>
+                </div>
+              )}
             </Card>
           )}
           {/* Bulk-select action bar — appears once one or more rows are ticked. */}
@@ -521,7 +544,7 @@ export default function Backups() {
                         {gradeBadge(b.confidence)}
                         {verifyChip(b.verified)}
                         {failedCopies(b).length > 0 && (
-                          <span title={`Off-site incomplete: ${failedCopies(b).map((l) => l.name).join(", ")} not uploaded`}>
+                          <span title={`Off-site incomplete: ${failedCopies(b).map((l) => l.name).join(", ")} not fully uploaded`}>
                             <Chip kind="warn"><AlertTriangle size={12} /> Degraded</Chip>
                           </span>
                         )}
@@ -1030,7 +1053,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
     const hrs = cloneTTL;
     if (!confirmUnverified && !confirm(
       `TEST RESTORE — bring ${b.target_name} up from this backup as an isolated copy on node ${nodes.find((n) => n.id === b.node_id)?.name || b.node_id}.\n\n` +
-      `The copy gets a fresh empty filesystem populated from the backup, no published ports, and a throwaway network. The running ${b.target_name} is NOT touched.\n\n` +
+      `The copy gets a fresh empty filesystem populated from the backup, no published ports, no network and no host powers. The running ${b.target_name} is NOT touched.\n\n` +
       `It is removed automatically after ${hrs} hour${hrs === 1 ? "" : "s"}, along with the volumes created for it. Continue?`
     )) return;
     setTesting(true); setRErr("");
@@ -1098,13 +1121,14 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
   // the checkbox list can label each.
   // A deferred copy holds no data either, so it's still a valid "Send offsite now"
   // target — treat only a genuinely-good copy as already-held (F14).
-  const goodDestIds = new Set((locations(b) || []).filter((l) => l.kind === "dest" && !noDataLoc(l)).map((l) => l.dest_id));
+  const goodDestIds = new Set((locations(b) || []).filter((l) => l.kind === "dest" && !noDataLoc(l) && l.status !== LOCATION_INCOMPLETE).map((l) => l.dest_id));
   const failedDestIds = new Set((locations(b) || []).filter((l) => l.kind === "dest" && l.status === "failed").map((l) => l.dest_id));
+  const incompleteDestIds = new Set((locations(b) || []).filter((l) => l.kind === "dest" && l.status === LOCATION_INCOMPLETE).map((l) => l.dest_id));
   const mirrorTargets = dests.filter((d) => d.enabled && !goodDestIds.has(d.id));
   const toggleMSel = (id: string) => setMSel((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
   // Default every pending destination to ticked when the list loads / backup changes.
   useEffect(() => {
-    const good = new Set((locations(b) || []).filter((l) => l.kind === "dest" && !noDataLoc(l)).map((l) => l.dest_id));
+    const good = new Set((locations(b) || []).filter((l) => l.kind === "dest" && !noDataLoc(l) && l.status !== LOCATION_INCOMPLETE).map((l) => l.dest_id));
     setMSel(new Set(dests.filter((d) => d.enabled && !good.has(d.id)).map((d) => d.id)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dests, b.id]);
@@ -1137,7 +1161,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
   // "deferred" copies hold no data — not selectable as a source (F14).
   const allCopies = locations(b);
   const copies = allCopies.filter((l) => !noDataLoc(l));
-  const failed = allCopies.filter((l) => l.status === "failed");
+  const failed = allCopies.filter((l) => l.status === "failed" || l.status === LOCATION_INCOMPLETE);
   const deferred = allCopies.filter((l) => l.status === "deferred");
   // Reset the source choice when switching versions (a copy may not exist there).
   useEffect(() => { setSource(""); }, [b.id]);
@@ -1187,8 +1211,10 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
     const start = Date.now();
     // #N10: the structured verdict and the fallback line rules both live in
     // followRun now, so this console and the three others cannot disagree.
+    const executionId = newExecutionId();
     stopRef.current = followRun(b.id, {
       mode: "one",
+      executionId,
       since: start - 2000, // skip replayed history
       filter: isRestoreProgressLine,
       onLine: (l) => setRLines((p) => [...p.slice(-60), { level: l.level, msg: l.msg }]),
@@ -1215,7 +1241,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
       // own address, this points the copy at something it only reads from, and a
       // dry run that cannot reach its data source proves nothing.
       const upAddr = newUpstreamAddress.trim() ? { new_upstream_address: newUpstreamAddress.trim() } : {};
-      await api.restore(b.id, { node_id: restoreNode, target_id: targetId, volumes: true, database: true, confirm: true, snapshot, recreate, source, ...(confirmIncompatible || acks.incompatible ? { confirm_incompatible: true } : {}), ...(confirmUnverified || acks.unverified ? { confirm_unverified: true } : {}), ...(allowDifferentImage ? { allow_different_image: true } : {}), ...(confirmed?.devices || acks.devices ? { confirm_missing_devices: true } : {}), ...(confirmed?.networks || acks.networks ? { confirm_missing_networks: true } : {}), ...(filesOnly ? { files_only: true } : {}), ...clone, ...hostRebuild, ...restartPromotion, ...probeInjection, ...ipRemap, ...domainRemap, ...pathRemap, ...siteAddr, ...upAddr, ...(privKey.trim() ? { private_key: privKey.trim() } : {}), ...(stepUp ? { password: stepUp.password, code: stepUp.code } : {}) });
+      await api.restore(b.id, { execution_id: executionId, node_id: restoreNode, target_id: targetId, volumes: true, database: true, confirm: true, snapshot, recreate, source, ...(confirmIncompatible || acks.incompatible ? { confirm_incompatible: true } : {}), ...(confirmUnverified || acks.unverified ? { confirm_unverified: true } : {}), ...(allowDifferentImage ? { allow_different_image: true } : {}), ...(confirmed?.devices || acks.devices ? { confirm_missing_devices: true } : {}), ...(confirmed?.networks || acks.networks ? { confirm_missing_networks: true } : {}), ...(filesOnly ? { files_only: true } : {}), ...clone, ...hostRebuild, ...restartPromotion, ...probeInjection, ...ipRemap, ...domainRemap, ...pathRemap, ...siteAddr, ...upAddr, ...(privKey.trim() ? { private_key: privKey.trim() } : {}), ...(stepUp ? { password: stepUp.password, code: stepUp.code } : {}) });
       setRestoreStepUp(null); // F206: satisfied — clear the prompt
       onRestoresChanged(); // F100: the run is now registered — reachable after a reload
     } catch (e) {
@@ -1362,7 +1388,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
       const nm = asName.trim();
       if (!nm) { setRErr("Enter a name for the copy."); setRState("failed"); return; }
       if (nm === b.target_name) { setRErr("The copy's name must differ from the original."); setRState("failed"); return; }
-      if (!confirm(`RESTORE AS A COPY — create a new, isolated container "${nm}" from this backup on node ${targetNodeName}, with no published ports and on a throwaway network. This creates a copy; the running ${b.target_name} is untouched.${verifyNote} Continue?`)) return;
+      if (!confirm(`RESTORE AS A COPY — create a new, isolated container "${nm}" from this backup on node ${targetNodeName}, with no published ports, no network and no host powers. This creates a copy; the running ${b.target_name} is untouched.${verifyNote} Continue?`)) return;
       return verifyFirst ? verifyThenRestore() : runRestore(false);
     }
     // F208: a standalone volume has no container to recreate or start, and the
@@ -1385,7 +1411,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
   //    what has happened so far rather than an empty box waiting for the next
   //    line — which after a reload could be minutes away;
   //  * there is no "skip replayed history" cutoff, for the same reason.
-  const attachToRun = useCallback((runId: string, mode: "one" | "stack") => {
+  const attachToRun = useCallback((runId: string, mode: "one" | "stack", executionId?: string) => {
     stopRef.current?.();
     setRMode(mode); setRState("running"); setRErr("");
 
@@ -1397,6 +1423,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
     // flight and wants the replayed history the stream sends on connect.
     stopRef.current = followRun(runId, {
       mode,
+      executionId,
       onLine: (l) => setRLines((p) => [...p.slice(-80), { level: l.level, msg: l.msg }]),
       onDone: (outcome, message) => {
         if (outcome === "ok") setRState("done");
@@ -1418,7 +1445,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
       (stackRun ? runningRestores.find((r) => r.id === stackRun) : undefined);
     if (!hit || attached.current === hit.id) return;
     attached.current = hit.id;
-    attachToRun(hit.id, hit.id === b.id ? "one" : "stack");
+    attachToRun(hit.id, hit.id === b.id ? "one" : "stack", hit.execution_id);
   }, [runningRestores, b.id, b.stack, rState, attachToRun]);
 
   // F224: escalating from one backup to the whole stack opens the stack's own
@@ -1866,7 +1893,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
                     <li key={i}>• <span className="font-medium">{l.name}</span> ({l.type}) — {l.detail || "offsite upload failed"}</li>
                   ))}
                 </ul>
-                <div className="mt-1 pl-6 text-on-surface-variant">The local copy is verified and safe. Retry the offsite copy now (below) — no need to re-run the backup — or it retries on the next run.</div>
+                <div className="mt-1 pl-6 text-on-surface-variant">The local copy is verified and safe. Retry the offsite copy now (below) — no need to re-run the backup — or DockBack retries it automatically.</div>
               </div>
             )}
             {deferred.length > 0 && (
@@ -1891,9 +1918,9 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
                       <input type="checkbox" checked={mSel.has(d.id)} onChange={() => toggleMSel(d.id)} disabled={mState === "running"} />
                       <span className="font-medium text-on-surface">{d.name}</span>
                       <span className="text-on-surface-variant">({d.type})</span>
-                      {failedDestIds.has(d.id)
-                        ? <span className="text-warning">retry — failed last time</span>
-                        : <span className="text-on-surface-variant">no copy yet</span>}
+                      {incompleteDestIds.has(d.id) && <span className="text-warning">repair — the archive is there, its recovery envelope is not</span>}
+                      {failedDestIds.has(d.id) && <span className="text-warning">retry — failed last time</span>}
+                      {!incompleteDestIds.has(d.id) && !failedDestIds.has(d.id) && <span className="text-on-surface-variant">no copy yet</span>}
                     </label>
                   ))}
                 </div>
@@ -2165,7 +2192,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
             <label className="flex cursor-pointer items-start gap-2 rounded border border-outline-variant/50 bg-surface-lowest px-3 py-2 text-sm text-on-surface-variant">
               <input type="checkbox" className="mt-0.5" checked={asCopy} onChange={(e) => { setAsCopy(e.target.checked); if (e.target.checked && !asName.trim()) setAsName(`${b.target_name}-restored`); }} disabled={optsLocked} />
               <span>
-                <span className="font-medium text-on-surface">Restore as a copy</span> — bring this backup up as a <b>new, isolated</b> container instead of overwriting {b.target_name}: no published ports, throwaway network. The running container is <b>untouched</b>.
+                <span className="font-medium text-on-surface">Restore as a copy</span> — bring this backup up as a <b>new, isolated</b> container instead of overwriting {b.target_name}: no published ports, no network, no host powers. The running container is <b>untouched</b>.
               </span>
             </label>
             {asCopy && (
@@ -2173,7 +2200,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
                 <label className="mb-1 block text-xs font-medium text-on-surface-variant">New container name</label>
                 <input value={asName} onChange={(e) => setAsName(e.target.value)} disabled={optsLocked} placeholder={`${b.target_name}-restored`}
                   className="w-full rounded border border-outline-variant bg-surface-lowest px-3 py-2 font-mono text-sm focus:outline-none focus:ring-1 focus:ring-primary" />
-                <p className="mt-1 text-[11px] italic text-on-surface-variant">Inspect the restored data or test an upgrade side-by-side. The copy gets its own fresh volumes and publishes no host ports — reach it with <span className="font-mono">docker exec</span> or by attaching it to a network.</p>
+                <p className="mt-1 text-[11px] italic text-on-surface-variant">Inspect the restored data or test an upgrade side-by-side. The copy gets its own fresh volumes, publishes no host ports and has no network — reach it with <span className="font-mono">docker exec</span>.</p>
               </div>
             )}
             </>)}

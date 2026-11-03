@@ -20,7 +20,7 @@ type Location struct {
 	DestID string `json:"dest_id,omitempty"`
 	Name   string `json:"name"`
 	Type   string `json:"type"`             // local | smb | webdav | s3
-	Status string `json:"status,omitempty"` // "" = ok/present; "failed" = intended copy that didn't upload (PLAN §6.5)
+	Status string `json:"status,omitempty"` // "" = ok/present; "failed" = intended copy that didn't upload (PLAN §6.5); LocationIncomplete = archive without a proven envelope
 	Detail string `json:"detail,omitempty"` // short human reason when Status=="failed" (e.g. "no progress (stalled)")
 
 	// WORM / object-lock (PLAN §9.1): this copy is immutable until LockUntil
@@ -35,6 +35,80 @@ type Location struct {
 	// omitempty keeps legacy rows byte-identical and lets old rows unmarshal cleanly.
 	VerifiedAt int64 `json:"verified_at,omitempty"`
 	VerifyOK   *bool `json:"verify_ok,omitempty"`
+
+	// The offsite drain's state for a copy still to be sent. Attempts counts failures
+	// in a row, NextAttemptAt (unix secs) is when the next may start, and GaveUp means
+	// it cannot succeed, so only a deliberate send tries again.
+	Attempts      int   `json:"attempts,omitempty"`
+	NextAttemptAt int64 `json:"next_attempt_at,omitempty"`
+	GaveUp        bool  `json:"gave_up,omitempty"`
+
+	// The provider version this copy's archive was written as (DBK-030), from the
+	// upload's own answer. VersionID names the exact bytes, so a delete marker or
+	// a newer object at the same key can neither hide nor replace them, and a
+	// delete removes exactly them. Unversioned records that the provider gave the
+	// write no version, so deleting the key removes the bytes. A copy with
+	// neither predates this record: it is read by key, and what a delete leaves
+	// behind on a versioned bucket is unknown.
+	VersionID   string `json:"version_id,omitempty"`
+	Unversioned bool   `json:"unversioned,omitempty"`
+}
+
+// Copy deletion outcomes (DBK-030): what deleting a backup did to one copy.
+const (
+	CopyRemoved     = "removed"     // the bytes are gone
+	CopyUnconfirmed = "unconfirmed" // the key is gone; older versions may still be stored
+	CopyLocked      = "locked"      // kept: its retention still runs
+	CopyFailed      = "failed"      // the destination refused the delete or could not be reached
+)
+
+// CopyDeletion is the outcome of deleting one copy of a backup.
+type CopyDeletion struct {
+	Location string `json:"location"`
+	Outcome  string `json:"outcome"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+// Reclaimed reports whether every copy's bytes are confirmed gone, which is
+// the only time a deleted backup's size is storage actually freed.
+func Reclaimed(deletions []CopyDeletion) bool {
+	for _, d := range deletions {
+		if d.Outcome != CopyRemoved {
+			return false
+		}
+	}
+	return true
+}
+
+// versionPinned reads one key, a copy's archive, by the version it was written
+// as. Every other key, and every other call, goes to the backend unchanged.
+type versionPinned struct {
+	storage.Backend
+	versioned storage.Versioned
+	key       string
+	versionID string
+}
+
+func (v versionPinned) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if key != v.key {
+		return v.Backend.Get(ctx, key)
+	}
+	return v.versioned.GetVersion(ctx, key, v.versionID)
+}
+
+// backendForCopy is backendForLocation for reading b's archive from loc. A copy
+// whose provider version is recorded is read by that version, so what a restore
+// or a scrub reads is the bytes this backup wrote, wherever the key points now.
+func (e *Engine) backendForCopy(loc Location, b *store.Backup) (storage.Backend, error) {
+	be, err := e.backendForLocation(loc)
+	if err != nil || loc.VersionID == "" {
+		return be, err
+	}
+	versioned, ok := be.(storage.Versioned)
+	if !ok {
+		return be, nil
+	}
+	return versionPinned{Backend: be, versioned: versioned, key: b.StorageKey, versionID: loc.VersionID}, nil
 }
 
 // mergeLocations overlays freshly-mirrored destination results onto a backup's
@@ -111,7 +185,7 @@ func (e *Engine) storageFor(source string, b *store.Backup) (storage.Backend, st
 	}
 	for _, loc := range e.locations(b) {
 		if loc.Kind == "dest" && loc.DestID == source {
-			be, err := e.backendForLocation(loc)
+			be, err := e.backendForCopy(loc, b)
 			if err != nil {
 				return nil, loc.Name, err
 			}
@@ -149,6 +223,25 @@ func (e *Engine) recordLocationVerify(b *store.Backup, source string, at int64, 
 		}
 	}
 	b.LocationsJSON = mustJSON(locs)
+}
+
+// recordEnvelopeProblem turns a scrub's finding of a missing or unusable envelope
+// into a status a repair acts on, which is how a copy recorded as good before the
+// envelope was required gets caught. It mutates b in memory, like recordLocationVerify.
+func (e *Engine) recordEnvelopeProblem(b *store.Backup, source string, rep *VerificationReport) {
+	for _, check := range rep.Checks {
+		if check.Name != replicaEnvelopeCheck || check.OK {
+			continue
+		}
+		locs := e.locations(b)
+		for i := range locs {
+			if locs[i].Kind == "dest" && locs[i].DestID == source {
+				locs[i].Status = LocationIncomplete
+				locs[i].Detail = check.Info
+			}
+		}
+		b.LocationsJSON = mustJSON(locs)
+	}
 }
 
 // backendForLocation resolves a Location to a usable storage backend.
@@ -231,7 +324,7 @@ func (e *Engine) bestLocation(ctx context.Context, b *store.Backup, source strin
 		if noData(loc.Status) {
 			continue // an intended copy that never uploaded (failed/deferred) — nothing to read
 		}
-		be, err := e.backendForLocation(loc)
+		be, err := e.backendForCopy(loc, b)
 		if err != nil {
 			lastErr = err
 			continue
@@ -265,14 +358,34 @@ func (e *Engine) openVerified(ctx context.Context, b *store.Backup, source strin
 	if err != nil {
 		return nil, err
 	}
+	if source != "" && !matchesSource(loc, source) {
+		e.warnCopyFallback(ctx, b, loc)
+	}
 	e.logf(b.ID, "INFO", "Restoring from %s (%s)", loc.Name, loc.Kind)
 	return be.Get(ctx, b.StorageKey)
 }
 
+// stackRunLogKey carries a stack restore's log id to the reads its members make.
+// A member logs under its own backup, which is not the console the operator is
+// watching during a stack restore.
+type stackRunLogKey struct{}
+
+// warnCopyFallback says that a read did not come from the copy the operator chose.
+// A copy that cannot be read must not cost the recovery, so the read goes on from
+// another one, but somebody who chose "not this disk" has to be told it was used.
+func (e *Engine) warnCopyFallback(ctx context.Context, b *store.Backup, loc Location) {
+	msg := fmt.Sprintf("%s: no readable copy on the chosen source — restoring from %s (%s) instead", b.TargetName, loc.Name, loc.Kind)
+	e.logf(b.ID, "WARN", "%s", msg)
+	if stackLog, ok := ctx.Value(stackRunLogKey{}).(string); ok {
+		e.logf(stackLog, "WARN", "%s", msg)
+	}
+}
+
 // DeleteArtifacts removes a backup's archive + manifest from EVERY location it
-// lives in (local + all destinations).
-func (e *Engine) DeleteArtifacts(ctx context.Context, b *store.Backup) {
+// lives in (local + all destinations), and says what happened to each copy.
+func (e *Engine) DeleteArtifacts(ctx context.Context, b *store.Backup) []CopyDeletion {
 	now := time.Now().Unix()
+	var deletions []CopyDeletion
 	for _, loc := range e.locations(b) {
 		if noData(loc.Status) {
 			continue // nothing was written there (failed/deferred)
@@ -280,37 +393,63 @@ func (e *Engine) DeleteArtifacts(ctx context.Context, b *store.Backup) {
 		if loc.Immutable && loc.LockUntil > now {
 			// WORM-locked: the object store refuses deletion until expiry — that's
 			// the whole point. Skip it (and don't generate noisy errors). PLAN §9.1.
-			e.logf(b.ID, "INFO", "Keeping WORM-locked copy on %s (immutable until %s)", loc.Name, time.Unix(loc.LockUntil, 0).UTC().Format("2006-01-02"))
+			until := time.Unix(loc.LockUntil, 0).UTC().Format("2006-01-02")
+			e.logf(b.ID, "INFO", "Keeping WORM-locked copy on %s (immutable until %s)", loc.Name, until)
+			deletions = append(deletions, CopyDeletion{Location: loc.Name, Outcome: CopyLocked, Detail: "immutable until " + until})
 			continue
 		}
 		be, err := e.backendForLocation(loc)
 		if err != nil {
+			deletions = append(deletions, CopyDeletion{Location: loc.Name, Outcome: CopyFailed, Detail: err.Error()})
 			continue
 		}
+		deletion := deleteCopy(ctx, be, loc, b.StorageKey)
 		// Surface a failure to remove the main archive: the catalog row is deleted
 		// regardless (so it leaves the list), which would otherwise silently orphan
 		// the file and waste space. The WARN + "Find orphaned files" sweep make it
 		// reclaimable instead of invisible (PLAN §4.6).
-		if derr := be.Delete(ctx, b.StorageKey); derr != nil {
-			e.logf(b.ID, "WARN", "Could not remove backup file from %s (%v) — it may remain as reclaimable space; use Settings → Find orphaned files to clean it up", loc.Name, derr)
+		switch deletion.Outcome {
+		case CopyFailed:
+			e.logf(b.ID, "WARN", "Could not remove backup file from %s (%s) — it may remain as reclaimable space; use Settings → Find orphaned files to clean it up", loc.Name, deletion.Detail)
+		case CopyUnconfirmed:
+			e.logf(b.ID, "INFO", "Removed the backup file from %s by name. %s", loc.Name, deletion.Detail)
 		}
 		_ = be.Delete(ctx, b.StorageKey+".manifest.json")
 		_ = be.Delete(ctx, b.StorageKey+".manifest.json.sig")
 		_ = be.Delete(ctx, b.StorageKey+".manifest.json.enc")
 		_ = be.Delete(ctx, b.StorageKey+".verification.json")
+		deletions = append(deletions, deletion)
 	}
+	return deletions
+}
+
+// deleteCopy removes one copy's archive as precisely as its recorded evidence
+// allows. A known version is removed itself, which is the only delete on a
+// versioned bucket that frees the bytes. A key on a bucket that gave the write no
+// version is removed outright. A key with no evidence either way is removed, but
+// on a versioned bucket that only adds a delete marker, so it is not called freed.
+func deleteCopy(ctx context.Context, be storage.Backend, loc Location, key string) CopyDeletion {
+	versioned, isVersioned := be.(storage.Versioned)
+	if isVersioned && loc.VersionID != "" {
+		if err := versioned.DeleteVersion(ctx, key, loc.VersionID); err != nil {
+			return CopyDeletion{Location: loc.Name, Outcome: CopyFailed, Detail: fmt.Sprintf("version %s: %v", loc.VersionID, err)}
+		}
+		return CopyDeletion{Location: loc.Name, Outcome: CopyRemoved, Detail: "version " + loc.VersionID + " removed"}
+	}
+	if err := be.Delete(ctx, key); err != nil {
+		return CopyDeletion{Location: loc.Name, Outcome: CopyFailed, Detail: err.Error()}
+	}
+	if isVersioned && !loc.Unversioned {
+		return CopyDeletion{Location: loc.Name, Outcome: CopyUnconfirmed,
+			Detail: "This copy predates version tracking, so if the bucket keeps versions, its earlier versions are still stored until the bucket's own lifecycle rules remove them."}
+	}
+	return CopyDeletion{Location: loc.Name, Outcome: CopyRemoved}
 }
 
 // enforceRetention prunes a container (node+target) per the GFS policy, removing
 // pruned backups from ALL their locations (PLAN §4.6). Newest is always kept.
 func (e *Engine) enforceRetention(ctx context.Context, nodeID, target string, cfg RetentionConfig) {
 	if !cfg.Active() {
-		return
-	}
-	// F69: a tripwire hold freezes pruning for this target (both this per-backup
-	// path and the global PruneAll sweep) until the operator clears it.
-	if e.retentionHeld(nodeID, target) {
-		e.logf("", "WARN", "Retention: hold active for %s (possible mass-change event) — skipping its prune until cleared", target)
 		return
 	}
 	all, err := e.Store.ListBackupsForTarget(nodeID, target, 10000) // newest first
@@ -323,33 +462,7 @@ func (e *Engine) enforceRetention(ctx context.Context, nodeID, target string, cf
 			mine = append(mine, b)
 		}
 	}
-	keep, toPrune := SelectForRetention(mine, cfg)
-	if len(toPrune) == 0 {
-		return
-	}
-	protected, perr := e.chainProtected(nodeID, target, keep)
-	if perr != nil {
-		e.logf("", "WARN", "Retention: could not read chain parents for %s — skipping its prune this cycle: %v", target, perr)
-		return
-	}
-	for _, old := range toPrune {
-		if protected[old.ID] {
-			e.logf(old.ID, "INFO", "Retention: keeping %s — a newer incremental backup depends on it", target)
-			continue
-		}
-		// A backup with a still-locked immutable copy is retained whole until the
-		// WORM lock expires — the immutable offsite copy is the ransomware
-		// protection, and the local copy is kept restorable alongside it (§9.1).
-		if e.hasLiveImmutable(old) {
-			e.logf(old.ID, "INFO", "Retention: keeping %s — immutable copy still WORM-locked", target)
-			continue
-		}
-		e.logf(old.ID, "INFO", "Retention: pruning old backup of %s (GFS policy)", target)
-		e.DeleteArtifacts(ctx, old)
-		if err := e.Store.DeleteBackup(old.ID); err != nil {
-			e.logf(old.ID, "ERR", "Retention prune failed: %v", err)
-		}
-	}
+	e.pruneTarget(ctx, nodeID, target, mine, cfg)
 }
 
 // applyRetention prunes after a successful backup if auto-pruning is enabled for

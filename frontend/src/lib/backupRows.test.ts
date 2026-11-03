@@ -69,6 +69,12 @@ describe("failedCopies / goodCopies", () => {
     expect(goodCopies(b).map((l) => l.name)).toEqual(["b", "local"]);
   });
 
+  it("treats an incomplete copy as degraded and still readable", () => {
+    const incomplete = backup({ locations: '[{"kind":"dest","name":"a","type":"s3","status":"incomplete"}]' });
+    expect(failedCopies(incomplete).map((l) => l.name)).toEqual(["a"]);
+    expect(goodCopies(incomplete).map((l) => l.name)).toEqual(["a"]);
+  });
+
   it("counts a local-only backup as one good copy", () => {
     expect(failedCopies(backup({}))).toHaveLength(0);
     expect(goodCopies(backup({}))).toHaveLength(1);

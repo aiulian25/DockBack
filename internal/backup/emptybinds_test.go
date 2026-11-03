@@ -8,7 +8,7 @@ import (
 	"dockback/internal/dockercli"
 )
 
-// index builds a VolIndex from relative paths, the shape ParseIndexOutput
+// index builds a VolIndex from relative paths, the shape an inventory
 // produces (leading slash stripped, same convention as tar members).
 func index(paths ...string) VolIndex {
 	idx := VolIndex{}

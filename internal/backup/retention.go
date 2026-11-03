@@ -9,6 +9,13 @@ import (
 	"dockback/internal/store"
 )
 
+// The values of store.Backup.Verified that retention tells apart. Anything else is
+// a backup with no verdict: still being verified, or adopted from an archive.
+const (
+	verifiedOK     = "verified"
+	verifiedFailed = "failed"
+)
+
 // RetentionConfig is the GFS-style retention policy (PLAN §4.6): keep the newest
 // N copies, plus the newest per day/week/month for the most recent buckets.
 type RetentionConfig struct {
@@ -99,16 +106,50 @@ func partitionAutoSnaps(backups []*store.Backup, keep int) (normal, keepAuto, pr
 // snapshots into their own newest-N budget so they can never evict scheduled
 // generations; the remaining "normal" backups then flow through the GFS rules
 // exactly as before. AutoKeep == 0 reproduces the prior behavior byte-for-byte.
+//
+// A backup that failed verification spends no budget: it is not a generation, and
+// a run of them must not push out the ones that are. With nothing else to judge,
+// every failed backup stays, because one of them may be the only data left.
 func SelectForRetention(backups []*store.Backup, c RetentionConfig) (keep, prune []*store.Backup) {
-	normal := backups
+	countable, failed := splitFailedVerification(backups)
+	if len(countable) == 0 {
+		return backups, nil
+	}
+	normal := countable
 	var keepAuto, pruneAuto []*store.Backup
 	if c.AutoKeep > 0 {
-		normal, keepAuto, pruneAuto = partitionAutoSnaps(backups, c.AutoKeep)
+		normal, keepAuto, pruneAuto = partitionAutoSnaps(countable, c.AutoKeep)
 	}
 	keep, prune = selectGFS(normal, c)
 	keep = append(keep, keepAuto...)
 	prune = append(prune, pruneAuto...)
+	for _, b := range failed {
+		if keepsFailedBackup(b, backups[0], c) {
+			keep = append(keep, b)
+		} else {
+			prune = append(prune, b)
+		}
+	}
 	return keep, prune
+}
+
+func splitFailedVerification(backups []*store.Backup) (countable, failed []*store.Backup) {
+	for _, b := range backups {
+		if b.Verified == verifiedFailed {
+			failed = append(failed, b)
+		} else {
+			countable = append(countable, b)
+		}
+	}
+	return countable, failed
+}
+
+// keepsFailedBackup keeps what a rule protects and the evidence of the latest run:
+// the newest backup stays whatever it is, and an older failure has no further use
+// once something newer exists. Without a rule that governs it, nothing is pruned.
+func keepsFailedBackup(b, newest *store.Backup, c RetentionConfig) bool {
+	governed := c.gfsActive() || (c.AutoKeep > 0 && strings.HasPrefix(b.Label, "auto:"))
+	return !governed || b.Pinned || b.ID == newest.ID
 }
 
 // selectGFS is the GFS selection over an already-auto-partitioned list. The newest
@@ -281,26 +322,151 @@ func EffectiveRetentionFor(st *store.Store, nodeID, target string) (RetentionCon
 	return cfg, autoprune
 }
 
-// chainProtected returns the backup ids retention must keep even when GFS would
-// prune them: every chain ancestor of a KEPT backup (F61). A delta is
-// unrestorable without its whole ancestor chain, so protecting the keep-set's
-// ancestors is the WORM-retain pattern applied to chain integrity. Callers fail
-// CLOSED on an error — skip the target's prune rather than risk orphaning a chain.
-func (e *Engine) chainProtected(nodeID, target string, keep []*store.Backup) (map[string]bool, error) {
+// Why a backup the policy would prune stays. Part of the retention preview's API.
+const (
+	RetainedLastHealthy = "last_healthy"
+	RetainedChain       = "chain"
+	RetainedImmutable   = "immutable"
+	RetainedUnreadable  = "unreadable"
+)
+
+var retainedExplanation = map[string]string{
+	RetainedLastHealthy: "it is the newest backup with a verified chain, and nothing newer can replace it yet",
+	RetainedChain:       "a newer incremental backup depends on it",
+	RetainedImmutable:   "immutable copy still WORM-locked",
+	RetainedUnreadable:  "its catalog row could not be read",
+}
+
+// RetentionPlan is what retention will do to one target. The preview shows it and
+// the sweeps carry it out, so the two cannot differ.
+type RetentionPlan struct {
+	Keep    []*store.Backup
+	Prune   []*store.Backup   // full rows: deleting needs their real locations
+	Reasons map[string]string // backup id → why the policy's prune was overruled
+	// Held: a tripwire hold freezes this target (F69), so nothing is pruned.
+	Held bool
+	// NoKnownGood: nothing here is verified along its whole chain. Reported rather
+	// than inferred. Only worked out when there is something to prune.
+	NoKnownGood bool
+}
+
+// PlanRetention decides one target's retention. list is its successful backups,
+// newest first. On top of the policy's selection it keeps, in this order:
+//
+//   - the last healthy point, when the policy kept none: the newest verified backup
+//     whose whole chain is verified;
+//   - anything with a live WORM lock (§9.1);
+//   - every chain ancestor of what is kept (F61), since a delta is unrestorable
+//     without them. An error here must fail CLOSED: the caller skips the target
+//     rather than risk orphaning a chain.
+func (e *Engine) PlanRetention(nodeID, target string, list []*store.Backup, cfg RetentionConfig) (RetentionPlan, error) {
+	plan := RetentionPlan{Keep: list, Reasons: map[string]string{}}
+	if !cfg.Active() {
+		return plan, nil
+	}
+	if e.retentionHeld(nodeID, target) {
+		plan.Held = true
+		return plan, nil
+	}
+	keep, prune := SelectForRetention(list, cfg)
+	if len(prune) == 0 {
+		return plan, nil
+	}
 	parentOf, err := e.Store.BackupParentMap(nodeID, target)
 	if err != nil {
-		return nil, err
+		return plan, err
 	}
+	retain := func(id, reason string) {
+		for i, b := range prune {
+			if b.ID == id {
+				keep = append(keep, b)
+				prune = append(prune[:i:i], prune[i+1:]...)
+				plan.Reasons[id] = reason
+				return
+			}
+		}
+	}
+
+	healthy := healthyChainMembers(list, parentOf)
+	if floor := newestIn(list, healthy); floor == nil {
+		plan.NoKnownGood = true
+	} else if !anyIn(keep, healthy) {
+		retain(floor.ID, RetainedLastHealthy)
+	}
+
+	var pruneFull []*store.Backup
+	for _, cand := range append([]*store.Backup(nil), prune...) {
+		full, gerr := e.Store.GetBackup(cand.ID)
+		switch {
+		case gerr != nil:
+			retain(cand.ID, RetainedUnreadable)
+		case e.hasLiveImmutable(full):
+			retain(cand.ID, RetainedImmutable)
+		default:
+			pruneFull = append(pruneFull, full)
+		}
+	}
+
 	keepIDs := make([]string, 0, len(keep))
 	for _, kept := range keep {
 		keepIDs = append(keepIDs, kept.ID)
 	}
-	return protectedAncestors(keepIDs, parentOf), nil
+	ancestors := protectedAncestors(keepIDs, parentOf)
+	for _, full := range pruneFull {
+		if ancestors[full.ID] {
+			retain(full.ID, RetainedChain)
+			continue
+		}
+		plan.Prune = append(plan.Prune, full)
+	}
+	plan.Keep = keep
+	return plan, nil
+}
+
+// healthyChainMembers is the set of backups that are verified and whose ancestors
+// all are, as far back as a full. A verified delta on a failed or missing parent
+// cannot be restored, whatever its own badge says.
+func healthyChainMembers(list []*store.Backup, parentOf map[string]string) map[string]bool {
+	verified := map[string]bool{}
+	for _, b := range list {
+		if b.Verified == verifiedOK {
+			verified[b.ID] = true
+		}
+	}
+	healthy := map[string]bool{}
+	for _, b := range list {
+		id, walked := b.ID, map[string]bool{}
+		for verified[id] && !walked[id] {
+			walked[id] = true
+			parent, hasParent := parentOf[id]
+			if !hasParent {
+				healthy[b.ID] = true
+				break
+			}
+			id = parent
+		}
+	}
+	return healthy
+}
+
+func newestIn(newestFirst []*store.Backup, members map[string]bool) *store.Backup {
+	for _, b := range newestFirst {
+		if members[b.ID] {
+			return b
+		}
+	}
+	return nil
+}
+
+func anyIn(backups []*store.Backup, members map[string]bool) bool {
+	return newestIn(backups, members) != nil
 }
 
 // PruneAll applies retention across every container (node+target), resolving the
 // effective per-node policy for each group, and deletes pruned backups from all
-// their locations. Returns count + bytes freed (PLAN §4.6/§4.13).
+// their locations. Returns count + bytes freed (PLAN §4.6/§4.13): the size of
+// each pruned backup whose every copy was confirmed removed (DBK-030), not the
+// catalog's total, because a locked or versioned copy can outlive its row.
 func (e *Engine) PruneAll(ctx context.Context) (pruned int, freed int64) {
 	// Slim projection (perf Fix 7): grouping + GFS selection read only scalars
 	// (id/node/target/status/pinned/label/created/size). Manifest parents come
@@ -312,49 +478,45 @@ func (e *Engine) PruneAll(ctx context.Context) (pruned int, freed int64) {
 		return 0, 0
 	}
 	for key, list := range successfulByTarget(all) {
-		// F69: a tripwire hold freezes this target's pruning until the operator
-		// reviews — never age out the last clean generations mid-incident.
-		if e.retentionHeld(key[0], key[1]) {
-			e.logf("", "WARN", "Retention: hold active for %s (possible mass-change event) — skipping its prune until cleared", key[1])
-			continue
-		}
 		cfg, _ := EffectiveRetentionFor(e.Store, key[0], key[1]) // key = [node id, target name]
-		if !cfg.Active() {
+		n, bytes := e.pruneTarget(ctx, key[0], key[1], list, cfg)
+		pruned += n
+		freed += bytes
+	}
+	return pruned, freed
+}
+
+// pruneTarget carries out one target's retention plan. list is its successful
+// backups, newest first. Every prune path ends here, so none can decide differently.
+func (e *Engine) pruneTarget(ctx context.Context, nodeID, target string, list []*store.Backup, cfg RetentionConfig) (pruned int, freed int64) {
+	plan, err := e.PlanRetention(nodeID, target, list, cfg)
+	if err != nil {
+		e.logf("", "WARN", "Retention: could not read chain parents for %s — skipping its prune this cycle: %v", target, err)
+		return 0, 0
+	}
+	if plan.Held {
+		e.logf("", "WARN", "Retention: hold active for %s (possible mass-change event) — skipping its prune until cleared", target)
+		return 0, 0
+	}
+	if plan.NoKnownGood {
+		e.logf("", "WARN", "Retention: %s has no verified backup with a verified chain, so nothing here is known to restore", target)
+	}
+	for id, reason := range plan.Reasons {
+		e.logf(id, "INFO", "Retention: keeping %s — %s", target, retainedExplanation[reason])
+	}
+	for _, old := range plan.Prune {
+		e.logf(old.ID, "INFO", "Retention: pruning old backup of %s (GFS policy)", target)
+		deletions := e.DeleteArtifacts(ctx, old)
+		if derr := e.Store.DeleteBackup(old.ID); derr != nil {
+			e.logf(old.ID, "ERR", "Retention prune failed: %v", derr)
 			continue
 		}
-		keep, toPrune := SelectForRetention(list, cfg)
-		if len(toPrune) == 0 {
-			continue // nothing to prune — skip the chain-map work for this group
-		}
-		protected, perr := e.chainProtected(key[0], key[1], keep)
-		if perr != nil {
-			e.logf("", "WARN", "Retention: could not read chain parents for %s — skipping its prune this cycle: %v", key[1], perr)
+		pruned++
+		if !Reclaimed(deletions) {
+			e.logf(old.ID, "INFO", "Retention: this backup of %s left the catalog, but not all of its storage is confirmed freed, so its size is not counted as freed", target)
 			continue
 		}
-		for _, cand := range toPrune {
-			if protected[cand.ID] { // a newer incremental backup still depends on this one
-				e.logf(cand.ID, "INFO", "Retention: keeping %s — a newer incremental backup depends on it", cand.TargetName)
-				continue
-			}
-			// Full row for the destructive path (locations/storage key).
-			old, gerr := e.Store.GetBackup(cand.ID)
-			if gerr != nil {
-				e.logf(cand.ID, "ERR", "Retention prune skipped — could not load backup: %v", gerr)
-				continue
-			}
-			if e.hasLiveImmutable(old) { // WORM copy still locked — retain (§9.1)
-				e.logf(old.ID, "INFO", "Retention: keeping %s — immutable copy still WORM-locked", old.TargetName)
-				continue
-			}
-			e.logf(old.ID, "INFO", "Retention: pruning old backup of %s (GFS policy)", old.TargetName)
-			e.DeleteArtifacts(ctx, old)
-			if derr := e.Store.DeleteBackup(old.ID); derr != nil {
-				e.logf(old.ID, "ERR", "Retention prune failed: %v", derr)
-				continue
-			}
-			pruned++
-			freed += old.SizeBytes
-		}
+		freed += old.SizeBytes
 	}
 	return pruned, freed
 }

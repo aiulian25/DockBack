@@ -169,26 +169,14 @@ func TestShortFreezeRefusesAHardLinkToADroppedEntry(t *testing.T) {
 	}
 }
 
-// The walk taken while held decides what is deleted, so a listing that is not
-// whole must never be trusted, and a line it cannot read is refused rather
-// than guessed at. Pure.
-func TestFrozenWalkIsTrustedOnlyWhole(t *testing.T) {
-	out := "/data|4096|10|41ed|10\n/data/a|b.txt|3|20|81a4|9000\n/data/bro\n" + "ken|1|20|81a4|9000\n/data/sock|0|9000|c1ed|9000\n" + walkCompleteMarker + "\n"
-	walk, complete := parseFrozenWalk([]byte(out))
-	if !complete || len(walk) != 3 {
-		t.Fatalf("a whole listing reads every line it can: %v %v", complete, walk)
-	}
-	if walk["data/a|b.txt"].size != 3 || !walk["data"].isDir() {
-		t.Errorf("a name holding the separator still parses: %v", walk)
+// The walk taken while held decides what is copied again. Pure.
+func TestChangedSinceLeavesOutOldEntriesAndSockets(t *testing.T) {
+	walk := map[string]walkEntry{
+		"data":         {mode: modeDir, ctime: 10},
+		"data/a|b.txt": {mode: modeRegular, ctime: 9000},
+		"data/sock":    {mode: modeSocket, ctime: 9000},
 	}
 	if got := changedSince(walk, 1000); !slices.Equal(got, []string{"data/a|b.txt"}) {
 		t.Errorf("only what changed since the live copy began, sockets left out: %q", got)
-	}
-	if _, complete := parseFrozenWalk([]byte("/data|4096|10|41ed|10\n")); complete {
-		t.Error("a listing without its end marker reported an error, and must not be trusted")
-	}
-	cmd := strings.Join(frozenWalkCmd([]string{"/data"}, []string{"/data/cache"}), " ")
-	if !strings.Contains(cmd, "find /data ( -path /data/cache ) -prune -o -exec stat -c "+walkStatFormat) {
-		t.Errorf("excluded paths are pruned from the walk: %s", cmd)
 	}
 }

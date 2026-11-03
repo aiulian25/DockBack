@@ -33,7 +33,9 @@ You're told when this stops working:
 
 Each backup is stored on the backups volume and appears in the **Available backups** list with its date, a summary (nodes / catalog entries / destinations) and size. From the list you can **Download**, **Restore** or **Delete** any entry.
 
-**Download** gives you a single encrypted file named `dockback-config-<timestamp>.dback`. Keep a copy *off the box* — Nextcloud, a Synology share, an SMB drive, a USB stick, a password manager's file vault — so a full host loss doesn't take your only copy with it. Because it contains credentials, treat it like a secret (it's encrypted, but defence in depth matters).
+A backup appears in the list only once it is complete. DockBack writes it to an unfinished file first and checks that it decrypts and opens as a valid database. Only then does it give the backup its final name. A backup that fails part-way leaves no entry and doesn't touch any other backup, and an unfinished file left by a crash is cleared at the next start. Backups started in the same second, such as a manual one and a scheduled one, are kept as separate files, and a second backup waits for the first to finish.
+
+**Download** gives you a single encrypted file named `dockback-config-<timestamp>-<random>.dback`. Backups made by earlier versions have no random part, and they still list, download and restore as before. Keep a copy *off the box* — Nextcloud, a Synology share, an SMB drive, a USB stick, a password manager's file vault — so a full host loss doesn't take your only copy with it. Because it contains credentials, treat it like a secret (it's encrypted, but defence in depth matters).
 
 ## How it's protected
 

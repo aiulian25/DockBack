@@ -4,7 +4,7 @@ Normally DockBack holds one master key. That key encrypts every backup and seals
 
 **Write-only mode removes that capability from DockBack itself.**
 
-You generate a keypair. DockBack keeps only the **public** half and seals each backup to it. The **private** half is shown to you exactly once and never stored. From then on, DockBack can create, upload, copy, prune and integrity-check backups — but it cannot open them. Restoring requires pasting your offline private key, for that one restore.
+You generate a keypair. DockBack keeps only the **public** half and seals each backup to it. The **private** half is shown to you exactly once and never stored. From then on, DockBack can create, upload, copy, prune and integrity-check backups — but it cannot open them. It does still see the data while it captures it: the work directory holds that capture unencrypted until it is sealed, as with any backup. Restoring requires pasting your offline private key, for that one restore.
 
 If someone owns your DockBack container tomorrow, they can still delete or corrupt future backups. What they cannot do is **read** them.
 

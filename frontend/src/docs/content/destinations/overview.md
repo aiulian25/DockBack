@@ -16,7 +16,7 @@ Every pending destination is listed with a **checkbox** (all ticked by default) 
 
 "Send offsite now" is per-backup. When you **add a new destination** (or recover one with *Scan & adopt*), you usually want your **whole existing history** on it — clicking through every backup would be tedious. The destination card has a **Backfill** button that does it in one action.
 
-Backfill finds every successful backup that has **no healthy copy** on this destination and mirrors them **oldest-first**, **one upload at a time**, reusing the same stored-archive mirror path (no re-capture). It respects each node's policy — a node configured to **exclude** this destination is skipped — and it honors the destination's **upload window and bandwidth cap** (see *Per-destination bandwidth & upload window*), so a backfill may **pause until the window opens**. The card shows live progress (**Backfill · 34/120**), and you get a summary alert if any item fails.
+Backfill finds every successful backup that has **no healthy copy** on this destination and mirrors them **oldest-first**, **one upload at a time**, reusing the same stored-archive mirror path (no re-capture). It respects each node's policy — a node configured to **exclude** this destination is skipped — and it honors the destination's **upload window and bandwidth cap** (see *Per-destination bandwidth & upload window*). Outside the window, a copy is marked **Deferred** and sent automatically when the window opens. The card shows live progress (**Backfill · 34/120**), and you get a summary alert if any item fails.
 
 Notes:
 
@@ -62,7 +62,11 @@ Each destination has optional **advanced** settings (in the Add/Edit dialog) to 
 - **Max upload rate (Mbit/s)** — caps the mirror speed to *this* destination only (0 = unlimited). It applies on top of any global `DOCKBACK_MAX_UPLOAD_MBPS` aggregate cap, so the tighter of the two wins.
 - **Upload window (from / to)** — only mirror to this destination during a time window (server local time; a window like `22:00`–`06:00` that crosses midnight is fine). Leave both blank for no window.
 
-Outside its window, a backup still completes and is **verified locally**; the offsite copy is marked **Deferred** (not failed) and is sent automatically on the next backup run that falls inside the window. To push it immediately regardless of the window, use **Send offsite now** — a deliberate on-demand push overrides the window.
+Outside its window, a backup still completes and is **verified locally**; the offsite copy is marked **Deferred** (not failed) and is sent automatically once the window opens, with no new backup needed, including after a restart. To push it immediately regardless of the window, use **Send offsite now** — a deliberate on-demand push overrides the window.
+
+The same background sender retries a copy that **failed** or is **incomplete**. It sends one at a time, oldest first, waiting 15 minutes after a first failure and doubling up to once a day. After 8 failures in a row you get one alert and it keeps trying daily. It stops only if the local archive itself is gone, since retrying can't help then, and the copy says so. **Send offsite now** always tries immediately and starts the count again.
+
+An incremental backup is useless without the generations under it, so its offsite copy stays **Deferred** until its parent's copy is there. DockBack sends any missing parents first.
 
 ## Supported providers
 

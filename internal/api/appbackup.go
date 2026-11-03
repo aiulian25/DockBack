@@ -172,6 +172,8 @@ func (s *Server) snapshotMeta(dst string) (appbackup.Entry, error) {
 // identical, verified snapshot. actor is the audit attribution (a username, or
 // "scheduler" for an automatic run).
 func (s *Server) createAppBackup(actor string) (appbackup.Entry, error) {
+	s.appBackupMu.Lock()
+	defer s.appBackupMu.Unlock()
 	// Read before the snapshot: a change landing during it is newer than the
 	// mark, so it triggers the next backup instead of being assumed covered.
 	covered, _ := s.store.MaxAuditID()
@@ -181,7 +183,7 @@ func (s *Server) createAppBackup(actor string) (appbackup.Entry, error) {
 	if err != nil {
 		return appbackup.Entry{}, fmt.Errorf("snapshot configuration: %w", err)
 	}
-	entry, err := appbackup.CreateFile(s.appBackupDir(), snap, s.cfg.EncryptionKey, meta)
+	entry, err := appbackup.CreateFile(s.appBackupDir(), snap, s.cfg.EncryptionKey, meta, s.cfg.TmpDir)
 	if err != nil {
 		return appbackup.Entry{}, fmt.Errorf("write backup: %w", err)
 	}
@@ -243,7 +245,7 @@ func (s *Server) handleAppBackupDownload(w http.ResponseWriter, r *http.Request)
 		errJSON(w, http.StatusInternalServerError, "could not snapshot configuration")
 		return
 	}
-	fname := fmt.Sprintf("dockback-config-%s.dback", time.Now().UTC().Format("20060102-150405"))
+	fname := appbackup.NewName(time.Now())
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fname))
 	m := appbackup.Manifest{Format: appbackup.Format, Version: appbackup.Version, CreatedAt: time.Now().Unix(), AppVersion: version.Version, KeyFingerprint: s.engine.MasterKeyFP()}
@@ -381,6 +383,7 @@ func (s *Server) loadAppBackupSchedule() appBackupSchedule {
 // has passed since the last run, never backfilling a missed window on first
 // enable.
 func (s *Server) startAppBackupSchedule() {
+	s.clearPartialAppBackups()
 	go func() {
 		t := time.NewTicker(appBackupTickInterval)
 		defer t.Stop()
@@ -389,6 +392,15 @@ func (s *Server) startAppBackupSchedule() {
 			s.appBackupDrillTick() // F58: periodic integrity drill of the newest app-backup
 		}
 	}()
+}
+
+// clearPartialAppBackups removes what creators interrupted by a crash left behind.
+func (s *Server) clearPartialAppBackups() {
+	s.appBackupMu.Lock()
+	defer s.appBackupMu.Unlock()
+	if removed := appbackup.RemovePartials(s.appBackupDir()); removed > 0 {
+		s.logSink("app-backup", "INFO", fmt.Sprintf("Cleared %d unfinished application backup file(s) left by an interrupted run", removed))
+	}
 }
 
 func (s *Server) appBackupTick(now time.Time) {

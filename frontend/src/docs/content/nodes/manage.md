@@ -12,7 +12,7 @@ The **Cluster** field is a picker over your existing clusters; typing a name tha
 
 ## Removing a node
 
-Removing a node disconnects DockBack from that server. Backups already taken from it remain in your catalog and on their destinations — removing the node does **not** delete its backups.
+Removing a node (**Forget node**) disconnects DockBack from that server and **permanently deletes all of its backups**, local and offsite, along with its stored connection credentials. It does not touch the server itself. You have about two minutes to **Undo** before the deletion runs; after that the backups cannot be recovered from DockBack. If you want to keep a node's history, leave the node in place.
 
 Removing a node is not the same as removing a **cluster**: removing a cluster only removes a grouping and never disconnects a server.
 

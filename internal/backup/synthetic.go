@@ -73,16 +73,16 @@ func (e *Engine) synthesizeFullVolumes(ctx context.Context, chain []*store.Backu
 				winner[cleanEntryName(p)] = gi
 			}
 		case gi == 0:
-			base, err := e.loadVolIndex(ctx, g.backup)
+			base, err := e.loadVolIndex(ctx, g.backup, "")
 			if err != nil {
 				return "", 0, fmt.Errorf("baseline index: %w", err)
 			}
-			for _, en := range base.Entries {
+			for _, en := range base.allEntries() {
 				winner[cleanEntryName(en.Path)] = 0
 			}
 			prevIdx = base
 		default:
-			idx, err := e.loadVolIndex(ctx, g.backup)
+			idx, err := e.loadVolIndex(ctx, g.backup, "")
 			if err != nil {
 				return "", 0, fmt.Errorf("chain index %s: %w", short(g.backup.ID), err)
 			}
@@ -93,8 +93,8 @@ func (e *Engine) synthesizeFullVolumes(ctx context.Context, chain []*store.Backu
 			prevIdx = idx
 		}
 	}
-	final := make(map[string]bool, len(freshIdx.Entries))
-	for _, en := range freshIdx.Entries {
+	final := make(map[string]bool, len(freshIdx.Entries)+len(freshIdx.Others))
+	for _, en := range freshIdx.allEntries() {
 		final[cleanEntryName(en.Path)] = true
 	}
 	for p := range winner {
@@ -104,10 +104,10 @@ func (e *Engine) synthesizeFullVolumes(ctx context.Context, chain []*store.Backu
 	}
 
 	// Phase 2 — streaming merge, oldest→newest: copy each generation's payload
-	// members that the winner map assigns to it. Non-regular members (dirs,
-	// symlinks…) ride from the BASELINE only — the same structure a chain
-	// restore lays down (deltas tar regular files only). Sizes come from each
-	// inner header, so this is a pure transcode with no directory staging.
+	// members that the winner map assigns to it, whatever their type, since the
+	// index lists them all. Extraction makes a missing parent, and a directory
+	// entry that arrives after what it holds only sets its attributes. Sizes come
+	// from each inner header, so this is a pure transcode with no directory staging.
 	f, err := os.Create(dst)
 	if err != nil {
 		return "", 0, err
@@ -127,16 +127,10 @@ func (e *Engine) synthesizeFullVolumes(ctx context.Context, chain []*store.Backu
 				return verr
 			}
 			p := cleanEntryName(vh.Name)
-			keep := false
-			if vh.Typeflag == tar.TypeReg {
-				// Explicit presence check: a map miss returns 0, which would
-				// otherwise resurrect baseline files deleted later in the chain.
-				wgi, ok := winner[p]
-				keep = ok && p != "" && wgi == gi
-			} else {
-				keep = gi == 0 // baseline structure (dirs, symlinks, …)
-			}
-			if !keep {
+			// Explicit presence check: a map miss returns 0, which would otherwise
+			// resurrect baseline entries deleted later in the chain.
+			wgi, ok := winner[p]
+			if !ok || p == "" || wgi != gi {
 				continue
 			}
 			if err := tw.WriteHeader(vh); err != nil {
@@ -204,7 +198,7 @@ func (e *Engine) syntheticFullEnabled() bool {
 // parent that hit the depth cap). On error the caller falls back to
 // captureFullBaseline — this function never partially commits manifest state.
 func (e *Engine) captureSyntheticFull(ctx context.Context, cli *client.Client, opts Options, man *Manifest, work string, id string, tip *store.Backup, curIdx VolIndex) error {
-	tipIdx, err := e.loadVolIndex(ctx, tip)
+	tipIdx, err := e.loadVolIndex(ctx, tip, "")
 	if err != nil {
 		return fmt.Errorf("tip index: %w", err)
 	}
@@ -213,6 +207,9 @@ func (e *Engine) captureSyntheticFull(ctx context.Context, cli *client.Client, o
 		return fmt.Errorf("tip manifest unreadable")
 	}
 	changed, _ := DiffIndex(tipIdx, curIdx)
+	if reason := deltaCannotCarry(changed, nil); reason != "" {
+		return fmt.Errorf("%s, which the delta it reads cannot hold", reason)
+	}
 	e.logf(id, "INFO", "Synthetic full: capturing only the delta from the source (%d changed file(s))", len(changed))
 
 	// The fresh delta spools OUTSIDE the work dir — work's contents are packed

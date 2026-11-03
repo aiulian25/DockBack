@@ -125,8 +125,9 @@ func (s *Server) backfillGet(destID string) backfillState {
 
 // handleBackfillDestination starts a background sweep that mirrors every existing
 // backup missing a healthy copy on this destination, oldest-first, ONE upload at a
-// time through the untouched single-backup MirrorExisting path (F51). It honors the
-// destination's upload window/throttle (F14) exactly as "Send offsite now" does.
+// time through the single-backup MirrorExisting path (F51). It honors the destination's
+// upload window and throttle (F14): outside the window a copy is left deferred, and
+// the offsite drain sends it when the window opens.
 func (s *Server) handleBackfillDestination(w http.ResponseWriter, r *http.Request) {
 	destID := r.PathValue("id")
 	d, err := s.store.GetDestination(destID)
@@ -154,7 +155,7 @@ func (s *Server) handleBackfillDestination(w http.ResponseWriter, r *http.Reques
 		s.logSink("queue", "INFO", fmt.Sprintf("Backfill of %q started — %d backup(s) with no healthy copy there", d.Name, len(cands)))
 		for _, b := range cands {
 			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
-			mErr := s.engine.MirrorExisting(ctx, b.ID, []string{destID})
+			mErr := s.engine.MirrorExisting(ctx, b.ID, []string{destID}, false)
 			cancel()
 			if mErr != nil {
 				s.backfillBump(destID, 0, 1)

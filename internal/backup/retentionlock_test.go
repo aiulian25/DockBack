@@ -71,7 +71,7 @@ func TestMirrorAppliesAndRecordsRetentionLock(t *testing.T) {
 	lockDest(t, st, key, "d-locked", lockedDir, 30)
 	lockDest(t, st, key, "d-plain", plainDir, 0)
 
-	locs := e.mirror(ctx, "run1", lockArchiveKey, manBytes, nil, false, true)
+	locs := e.mirror(ctx, "run1", lockArchiveKey, manBytes, nil, false, true, nil)
 	if len(locs) != 2 {
 		t.Fatalf("want 2 locations, got %+v", locs)
 	}
@@ -164,10 +164,9 @@ func TestDeleteArtifactsHonoursLockUntilThenReleases(t *testing.T) {
 	}
 }
 
-// applyRetentionLock fails only on the ARCHIVE. A sidecar that a destination's
-// sealing preference never wrote is expected to be absent, and must not turn a
-// good, genuinely-locked upload into an unprotected one.
-func TestApplyRetentionLockToleratesMissingSidecars(t *testing.T) {
+// A sidecar the sealing preference never wrote is not asked for, but one the copy
+// requires has to lock, or the lock does not cover this copy.
+func TestApplyRetentionLockCoversWhatTheCopyRequires(t *testing.T) {
 	e, _, _, _ := lockTestEngine(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -178,15 +177,18 @@ func TestApplyRetentionLockToleratesMissingSidecars(t *testing.T) {
 	if _, err := be.Put(ctx, lockArchiveKey, strings.NewReader("only the archive")); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.applyRetentionLock(ctx, be, lockArchiveKey, time.Now().Add(5*24*time.Hour)); err != nil {
-		t.Fatalf("missing sidecars must not fail the lock: %v", err)
+	until := time.Now().Add(5 * 24 * time.Hour)
+	if err := e.applyRetentionLock(ctx, be, lockArchiveKey, nil, until); err != nil {
+		t.Fatalf("nothing else was required: %v", err)
 	}
 	if f, oerr := os.OpenFile(filepath.Join(dir, lockArchiveKey), os.O_WRONLY, 0); oerr == nil {
 		f.Close()
 		t.Fatal("the archive itself must be locked")
 	}
-	// A missing archive IS an error — that is the object the lock exists for.
-	if err := e.applyRetentionLock(ctx, be, "node1/web/absent.dback", time.Now()); err == nil {
+	if err := e.applyRetentionLock(ctx, be, lockArchiveKey, []string{sidecarSealed}, until); err == nil {
+		t.Fatal("a required sidecar that cannot be locked must fail the lock")
+	}
+	if err := e.applyRetentionLock(ctx, be, "node1/web/absent.dback", nil, time.Now()); err == nil {
 		t.Fatal("a missing archive must fail the lock")
 	}
 }

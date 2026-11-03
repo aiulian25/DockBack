@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/klauspost/compress/zstd"
 
@@ -135,7 +134,8 @@ type serviceCapture struct {
 	stack        string
 	containerID  string
 	insp         types.ContainerJSON
-	engineKind   string // non-empty => a live DB dump will be taken
+	engineKind   string        // non-empty => a live DB dump will be taken
+	embedded     *EmbeddedDump // set when that database is bundled inside an application image (F126)
 	env          []string
 	volDests     []string
 	uncompressed int64
@@ -144,7 +144,7 @@ type serviceCapture struct {
 	zwindow      int
 	start        time.Time
 	pre, post    []Hook
-	ranPre       bool
+	hooks        *hookBracket
 	running      bool
 	opts         Options // per-service opts (ContainerID set)
 
@@ -167,30 +167,25 @@ func (sc *serviceCapture) heldInWindow() bool {
 }
 
 // settleLiveCopy merges a service's two passes into its volumes archive once
-// the window is over. Nothing to do for a service copied whole inside it.
-func (sc *serviceCapture) settleLiveCopy() error {
-	if sc.live == nil {
-		return nil
-	}
-	sha, _, err := sc.live.settle(sc.work)
-	if err != nil {
-		return fmt.Errorf("volume archive: %w", err)
-	}
-	sc.man.VolumesSHA256 = sha
-	return nil
+// the window is over, with the index of the held moment, exactly as a single
+// container's short freeze does. Nothing to do for a service copied whole inside it.
+func (e *Engine) settleLiveCopy(sc *serviceCapture) error {
+	return e.recordShortFreeze(sc.man, sc.opts, sc.work, sc.id, sc.live)
 }
 
 // spoolWholeService archives every selected volume of a service in one pass,
 // inside the window.
 func (e *Engine) spoolWholeService(ctx context.Context, cli *client.Client, sc *serviceCapture) error {
 	e.logf(sc.id, "INFO", "Archiving %d volume path(s) for %q via sidecar", len(sc.volDests), sc.name)
-	// The app-consistent path writes no file index, so the per-file hashes
-	// this returns have nowhere to be recorded.
-	volSHA, _, err := e.spoolVolumeTar(ctx, cli, sc.id, sc.containerID, sc.volDests, filepath.Join(sc.work, volumesMember))
+	excludes := sc.opts.excludeSubPaths()
+	volSHA, fileHashes, err := e.spoolVolumeTar(ctx, cli, sc.id, sc.containerID, sc.volDests, filepath.Join(sc.work, volumesMember), excludes...)
 	if err != nil {
 		return err
 	}
 	sc.man.VolumesSHA256 = volSHA
+	sc.man.ArchiveExcluded = excludes
+	// Inside the window, like the copy, so the index lists what the archive holds.
+	e.indexWholeCapture(ctx, cli, sc.containerID, sc.volDests, excludes, fileHashes, nil, sc.man, sc.work, sc.id)
 	return nil
 }
 
@@ -228,13 +223,8 @@ func (e *Engine) prepareServiceCapture(ctx context.Context, cli *client.Client, 
 	e.logf(id, "INFO", "Preparing consistent capture of %q (service=%q)", name, service)
 
 	imageRef, imageDigest, _ := dockercli.ImageRef(ctx, cli, containerID)
-	engineKind := detectDBEngine(insp.Config.Image, insp.Config.Env)
 	running := insp.State != nil && insp.State.Running
-	if !running && engineKind != "" {
-		// A stopped DB has no live process to dump — capture its files instead.
-		e.logf(id, "INFO", "Service %q is stopped — capturing volumes/config without a live database dump", name)
-		engineKind = ""
-	}
+	engineKind, embedded := e.resolveDatabaseCapture(ctx, cli, containerID, insp, running, id)
 	// A DB image without its dump CLI isn't really a database server (e.g. an app
 	// that merely connects to one). Decide up front — BEFORE selectMounts — so the
 	// data dir is INCLUDED in the volume tar, matching Run's no-tools fallback
@@ -242,7 +232,7 @@ func (e *Engine) prepareServiceCapture(ctx context.Context, cli *client.Client, 
 	// selection must be final before the window opens).
 	if engineKind != "" && !e.probeDBTools(ctx, cli, containerID, engineKind) {
 		e.logf(id, "WARN", "%s tools not found in %q — it isn't a database server; capturing its files instead", engineKind, name)
-		engineKind = ""
+		engineKind, embedded = "", nil
 	}
 
 	algo, zlevel, zwindow, compLabel := parseCompression(opts.Compression)
@@ -331,10 +321,27 @@ func (e *Engine) prepareServiceCapture(ctx context.Context, cli *client.Client, 
 	// live dump will actually replace it (engineKind survived the no-tools check).
 	sopts := opts
 	sopts.ContainerID = containerID
+	sopts.NodeID = nodeID
+	e.resolveExclusions(&sopts, man, insp.Config.Image, name, id)
 	dumpedDataDir := ""
 	if engineKind != "" {
 		dumpedDataDir = dockercli.DBDataDir(engineKind)
 	}
+	// F126: an embedded server keeps its data where the APPLICATION puts it.
+	if embedded != nil && embedded.DataDir != "" {
+		dumpedDataDir = embedded.DataDir
+	}
+	// The pieces a group can take as a single capture would, taken here, before
+	// anything is held: the image does not change while the window is open.
+	if sopts.SaveImage {
+		e.bundleImage(ctx, cli, imageRef, work, man, id)
+	}
+	incremental, _ := e.incrementalPolicy(nodeID, name)
+	exportTool := ""
+	if profile := e.exportProfile(insp.Config.Image, nodeID, name); profile.Available {
+		exportTool = profile.Tool
+	}
+	e.recordCaptureOverrides(man, id, consistentCaptureOverrides(sopts.AppExport, exportTool, incremental))
 	volDests, refs, skipped := e.selectMounts(ctx, cli, insp, sopts, id, dumpedDataDir)
 	// F81: the same bind work the ordinary capture does — what each bind's root
 	// IS, and the file-rooted ones held out of volumes.tar into their own
@@ -390,7 +397,7 @@ func (e *Engine) prepareServiceCapture(ctx context.Context, cli *client.Client, 
 	}
 	return &serviceCapture{
 		id: id, key: key, b: b, man: man, work: work, nodeID: nodeID, name: name, service: service, stack: stack,
-		containerID: containerID, insp: insp, engineKind: engineKind, env: insp.Config.Env,
+		containerID: containerID, insp: insp, engineKind: engineKind, embedded: embedded, env: insp.Config.Env,
 		volDests: volDests, uncompressed: uncompressed, algo: algo, zlevel: zlevel, zwindow: zwindow,
 		start: start, pre: pre, post: post, running: running, opts: sopts,
 	}, nil
@@ -527,7 +534,7 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 	for _, sc := range caps {
 		sc.sqliteDBs = e.detectSQLite(ctx, cli, sc.containerID, sc.volDests, sc.id)
 		if sc.heldInWindow() {
-			sc.live = e.copyLive(ctx, cli, sc.containerID, sc.volDests, nil, sc.work, sc.id)
+			sc.live = e.copyLive(ctx, cli, sc.containerID, sc.volDests, sc.opts.excludeSubPaths(), sc.work, sc.id)
 		}
 	}
 
@@ -549,14 +556,9 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 			return
 		}
 		ranPost = true
-		pctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
 		for _, sc := range caps {
-			if !sc.ranPre {
-				continue
-			}
-			for _, h := range sc.post {
-				_ = e.runHook(pctx, cli, sc.containerID, h, sc.id, "post")
+			if sc.hooks != nil {
+				sc.hooks.release()
 			}
 		}
 	}
@@ -566,16 +568,16 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 	// Application-layer pre-hooks run BEFORE any pause (a paused container can't
 	// exec). A failing pre-hook fails only that service.
 	for _, sc := range caps {
-		for _, h := range sc.pre {
-			if herr := e.runHook(ctx, cli, sc.containerID, h, sc.id, "pre"); herr != nil {
-				sc.captureErr = fmt.Errorf("pre-backup hook: %w", herr)
-				e.logf(sc.id, "ERR", "Pre-backup hook failed: %v", herr)
-				break
-			}
-			sc.ranPre = true
+		sc.hooks = e.newHookBracket(cli, sc.nodeID, sc.containerID, sc.name, sc.insp.Config.Image, sc.id, sc.pre, sc.post)
+		if herr := sc.hooks.runPre(ctx); herr != nil {
+			sc.captureErr = fmt.Errorf("pre-backup hook: %w", herr)
+			e.logf(sc.id, "ERR", "Pre-backup hook failed: %v", herr)
 		}
 	}
 
+	for _, sc := range caps {
+		sc.man.QuiesceRequested, sc.man.QuiesceAchieved = quiesceEvidence(PauseNone, sc.engineKind, sc.running, len(sc.volDests))
+	}
 	for _, op := range plan {
 		sc := byKey[op.service]
 		if sc == nil || sc.captureErr != nil {
@@ -599,28 +601,26 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 				mode = PausePause
 			}
 			sc.heldAt = time.Now()
-			if mode == PauseStop {
-				e.logf(sc.id, "INFO", "Stopping %q for the consistency window", sc.name)
-				if serr := cli.ContainerStop(ctx, sc.containerID, container.StopOptions{}); serr == nil {
-					sc.paused, sc.pauseKind = true, PauseStop
-				} else {
-					e.logf(sc.id, "WARN", "Stop failed (%v) — capturing %q live", serr, sc.name)
-				}
-			} else {
-				e.logf(sc.id, "INFO", "Pausing %q for the consistency window", sc.name)
-				if perr := cli.ContainerPause(ctx, sc.containerID); perr == nil {
-					sc.paused, sc.pauseKind = true, PausePause
-				} else {
-					e.logf(sc.id, "WARN", "Pause failed (%v) — capturing %q live", perr, sc.name)
-				}
+			e.logf(sc.id, "INFO", "Holding %q (%s) for the consistency window", sc.name, mode)
+			sc.man.QuiesceRequested = mode
+			// A member that cannot be held fails: the group cannot be one point in time
+			// without it, and is not reported or offered as one. The holds its siblings
+			// took are released by resumeAll as usual.
+			result, herr := e.acquireHold(ctx, cli, sc.nodeID, sc.containerID, sc.id, mode)
+			if herr != nil {
+				sc.captureErr = herr
+				e.logf(sc.id, "ERR", "%v", herr)
+				continue
 			}
+			sc.man.QuiesceAchieved = result.achieved
+			sc.paused, sc.pauseKind = result.owned, mode
 		case "dump":
 			e.logf(sc.id, "INFO", "Dumping %s database live for %q", sc.engineKind, sc.name)
 			// F205: the same operator-recorded Redis password the ordinary path
 			// uses, resolved inside dumpDatabase from this ref — one lookup, one
 			// code path, so a stack backup and a single-container backup of the
 			// same broker cannot disagree about whether a snapshot is possible.
-			dump, derr := e.dumpDatabase(ctx, cli, ContainerRef{NodeID: sc.nodeID, Name: sc.name}, sc.containerID, sc.engineKind, sc.env, sc.work, sc.service, sc.opts.Databases)
+			dump, derr := e.dumpDatabaseWith(ctx, cli, ContainerRef{NodeID: sc.nodeID, Name: sc.name}, sc.containerID, sc.engineKind, sc.embedded, sc.env, sc.work, sc.service, sc.opts.Databases)
 			if derr != nil {
 				// F191: the SAME Redis fallback the ordinary path has (F185). This
 				// path failed the whole service — and with it the group looked
@@ -651,7 +651,7 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 			if len(sc.volDests) == 0 {
 				continue
 			}
-			sc.live = e.copyFrozen(ctx, cli, sc.containerID, sc.volDests, nil, sc.work, sc.id, sc.live)
+			sc.live = e.copyFrozen(ctx, cli, sc.containerID, sc.volDests, sc.opts.excludeSubPaths(), sc.work, sc.id, sc.live)
 			var verr error
 			if sc.live == nil {
 				verr = e.spoolWholeService(ctx, cli, sc)
@@ -679,7 +679,7 @@ func (e *Engine) BackupStackConsistent(ctx context.Context, nodeID, project stri
 	ok := 0
 	for _, sc := range caps {
 		if sc.captureErr == nil {
-			sc.captureErr = sc.settleLiveCopy()
+			sc.captureErr = e.settleLiveCopy(sc)
 		}
 		// F116: a corruption verdict fails THIS service only. The group's other
 		// members are already captured and still form a coherent point-in-time;

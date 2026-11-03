@@ -38,7 +38,7 @@ func gradeBackup(b *store.Backup, man *backup.Manifest, locs []backup.Location, 
 			continue
 		}
 		switch l.Status {
-		case "failed":
+		case "failed", backup.LocationIncomplete:
 			offsiteFailed = true
 		case "deferred":
 			// queued for its upload window — no data there yet, neither healthy nor failed
@@ -97,6 +97,10 @@ func gradeBackup(b *store.Backup, man *backup.Manifest, locs []backup.Location, 
 	// finding about the SOURCE, not the backup — the copy is correct — so it
 	// earns a line and never a grade.
 	stagingFindings := backup.StaleStagingFindings(man)
+	// A pass recorded for a backup the drill had nothing to restore from proved nothing.
+	if drill != nil && drill.OK && drill.Detail == backup.LegacyUntestedDrillDetail {
+		drill = nil
+	}
 	drillFailed := drill != nil && !drill.OK
 	neverDrilled := drill == nil // A requires a PASSED drill, reached as the default band
 

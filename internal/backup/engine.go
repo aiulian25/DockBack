@@ -39,6 +39,10 @@ type LogFunc func(backupID, level, msg string)
 
 // Engine orchestrates backups, verification and restores.
 type Engine struct {
+	// mirrorClaims holds the backups being mirrored right now, whoever asked, so the
+	// drain, a manual send and a backfill cannot upload the same one twice.
+	mirrorClaims sync.Map // backupID -> struct{}
+
 	Store   *store.Store
 	Reg     *dockercli.Registry
 	Storage storage.Backend
@@ -152,30 +156,69 @@ func (e *Engine) notify(kind, title, message string) {
 // heldForPrecision is how finely the log states how long a container was held.
 const heldForPrecision = 100 * time.Millisecond
 
-// hold quiesces the container for the copy — stopped or paused as pm says —
-// and returns whether it is held and how to let it go. short says a live copy
-// already holds the bulk, so the hold lasts only as long as copying again what
-// changed meanwhile; otherwise it lasts the whole copy.
-func (e *Engine) hold(ctx context.Context, cli *client.Client, containerID, id, pm string, short bool) (bool, func()) {
+// hold quiesces the container for the copy — stopped or paused as pm says — and
+// says how it went. short says a live copy already holds the bulk, so the hold
+// lasts only as long as copying again what changed meanwhile; otherwise it lasts
+// the whole copy. An error means the consistency this run asked for cannot be had,
+// so the caller fails rather than copy live and call that consistent.
+func (e *Engine) hold(ctx context.Context, cli *client.Client, nodeID, containerID, id, pm string, short bool) (holdResult, error) {
 	purpose := "for the whole volume copy"
 	if short {
 		purpose = "to copy again what changed during the live copy"
 	}
-	heldAt := time.Now()
-	switch pm {
-	case PauseStop:
-		e.logf(id, "INFO", "Stopping container %s", purpose)
-		stopped := cli.ContainerStop(ctx, containerID, container.StopOptions{}) == nil
-		return stopped, func() { e.resumeContainer(cli, containerID, id, false, heldAt) }
-	case PausePause:
-		e.logf(id, "INFO", "Pausing container %s", purpose)
-		if err := cli.ContainerPause(ctx, containerID); err != nil {
-			e.logf(id, "WARN", "Pause failed (%v) — continuing with a live copy", err)
-			return false, nil
-		}
-		return true, func() { e.resumeContainer(cli, containerID, id, true, heldAt) }
+	verb := "Pausing"
+	if pm == PauseStop {
+		verb = "Stopping"
 	}
-	return false, nil
+	e.logf(id, "INFO", "%s container %s", verb, purpose)
+	heldAt := time.Now()
+	result, err := e.acquireHold(ctx, cli, nodeID, containerID, id, pm)
+	if err != nil {
+		return result, err
+	}
+	if result.owned {
+		result.resume = func() { e.resumeContainer(cli, containerID, id, pm == PausePause, heldAt) }
+	}
+	return result, nil
+}
+
+// holdResult is what a hold achieved. achieved is one of the Quiesce* values.
+type holdResult struct {
+	achieved string
+	owned    bool   // this run took the hold, so this run has to let it go
+	resume   func() // set when owned, by hold
+}
+
+// acquireHold is the Docker side of a hold, journaled, for a container and a stack
+// member alike. A container that turns out to be already paused or stopped is held
+// still by somebody else, which serves the copy, and is not this run's to release.
+func (e *Engine) acquireHold(ctx context.Context, cli *client.Client, nodeID, containerID, opID, pm string) (holdResult, error) {
+	var err error
+	if pm == PauseStop {
+		e.journalHoldIntent(ctx, cli, nodeID, opID, containerID, holdKindStop)
+		err = cli.ContainerStop(ctx, containerID, container.StopOptions{})
+	} else {
+		e.journalHoldIntent(ctx, cli, nodeID, opID, containerID, holdKindPause)
+		err = cli.ContainerPause(ctx, containerID)
+	}
+	if err == nil {
+		e.journalHoldAcquired(opID, containerID)
+		return holdResult{achieved: pm, owned: true}, nil
+	}
+	e.settleUnconfirmedHold(cli, opID, containerID)
+	if insp, ierr := cli.ContainerInspect(context.WithoutCancel(ctx), containerID); ierr == nil && insp.ContainerJSONBase != nil && insp.State != nil {
+		if insp.State.Paused {
+			return holdResult{achieved: QuiesceAlreadyPaused}, nil
+		}
+		if !insp.State.Running {
+			return holdResult{achieved: QuiesceAlreadyStopped}, nil
+		}
+	}
+	verb := "pause"
+	if pm == PauseStop {
+		verb = "stop"
+	}
+	return holdResult{achieved: QuiesceLive}, fmt.Errorf("could not %s the container for a consistent copy: %w. Nothing was copied in its place, because a live copy is not what this backup was set to take. If live is acceptable for this container, set its mode to Live copy", verb, err)
 }
 
 // resumeContainer brings a quiesced container back after the volume snapshot —
@@ -192,15 +235,18 @@ func (e *Engine) resumeContainer(cli *client.Client, containerID, logID string, 
 		e.logf(logID, "INFO", "Unpausing container — it was paused for %s", heldFor)
 		if err := cli.ContainerUnpause(ctx, containerID); err != nil {
 			e.logf(logID, "ERR", "Failed to unpause container: %v — unpause it manually", err)
+			e.notifyHoldNotReleased(containerID, "paused", err)
 			return
 		}
 	} else {
 		e.logf(logID, "INFO", "Restarting container after volume snapshot — it was stopped for %s", heldFor)
 		if err := cli.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
 			e.logf(logID, "ERR", "Failed to restart container after backup: %v — start it manually", err)
+			e.notifyHoldNotReleased(containerID, "stopped", err)
 			return
 		}
 	}
+	e.clearHold(logID, containerID)
 	// Confirm it's actually up (catch a crash-loop / immediate exit).
 	time.Sleep(2 * time.Second)
 	insp, err := cli.ContainerInspect(ctx, containerID)
@@ -491,42 +537,8 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 	}
 
 	imageRef, imageDigest, _ := dockercli.ImageRef(ctx, cli, opts.ContainerID)
-	engineKind := detectDBEngine(insp.Config.Image, insp.Config.Env)
-	// F126: an ALL-IN-ONE image bundling its own database server. detectDBEngine
-	// reads the image name, and an image name says nothing about what it bundles —
-	// `jwetzell/guacamole` runs a full PostgreSQL and looks like an ordinary app,
-	// so its live data directory was raw-copied: a hot file copy of a running
-	// database, which is exactly what the dump path exists to prevent.
-	var embedded *EmbeddedDump
-	if engineKind == "" {
-		if p := ProfileFor(insp.Config.Image); p != nil && p.EmbeddedDump != nil {
-			// F166: some applications ship ONE image that can run several ways, so
-			// the declaration is conditional. The probe decides; a "no" leaves the
-			// ordinary file path in place, which for such a deployment is the
-			// correct method rather than a fallback.
-			if e.embeddedDumpApplies(ctx, cli, opts.ContainerID, p.EmbeddedDump, id, p.Name) {
-				embedded = p.EmbeddedDump
-				engineKind = embedded.Engine
-				// NOTE: opts.embeddedDataDir is deliberately NOT set here. The
-				// exclusion is armed only once the dump has actually succeeded —
-				// excluding a data directory with no dump to supersede it would turn
-				// a wasteful backup into an empty one.
-				e.logf(id, "INFO", "%s bundles its own %s server — dumping it with native tools instead of copying its data directory", p.Name, embedded.Engine)
-			}
-		}
-	}
-
-	// A stopped container can't run a live database dump (the dump execs a client
-	// inside a running process) and has no live writes to quiesce. Back it up as a
-	// file/volume snapshot instead — valid for an app kept off between uses, and it
-	// keeps a scheduled whole-node/specific run from failing on a stopped target
-	// (F9). Its data dir is NOT excluded from the volume tar, since no dump replaces
-	// it, so the raw files are captured.
 	running := insp.State != nil && insp.State.Running
-	if !running && engineKind != "" {
-		e.logf(id, "INFO", "Target is stopped — backing up volumes/config without a live database dump")
-		engineKind = ""
-	}
+	engineKind, embedded := e.resolveDatabaseCapture(ctx, cli, opts.ContainerID, insp, running, id)
 
 	// Pre-flight (PLAN §4.4): encryption key present, storage writable, DB tools
 	// present — fail fast before any expensive/destructive work. (Disk-space
@@ -590,26 +602,15 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 
 	// 0) Application-aware quiesce hooks (PLAN §9.5): run pre-hooks so the files
 	// and database are captured at one consistent instant; post-hooks always run
-	// afterward (e.g. Nextcloud maintenance mode off), even on failure.
+	// afterward (e.g. Nextcloud maintenance mode off), even on failure, and as soon
+	// as the capture is done rather than after the upload.
 	pre, post := e.gatherHooks(insp.Config.Image, opts.NodeID, name)
-	ranPre := false
-	defer func() {
-		if !ranPre {
-			return
-		}
-		pctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		for _, h := range post {
-			_ = e.runHook(pctx, cli, opts.ContainerID, h, id, "post")
-		}
-	}()
-	for _, h := range pre {
-		if err := e.runHook(ctx, cli, opts.ContainerID, h, id, "pre"); err != nil {
-			return id, e.fail(b, fmt.Errorf("pre-backup hook failed: %w", err))
-		}
+	hooks := e.newHookBracket(cli, opts.NodeID, opts.ContainerID, name, insp.Config.Image, id, pre, post)
+	defer hooks.release()
+	if err := hooks.runPre(ctx); err != nil {
+		return id, e.fail(b, fmt.Errorf("pre-backup hook failed: %w", err))
 	}
 	if len(pre) > 0 {
-		ranPre = true
 		e.logf(id, "INFO", "Application quiesced for a consistent snapshot")
 	}
 
@@ -812,32 +813,7 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 		}
 	}
 
-	// F132: regenerable directories the operator chose to drop. Resolved here so
-	// the exclusion and the manifest record cannot disagree — the archive always
-	// states exactly what was left out and what regenerating it costs.
-	// F138: paths always left out — logs, temp, scratch. No toggle: these have
-	// no restore value at all, unlike the regenerable data below, and keeping
-	// them costs archive space and widens what a leak exposes.
-	if p := ProfileFor(insp.Config.Image); p != nil && len(p.NeverBackup) > 0 {
-		for _, nb := range p.NeverBackup {
-			if nb.Path == "" {
-				continue
-			}
-			opts.neverBackup = append(opts.neverBackup, nb.Path)
-			man.ExcludedRegenerable = append(man.ExcludedRegenerable, ExcludedPath{Path: nb.Path, Label: nb.Why})
-		}
-		if len(opts.neverBackup) > 0 {
-			e.logf(id, "INFO", "Leaving out %d path(s) with no restore value: %s", len(opts.neverBackup), strings.Join(opts.neverBackup, ", "))
-		}
-	}
-
-	if regen := RegenerablePathsFor(insp.Config.Image); len(regen) > 0 && e.ExcludeRegenerable(opts.NodeID, name) {
-		opts.excludeRegenerable = regen
-		for _, r := range regen {
-			man.ExcludedRegenerable = append(man.ExcludedRegenerable, ExcludedPath{Path: r.Path, Label: r.Label, Cost: r.Cost})
-			e.logf(id, "INFO", "Leaving out %s (%s) — %s rebuilds it. %s", r.Path, r.Label, name, r.Cost)
-		}
-	}
+	e.resolveExclusions(&opts, man, insp.Config.Image, name, id)
 
 	// F89: record the network topology — each attached network's definition and
 	// this container's endpoint on it. Best-effort: a failure leaves the field
@@ -882,20 +858,9 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 		man.Format.Layout += ", " + layoutPath(projectFolderMember)
 	}
 
-	// 2c) Optional image tarball for air-gapped restore (PLAN §0.3 / §8.4). Saved
-	// by the image reference so `docker load` restores its repo:tag. Best-effort:
-	// a failure logs WARN and the state backup still completes (just not
-	// air-gapped). Materially enlarges the archive, hence opt-in.
+	// 2c) Optional image tarball for air-gapped restore (PLAN §0.3 / §8.4).
 	if opts.SaveImage {
-		if imageRef == "" {
-			e.logf(id, "WARN", "Image tarball requested but the container has no resolvable image reference — skipping")
-		} else if itBytes, ierr := e.saveImageTar(ctx, cli, imageRef, work, id); ierr != nil {
-			e.logf(id, "WARN", "Image tarball NOT saved (%v) — this backup is not air-gapped", ierr)
-		} else {
-			man.ImageTar = &ImageTarRef{Ref: imageRef, Bytes: itBytes}
-			man.Format.Layout += ", image.tar"
-			e.logf(id, "INFO", "Saved image tarball for air-gapped restore: %s (%s)", imageRef, humanBytes(itBytes))
-		}
+		e.bundleImage(ctx, cli, imageRef, work, man, id)
 	}
 
 	// 3) Volumes via --volumes-from sidecar (PLAN §2.12). Optionally stop the
@@ -1016,8 +981,14 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 	if holding && e.shortFreezeFits(opts, name) {
 		live = e.copyLive(ctx, cli, opts.ContainerID, volDests, opts.excludeSubPaths(), work, id)
 	}
+	man.QuiesceRequested, man.QuiesceAchieved = quiesceEvidence(pm, engineKind, running, len(volDests))
 	if holding {
-		quiesced, resume = e.hold(ctx, cli, opts.ContainerID, id, pm, live != nil)
+		result, herr := e.hold(ctx, cli, opts.NodeID, opts.ContainerID, id, pm, live != nil)
+		if herr != nil {
+			return id, e.fail(b, herr)
+		}
+		man.QuiesceAchieved = result.achieved
+		quiesced, resume = true, result.resume
 	}
 	// #25: what the tree looked like as the copy began. Compared against the walk
 	// the index already takes afterwards, it says what moved underneath the
@@ -1025,7 +996,7 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 	// copies again whatever moved, which leaves it nothing to report.
 	var driftBefore *VolIndex
 	if live == nil {
-		driftBefore = e.driftBaseline(ctx, cli, opts.ContainerID, volDests, pm, man.Image, id)
+		driftBefore = e.driftBaseline(ctx, cli, opts.ContainerID, volDests, opts.excludeSubPaths(), pm, man.Image, id)
 	}
 	if len(volDests) > 0 {
 		live = e.copyFrozen(ctx, cli, opts.ContainerID, volDests, opts.excludeSubPaths(), work, id, live)
@@ -1049,6 +1020,7 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 		// an app must never be left paused because its database turned out to be
 		// damaged.
 		doResume()
+		hooks.release()
 		if verr := e.recordShortFreeze(man, opts, work, id, live); verr != nil {
 			return id, e.fail(b, verr)
 		}
@@ -1075,6 +1047,9 @@ func (e *Engine) Run(ctx context.Context, nodeName string, opts Options) (string
 	}
 
 	// 4-7) Shared tail: pack -> encrypt -> store -> mirror -> verify -> retention.
+	// The capture is complete whichever path it took, so the window ends here at the
+	// latest: nothing below needs the application held.
+	hooks.release()
 	return e.storeAndVerify(ctx, id, nodeName, stack, name, b, &man, opts, work, algo, zlevel, zwindow, uncompressedSel, start)
 }
 
@@ -1227,19 +1202,21 @@ func (e *Engine) storeAndVerify(ctx context.Context, id, nodeName, stack, name s
 	// Best-effort: a failed mirror never fails the (verified) local backup.
 	locs := []Location{{Kind: "local", Name: "local", Type: "local"}}
 	// Automatic path: honour each destination's upload window (overrideWindow=false).
-	locs = append(locs, e.mirror(ctx, id, key, manBytes, opts.Destinations, opts.DestinationsExplicit, false)...)
+	locs = append(locs, e.mirror(ctx, id, key, manBytes, opts.Destinations, opts.DestinationsExplicit, false, nil)...)
+
+	e.alertOnRepeatedFailures(name, stampOffsiteAttempts(locs, nil, time.Now()))
 
 	// Surface a degraded result: the backup is a verified-good local copy, but one
 	// or more intended offsite copies didn't make it (3-2-1 not satisfied). These
 	// failed destinations are recorded on the backup so the UI can flag it; they
-	// are retried on the next run (PLAN §6.5/§9.1).
+	// are retried by the offsite drain (PLAN §6.5/§9.1).
 	var okExternal, failedExternal, deferredExternal int
 	for _, l := range locs {
 		if l.Kind != "dest" {
 			continue
 		}
 		switch l.Status {
-		case "failed":
+		case "failed", LocationIncomplete:
 			failedExternal++
 		case "deferred": // outside its upload window (F14) — postponed, not a failure
 			deferredExternal++
@@ -1251,13 +1228,13 @@ func (e *Engine) storeAndVerify(ctx context.Context, id, nodeName, stack, name s
 		e.logf(id, "INFO", "%d offsite destination(s) deferred to their upload window — this backup is verified locally and will be mirrored when the window opens (or via Send offsite now).", deferredExternal)
 	}
 	if failedExternal > 0 {
-		e.logf(id, "WARN", "DEGRADED offsite copies: %d destination(s) failed — this backup has %d good copy/copies (local + %d offsite). Not fully protected (3-2-1); will retry next run.",
+		e.logf(id, "WARN", "DEGRADED offsite copies: %d destination(s) failed — this backup has %d good copy/copies (local + %d offsite). Not fully protected (3-2-1); DockBack keeps retrying automatically.",
 			failedExternal, 1+okExternal, okExternal)
 		// Operational alert (PLAN §9.15): the local copy is good but 3-2-1 isn't
 		// satisfied — surface it instead of leaving it in the log only. Throttled
 		// server-side so a persistent outage doesn't alert on every backup.
 		e.notify(notify.KindNoOffsite, "Offsite copy incomplete: "+name,
-			fmt.Sprintf("%s on %s backed up and verified locally, but %d offsite destination(s) failed — not fully protected (3-2-1). Will retry next run.", name, nodeName, failedExternal))
+			fmt.Sprintf("%s on %s backed up and verified locally, but %d offsite destination(s) failed — not fully protected (3-2-1). DockBack keeps retrying automatically.", name, nodeName, failedExternal))
 	}
 
 	// If the run was canceled (e.g. during a slow mirror), stop here so the
@@ -1352,6 +1329,7 @@ func (e *Engine) Scrub(ctx context.Context, b *store.Backup, source string) *Ver
 
 	// Stamp the per-copy result (all cases).
 	e.recordLocationVerify(b, source, now, rep.OK)
+	e.recordEnvelopeProblem(b, source, rep)
 	// A local scrub also drives the legacy global verified/last-verified fields
 	// (unchanged UI-list semantics). A destination scrub touches ONLY its location.
 	if source == "" || source == "local" {
@@ -1390,8 +1368,7 @@ const (
 // (PLAN §4.5). WebDAV/Nextcloud also retries at the chunk level, so this
 // whole-file retry rarely re-uploads in practice.
 const (
-	maxMirrorAttempts  = 3
-	mirrorRetryBackoff = 5 * time.Second
+	maxMirrorAttempts = 3
 )
 
 // progressReader tracks bytes read and the time of the last read, so the upload
@@ -1668,6 +1645,9 @@ func isTransientErr(err error) bool {
 	return false
 }
 
+// mirrorRetryBackoff is the first wait between attempts, tripled each time.
+var mirrorRetryBackoff = 5 * time.Second
+
 // mirror copies the stored archive + manifest to every enabled external
 // destination (PLAN §9.1). Best-effort and isolated per destination; returns
 // the locations successfully written so they're recorded on the backup. Each
@@ -1675,8 +1655,9 @@ func isTransientErr(err error) bool {
 // every step is logged so the user can see exactly where a mirror is.
 // overrideWindow ignores per-destination upload windows (a deliberate on-demand
 // "Send offsite now" pushes now regardless); the automatic backup-run path passes
-// false so a metered target's window is honoured (F14).
-func (e *Engine) mirror(ctx context.Context, id, key string, manBytes []byte, sel []string, explicit, overrideWindow bool) []Location {
+// false so a metered target's window is honoured (F14). repairs names the copies
+// whose archive is already there, by destination, so only the envelope is published.
+func (e *Engine) mirror(ctx context.Context, id, key string, manBytes []byte, sel []string, explicit, overrideWindow bool, repairs map[string]Location) []Location {
 	var written []Location
 	dests, err := e.Store.ListDestinations()
 	if err != nil || len(dests) == 0 {
@@ -1717,12 +1698,17 @@ func (e *Engine) mirror(ctx context.Context, id, key string, manBytes []byte, se
 
 		// Upload window (F14): outside its window, defer this destination instead of
 		// uploading — recorded as a "deferred" (not failed) location, retried by the
-		// next in-window run or an explicit "Send offsite now". A deliberate on-demand
+		// offsite drain once the window opens, or an explicit "Send offsite now". A deliberate on-demand
 		// push (overrideWindow) uploads regardless.
 		if !overrideWindow && !inUploadWindow(policy.Start, policy.End, time.Now()) {
 			e.logf(id, "INFO", "Deferring mirror to %s — now is outside its upload window (%s–%s)", d.Name, policy.Start, policy.End)
 			written = append(written, Location{Kind: "dest", DestID: d.ID, Name: d.Name, Type: d.Type, Status: "deferred",
 				Detail: fmt.Sprintf("outside upload window %s–%s", policy.Start, policy.End)})
+			continue
+		}
+		if reason := e.parentBlocking(manBytes, d.ID); reason != "" {
+			e.logf(id, "INFO", "Deferring mirror to %s — %s", d.Name, reason)
+			written = append(written, Location{Kind: "dest", DestID: d.ID, Name: d.Name, Type: d.Type, Status: "deferred", Detail: reason})
 			continue
 		}
 
@@ -1744,14 +1730,23 @@ func (e *Engine) mirror(ctx context.Context, id, key string, manBytes []byte, se
 			e.logf(id, "INFO", "Mirroring to %s (%s)…", d.Name, d.Type)
 		}
 		start := time.Now()
+		prior, repairing := repairs[d.ID]
+		if repairing && archiveGone(ctx, backend, key) {
+			e.logf(id, "WARN", "%s no longer holds the archive, so it is uploaded again", d.Name)
+			prior, repairing = Location{}, false
+		}
+		if repairing {
+			e.logf(id, "INFO", "The archive is already on %s — publishing only its recovery envelope", d.Name)
+		}
 
 		// Upload with bounded retry/back-off on transient failures (PLAN §4.5) and
 		// a no-progress (stall) guard instead of a fixed cap, so a slow-but-steady
 		// large upload completes while a hung target still fails (PLAN §4.5/§9.1).
 		var perr error
 		var stalled int32
+		var versionID string
 		backoff := mirrorRetryBackoff
-		for attempt := 1; attempt <= maxMirrorAttempts; attempt++ {
+		for attempt := 1; !repairing && attempt <= maxMirrorAttempts; attempt++ {
 			atomic.StoreInt32(&stalled, 0)
 			dctx, cancel := context.WithCancel(ctx)
 			rc, gerr := e.Storage.Get(dctx, key)
@@ -1767,19 +1762,13 @@ func (e *Engine) mirror(ctx context.Context, id, key string, manBytes []byte, se
 			atomic.StoreInt64(&pr.lastNano, time.Now().UnixNano())
 			done := make(chan struct{})
 			go e.uploadGuard(dctx, cancel, pr, totalSize, d.Name, id, done, &stalled)
-			_, perr = backend.Put(dctx, key, pr)
+			versionID, perr = putArchive(dctx, backend, key, pr)
 			close(done)
 			rc.Close()
+			cancel()
 			if perr == nil {
-				// F78: seal the sidecar per this destination's preference (metadata
-				// privacy where an untrusted third party holds the bytes).
-				if merr := e.writeManifestSidecarSealed(dctx, backend, key, manBytes, e.sealForDest(cfg)); merr != nil {
-					e.logf(id, "ERR", "Mirror to %s manifest failed: %v", d.Name, merr)
-				}
-				cancel()
 				break
 			}
-			cancel()
 			if ctx.Err() != nil { // the whole backup was canceled by the user
 				e.logf(id, "INFO", "Mirror to %s canceled", d.Name)
 				return written
@@ -1810,37 +1799,43 @@ func (e *Engine) mirror(ctx context.Context, id, key string, manBytes []byte, se
 			written = append(written, failedLoc)
 			continue
 		}
-		_ = e.Store.SetDestinationStatus(d.ID, "active")
 		loc := Location{Kind: "dest", DestID: d.ID, Name: d.Name, Type: d.Type}
-		// Record WORM/object-lock so the UI can badge it and prune can retain it
-		// while the lock is live (PLAN §9.1).
-		if im, ok := backend.(storage.Immutabler); ok && im.Immutable() {
-			until := time.Now().Add(time.Duration(im.LockDays()) * 24 * time.Hour)
-			// F97: a filesystem-like destination has to be TOLD to lock — S3 applies
-			// Object Lock server-side at write time, but local/SMB/SFTP need an
-			// explicit post-write pass over the archive and its sidecars.
-			//
-			// The location is only marked immutable if that pass SUCCEEDS. Recording
-			// a lock that was never applied would make prune skip a copy nothing is
-			// actually protecting — a false sense of safety, which is worse here than
-			// no lock at all.
-			locked := true
-			if rl, ok := backend.(storage.RetentionLocker); ok {
-				if lerr := e.applyRetentionLock(ctx, rl, key, until); lerr != nil {
-					e.logf(id, "WARN", "Mirrored to %s but could not apply its retention lock (%v) — this copy is NOT protected and prune may remove it on schedule", d.Name, lerr)
-					locked = false
-				}
-			}
-			if locked {
-				loc.Immutable = true
-				loc.LockUntil = until.Unix()
-				e.logf(id, "INFO", "Mirrored to %s (immutable / WORM-locked ~%dd)", d.Name, im.LockDays())
-			}
+		_, versionedBackend := backend.(storage.Versioned)
+		loc.VersionID, loc.Unversioned = versionID, versionedBackend && versionID == ""
+		if repairing {
+			loc.VersionID, loc.Unversioned = prior.VersionID, prior.Unversioned
 		}
+		// F78: seal the sidecar per this destination's preference (metadata privacy
+		// where an untrusted third party holds the bytes).
+		seal := e.sealForDest(cfg)
+		eerr := e.publishEnvelopeWithRetry(ctx, id, d.Name, backend, key, manBytes, seal)
+		if eerr != nil {
+			loc.Status = LocationIncomplete
+			loc.Detail = "archive uploaded, recovery envelope missing: " + mirrorFailReason(eerr, false)
+		}
+		e.recordReplicaLock(ctx, id, backend, key, requiredSidecarSuffixes(seal), prior, &loc)
 		written = append(written, loc)
+		if eerr != nil {
+			e.logf(id, "ERR", "Mirror to %s is incomplete: the archive is there but its recovery envelope is not (%v). Without the envelope, this copy cannot be opened if this instance's catalog is lost. Send offsite now repairs it.", d.Name, eerr)
+			_ = e.Store.SetDestinationStatus(d.ID, "error")
+			continue
+		}
+		_ = e.Store.SetDestinationStatus(d.ID, "active")
 		e.logf(id, "INFO", "Mirrored to %s in %s", d.Name, time.Since(start).Round(time.Second))
 	}
 	return written
+}
+
+// putArchive uploads an archive and returns the version id the provider gave
+// it, "" when the backend keeps no versions (DBK-030).
+func putArchive(ctx context.Context, backend storage.Backend, key string, r io.Reader) (string, error) {
+	versioned, ok := backend.(storage.Versioned)
+	if !ok {
+		_, err := backend.Put(ctx, key, r)
+		return "", err
+	}
+	_, versionID, err := versioned.PutVersion(ctx, key, r)
+	return versionID, err
 }
 
 // MirrorExisting re-runs ONLY the offsite mirror step for an already-stored,
@@ -1850,7 +1845,13 @@ func (e *Engine) mirror(ctx context.Context, id, key string, manBytes []byte, se
 // without wasting resources (PLAN §9.1/§6.5). destIDs limits the mirror to a
 // subset; empty means every enabled destination that doesn't already hold a good
 // copy. Progress is logged under the backup id so the UI's log stream shows it.
-func (e *Engine) MirrorExisting(ctx context.Context, backupID string, destIDs []string) error {
+// overrideWindow is for a deliberate on-demand push, which also starts a failing
+// copy's count again; backfill honours windows and leaves a copy deferred.
+func (e *Engine) MirrorExisting(ctx context.Context, backupID string, destIDs []string, overrideWindow bool) error {
+	if _, busy := e.mirrorClaims.LoadOrStore(backupID, struct{}{}); busy {
+		return ErrMirrorBusy
+	}
+	defer e.mirrorClaims.Delete(backupID)
 	b, err := e.Store.GetBackup(backupID)
 	if err != nil {
 		return err
@@ -1869,14 +1870,18 @@ func (e *Engine) MirrorExisting(ctx context.Context, backupID string, destIDs []
 		e.logf(backupID, "WARN", "Could not check the local archive before mirroring (%v) — continuing; the copy step will report any real problem", serr)
 	}
 	if serr == nil && !ok {
-		return fmt.Errorf("the local archive for this backup is missing — cannot mirror")
+		return ErrMirrorSourceGone
 	}
 
 	var existing []Location
 	_ = unmarshal(b.LocationsJSON, &existing)
 	good := map[string]bool{}
+	repairs := map[string]Location{}
 	for _, l := range existing {
-		if l.Kind == "dest" && !noData(l.Status) {
+		if l.Kind == "dest" && l.Status == LocationIncomplete {
+			repairs[l.DestID] = l
+		}
+		if l.Kind == "dest" && !needsPublishing(l.Status) {
 			good[l.DestID] = true // already holds a copy — don't re-upload (deferred/failed still need one)
 		}
 	}
@@ -1897,12 +1902,12 @@ func (e *Engine) MirrorExisting(ctx context.Context, backupID string, destIDs []
 	}
 	if len(sel) == 0 {
 		e.logf(backupID, "INFO", "Nothing to mirror — every enabled destination already has a copy of this backup")
-		return fmt.Errorf("all enabled destinations already have a copy of this backup")
+		return ErrNothingToMirror
 	}
 
+	e.mirrorMissingAncestors(ctx, b, sel, overrideWindow)
 	e.logf(backupID, "INFO", "Mirroring the existing local backup to %d destination(s) — reusing the stored archive, no re-capture", len(sel))
-	// On-demand push: a deliberate user action, so override upload windows (F14).
-	newLocs := e.mirror(ctx, backupID, b.StorageKey, []byte(b.ManifestJSON), sel, true, true)
+	newLocs := e.mirror(ctx, backupID, b.StorageKey, []byte(b.ManifestJSON), sel, true, overrideWindow, repairs)
 
 	// Reload before saving so a concurrent scrub/verify's fields aren't clobbered;
 	// only the locations are ours to update here.
@@ -1910,21 +1915,33 @@ func (e *Engine) MirrorExisting(ctx context.Context, backupID string, destIDs []
 		b = fresh
 		_ = unmarshal(b.LocationsJSON, &existing)
 	}
+	counted := existing
+	if overrideWindow {
+		counted = nil
+	}
+	alert := stampOffsiteAttempts(newLocs, counted, time.Now())
 	b.LocationsJSON = mustJSON(mergeLocations(existing, newLocs))
 	if uerr := e.Store.UpdateBackup(b); uerr != nil {
 		return uerr
 	}
+	e.alertOnRepeatedFailures(b.TargetName, alert)
 
-	okN, failN := 0, 0
+	okN, failN, deferredN := 0, 0, 0
 	for _, l := range newLocs {
 		if l.Kind != "dest" {
 			continue
 		}
-		if l.Status == "failed" {
+		switch l.Status {
+		case "failed", LocationIncomplete:
 			failN++
-		} else {
+		case "deferred":
+			deferredN++
+		default:
 			okN++
 		}
+	}
+	if deferredN > 0 {
+		e.logf(backupID, "INFO", "%d destination(s) deferred — sent automatically when due", deferredN)
 	}
 	if failN == 0 {
 		e.logf(backupID, "INFO", "Mirror complete — %d destination(s) now hold this backup", okN)
@@ -2231,24 +2248,14 @@ func (e *Engine) captureVolumes(ctx context.Context, cli *client.Client, opts Op
 		// and cross-backup file search / generation diff become index-only reads.
 		// Best-effort — an index failure NEVER fails the backup; set index.always
 		// to "false" for byte-identical pre-F70 archives.
-		if e.indexAlways() {
-			if idx, ierr := e.buildVolIndex(ctx, cli, opts.ContainerID, volDests, man.Image); ierr == nil {
-				e.stampIndexHashes(&idx, fileHashes, id)
-				// The index walk is itself the "after" reading, so the drift
-				// report costs no walk of its own.
-				e.reportCopyDrift(man, id, driftBefore, idx, man.Image)
-				e.storeVolIndex(man, work, id, idx)
-			} else {
-				e.logf(id, "WARN", "File indexing failed (%v) — browsing this backup will stream the archive instead", ierr)
-			}
-		}
+		e.indexWholeCapture(ctx, cli, opts.ContainerID, volDests, opts.excludeSubPaths(), fileHashes, driftBefore, man, work, id)
 		return nil
 	}
 
 	// Incremental mode: build the current index (inside the quiesce window, so it
 	// reflects exactly what the tar captures), then decide full-baseline vs delta.
 	e.logf(id, "INFO", "Incremental mode: indexing volume files")
-	curIdx, ierr := e.buildVolIndex(ctx, cli, opts.ContainerID, volDests, man.Image)
+	curIdx, ierr := e.buildVolIndex(ctx, cli, opts.ContainerID, volDests, opts.excludeSubPaths(), man.Image)
 	if ierr != nil {
 		// Indexing is a hard prerequisite for a correct delta; fall back to a full
 		// baseline (still with an index next time) rather than risk a wrong delta.
@@ -2259,6 +2266,15 @@ func (e *Engine) captureVolumes(ctx context.Context, cli *client.Client, opts Op
 	parent, atCap := e.incrementalParent(opts.NodeID, name, volDests, fullEvery, id)
 	if parent == nil {
 		e.logf(id, "INFO", "Incremental: no reusable parent — capturing a full baseline (chain reset)")
+		return e.captureFullBaseline(ctx, cli, opts, man, work, volDests, id, curIdx, driftBefore)
+	}
+	prevIdx, perr := e.loadVolIndex(ctx, parent, "")
+	if perr != nil {
+		e.logf(id, "WARN", "Incremental: could not read parent index (%v) — capturing a full baseline", perr)
+		return e.captureFullBaseline(ctx, cli, opts, man, work, volDests, id, curIdx, driftBefore)
+	}
+	if prevIdx.Version != volIndexVersion {
+		e.logf(id, "INFO", "Incremental: the parent's file index cannot describe everything a delta has to carry — capturing a full baseline (the older backups stay restorable)")
 		return e.captureFullBaseline(ctx, cli, opts, man, work, volDests, id, curIdx, driftBefore)
 	}
 	if atCap {
@@ -2277,22 +2293,22 @@ func (e *Engine) captureVolumes(ctx context.Context, cli *client.Client, opts Op
 		return e.captureFullBaseline(ctx, cli, opts, man, work, volDests, id, curIdx, driftBefore)
 	}
 
-	prevIdx, perr := e.loadVolIndex(ctx, parent)
-	if perr != nil {
-		e.logf(id, "WARN", "Incremental: could not read parent index (%v) — capturing a full baseline", perr)
-		return e.captureFullBaseline(ctx, cli, opts, man, work, volDests, id, curIdx, driftBefore)
-	}
 	var parentMan Manifest
 	_ = unmarshal(parent.ManifestJSON, &parentMan)
 
 	changed, deleted := DiffIndex(prevIdx, curIdx)
+	replaced := replacedEntries(prevIdx, curIdx)
+	if reason := deltaCannotCarry(changed, append(append([]string(nil), deleted...), replaced...)); reason != "" {
+		e.logf(id, "INFO", "Incremental: %s, which a delta cannot hold — capturing a full baseline", reason)
+		return e.captureFullBaseline(ctx, cli, opts, man, work, volDests, id, curIdx, driftBefore)
+	}
 	e.logf(id, "INFO", "Incremental delta vs %s: %d changed, %d deleted (chain depth %d)",
 		short(parent.ID), len(changed), len(deleted), parentMan.ChainDepth+1)
 
 	// F69 ransomware tripwire: a delta touching an abnormal share of the volume
 	// marks the backup suspect (never fails it — capturing the evidence matters).
 	if e.tripwireEnabled() {
-		st := AnalyzeDelta(prevIdx, curIdx, changed, deleted)
+		st := AnalyzeDelta(prevIdx, curIdx, ContentChangedFiles(prevIdx, curIdx), DeletedFiles(prevIdx, deleted))
 		if sus, reason := SuspectDelta(st,
 			e.settingIntClamped("tripwire.min_files", 200, 10, 100000),
 			e.settingIntClamped("tripwire.changed_pct", 60, 10, 100),
@@ -2315,6 +2331,7 @@ func (e *Engine) captureVolumes(ctx context.Context, cli *client.Client, opts Op
 	man.ParentCipherSHA256 = parent.CipherSHA256
 	man.ChainDepth = parentMan.ChainDepth + 1
 	man.Deleted = deleted
+	man.Replaced = replaced
 	man.VolIndex = volumeIndexMember
 	man.Format.Layout = "manifest.json, config/…, db/…, volumes-delta.tar (changed files only), volumes-index.json.zst; parent chain restores full→deltas"
 	return nil
@@ -2332,7 +2349,7 @@ func (e *Engine) captureFullBaseline(ctx context.Context, cli *client.Client, op
 	}
 	man.ArchiveExcluded = opts.excludeSubPaths()
 	if len(curIdx.Entries) == 0 {
-		if built, berr := e.buildVolIndex(ctx, cli, opts.ContainerID, volDests, man.Image); berr == nil {
+		if built, berr := e.buildVolIndex(ctx, cli, opts.ContainerID, volDests, opts.excludeSubPaths(), man.Image); berr == nil {
 			e.stampIndexHashes(&built, fileHashes, id)
 			e.reportCopyDrift(man, id, driftBefore, built, man.Image)
 			curIdx = built
@@ -2423,20 +2440,20 @@ func sameDestSet(want map[string]bool, vols []VolumeRef) bool {
 }
 
 // buildVolIndex builds the current volume file index via the read-only sidecar (F61).
-func (e *Engine) buildVolIndex(ctx context.Context, cli *client.Client, containerID string, volDests []string, image string) (VolIndex, error) {
-	out, err := dockercli.CaptureSidecarRO(ctx, cli, containerID, BuildIndexCmd(volDests))
+func (e *Engine) buildVolIndex(ctx context.Context, cli *client.Client, containerID string, volDests, excludes []string, image string) (VolIndex, error) {
+	// Once more on a failure: a file that vanishes between find and stat reports an
+	// error, and one running application is enough to make that an ordinary event.
+	walk, walkedAt, err := walkInventory(ctx, cli, containerID, volDests, excludes)
+	if err != nil && ctx.Err() == nil {
+		walk, walkedAt, err = walkInventory(ctx, cli, containerID, volDests, excludes)
+	}
 	if err != nil {
 		return VolIndex{}, err
-	}
-	idx, perr := ParseIndexOutput(out)
-	if perr != nil {
-		return idx, perr
 	}
 	// #41: stamp the files this application rewrites itself, at capture, while the
 	// image that decides the answer is known. A fixed-width marker is invisible to
 	// a path+size comparison, so the classification cannot be recovered later.
-	markVolatileFiles(&idx, volatileFileGlobs(image))
-	return idx, nil
+	return frozenIndex(walk, walkedAt, image), nil
 }
 
 // storeVolIndex writes a full capture's file index into the archive. A write
@@ -2480,7 +2497,7 @@ func (e *Engine) VolIndexCached(ctx context.Context, b *store.Backup) (VolIndex,
 	}
 	e.idxMu.Unlock()
 
-	idx, err := e.loadVolIndex(ctx, b)
+	idx, err := e.loadVolIndex(ctx, b, "")
 	if err != nil {
 		return VolIndex{}, false
 	}
@@ -2500,9 +2517,10 @@ func (e *Engine) VolIndexCached(ctx context.Context, b *store.Backup) (VolIndex,
 	return idx, true
 }
 
-// loadVolIndex reads and decodes a parent backup's stored file index (F61).
-func (e *Engine) loadVolIndex(ctx context.Context, parent *store.Backup) (VolIndex, error) {
-	data, err := e.extractEntry(ctx, parent, "", volumeIndexMember)
+// loadVolIndex reads and decodes a backup's stored file index (F61) from the copy
+// named by source; "" is auto, the same as every other archive read.
+func (e *Engine) loadVolIndex(ctx context.Context, b *store.Backup, source string) (VolIndex, error) {
+	data, err := e.extractEntry(ctx, b, source, volumeIndexMember)
 	if err != nil {
 		return VolIndex{}, err
 	}
@@ -2519,12 +2537,16 @@ func (e *Engine) loadVolIndex(ctx context.Context, parent *store.Backup) (VolInd
 	if err := json.Unmarshal(raw, &idx); err != nil {
 		return VolIndex{}, err
 	}
+	decodeOddPaths(idx.Entries)
+	decodeOddPaths(idx.Others)
 	return idx, nil
 }
 
 // writeVolIndex zstd-compresses the index JSON to work/volumes-index.json.zst so
 // it rides inside the (encrypted) archive as the diff base for the next delta (F61).
 func writeVolIndex(work string, idx VolIndex) error {
+	encodeOddPaths(idx.Entries)
+	encodeOddPaths(idx.Others)
 	raw, err := json.Marshal(idx)
 	if err != nil {
 		return err
@@ -2549,7 +2571,7 @@ func writeVolIndex(work string, idx VolIndex) error {
 // payload, F61) into dst, returning the SHA-256 of the plaintext payload for the
 // manifest. An empty file list yields an empty tar (a delta that only deletes).
 func (e *Engine) spoolVolumeTarFiles(ctx context.Context, cli *client.Client, id string, files []string, dst string) (string, error) {
-	rc, err := dockercli.TarVolumesFromList(ctx, cli, id, files)
+	rc, err := dockercli.TarVolumeEntries(ctx, cli, id, files)
 	if err != nil {
 		return "", err
 	}
@@ -3056,37 +3078,31 @@ func (e *Engine) writeManifestSidecar(ctx context.Context, be storage.Backend, k
 // confidential AND tamper-evident (GCM auth), so no separate signature is
 // needed and volume/DB names + digests are no longer exposed in the clear.
 func (e *Engine) writeManifestSidecarSealed(ctx context.Context, be storage.Backend, key string, manBytes []byte, seal bool) error {
-	if seal {
-		sealed, err := crypto.SealString(string(manBytes), e.MasterKey())
-		if err != nil {
+	sidecars, err := e.manifestSidecars(manBytes, seal)
+	if err != nil {
+		return err
+	}
+	for _, sidecar := range sidecars {
+		if _, err := be.Put(ctx, key+sidecar.suffix, bytes.NewReader(sidecar.body)); err != nil {
 			return err
 		}
-		_, err = be.Put(ctx, key+".manifest.json.enc", bytes.NewReader(sealed))
-		return err
 	}
-	if _, err := be.Put(ctx, key+".manifest.json", bytes.NewReader(manBytes)); err != nil {
-		return err
-	}
-	_, err := be.Put(ctx, key+".manifest.json.sig", strings.NewReader(crypto.SignManifest(manBytes, e.MasterKey())))
-	return err
+	return nil
 }
 
 // applyRetentionLock makes an uploaded copy read-only on a filesystem-like
-// destination (F97): the archive itself, plus whichever manifest sidecars were
-// actually written beside it.
-//
-// The ARCHIVE is the one that must succeed — it holds the data. A sidecar is
-// regenerable from the archive, and which ones exist depends on the destination's
-// sealing preference (F78), so a missing sidecar is not an error. Locking them
-// anyway matters because a manifest is the map to the archive: leaving it
-// writable would let an attacker rewrite the description of a copy they cannot
-// touch.
-func (e *Engine) applyRetentionLock(ctx context.Context, rl storage.RetentionLocker, key string, until time.Time) error {
+// destination (F97): the archive itself, plus the manifest sidecars this copy
+// requires. An envelope is the map to the archive and the only way into it, so a lock
+// that missed one is not a lock on this copy: leaving it writable would let an
+// attacker rewrite it. A sidecar the sealing preference never wrote is not asked for.
+func (e *Engine) applyRetentionLock(ctx context.Context, rl storage.RetentionLocker, key string, required []string, until time.Time) error {
 	if err := rl.LockUntil(ctx, key, until); err != nil {
 		return err
 	}
-	for _, suffix := range []string{".manifest.json", ".manifest.json.sig", ".manifest.json.enc"} {
-		_ = rl.LockUntil(ctx, key+suffix, until) // absent sidecars are expected
+	for _, suffix := range required {
+		if err := rl.LockUntil(ctx, key+suffix, until); err != nil {
+			return err
+		}
 	}
 	return nil
 }

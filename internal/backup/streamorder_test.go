@@ -112,7 +112,7 @@ func TestShortFreezeCopiesTheBulkBeforeTheHold(t *testing.T) {
 			"e.detectSQLite(", "e.copyLive(", "e.hold(", "e.copyFrozen(", "e.captureSQLite(", "\n\t\tdoResume()\n", "e.recordShortFreeze(",
 		}},
 		{"BackupStackConsistent", functionBody(t, string(stackSrc), "func (e *Engine) BackupStackConsistent("), []string{
-			"e.detectSQLite(", "e.copyLive(", `"pre")`, `case "pause":`, "e.copyFrozen(", "e.captureSQLite(", "\n\tresumeAll()\n\trunPost()\n", "sc.settleLiveCopy()",
+			"e.detectSQLite(", "e.copyLive(", `sc.hooks.runPre(ctx)`, `case "pause":`, "e.copyFrozen(", "e.captureSQLite(", "\n\tresumeAll()\n\trunPost()\n", "e.settleLiveCopy(sc)",
 		}},
 	} {
 		last := -1

@@ -74,6 +74,27 @@ describe("req() via api.*", () => {
     expect(path).not.toContain("services=");
   });
 
+  // Unlike the plan's comma-joined list, the restore itself takes one service= per
+  // member. A mismatch here is silent and reads as the whole stack on the server.
+  it("sends the stack restore's services and source copy in the query", async () => {
+    fetchMock.mockResolvedValue(resp(202, JSON.stringify({ status: "started" })));
+    await api.restoreStack("n1", "my stack", { services: ["db", "web"], source: "dest-nas", password: "pw" });
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const params = new URL(path, "http://dockback.test").searchParams;
+    expect(params.getAll("service")).toEqual(["db", "web"]);
+    expect(params.get("source")).toBe("dest-nas");
+    expect(params.has("password")).toBe(false);
+    expect(init.body).toContain("pw");
+  });
+
+  it("omits the stack restore's selectors when nothing narrows it", async () => {
+    fetchMock.mockResolvedValue(resp(202, JSON.stringify({ status: "started" })));
+    await api.restoreStack("n1", "proj", { snapshot: true });
+    const [path] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).not.toContain("service=");
+    expect(path).not.toContain("source=");
+  });
+
   // During an outage the body is whatever sits in front of the app. Reporting
   // the parser's complaint instead of the server's status is worst exactly when
   // a clear message matters most.

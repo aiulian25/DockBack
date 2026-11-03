@@ -517,6 +517,11 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "could not update password")
 		return
 	}
+	// A password change never proved the second factor, so with one enrolled it must
+	// not wipe the failed guesses at it.
+	if u.TOTPSecret == "" {
+		s.guard.reset(s.clientIP(r), username)
+	}
 
 	// Revoke ALL sessions (incl. current) + their CSRF entries, then mint a fresh
 	// session for this browser. Other devices are signed out; this token rotates.
@@ -774,6 +779,10 @@ func (s *Server) requireFreshAuth(w http.ResponseWriter, r *http.Request, body s
 // counter, or the lockout is only a lockout on the door it was written for.
 // Returns true when the password matched. On false it has ALREADY written the
 // response: 429 while locked out or while argon2 is saturated, 401 otherwise.
+//
+// A match clears nothing. The counters also bound guesses at the second factor, so
+// they are the caller's to clear once its whole action has succeeded: clearing them
+// here let anyone holding the password wipe its failures with every retry.
 func (s *Server) verifyAccountPassword(w http.ResponseWriter, r *http.Request, username, hash, password, surface string) bool {
 	ip := s.clientIP(r)
 	if d := s.guard.blocked(ip, username); d > 0 {
@@ -795,7 +804,6 @@ func (s *Server) verifyAccountPassword(w http.ResponseWriter, r *http.Request, u
 		errJSON(w, http.StatusUnauthorized, "password is incorrect")
 		return false
 	}
-	s.guard.reset(ip, username)
 	return true
 }
 

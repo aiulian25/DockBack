@@ -307,7 +307,11 @@ const rotationWaitInterval = time.Second
 // way queued jobs wait. It does not watch for a cancel: a run canceled while it
 // waits stops once the rotation is over. Call end when the run is over.
 func (s *Server) beginOutsideQueueRun(logID string) (end func()) {
-	end = func() { s.outsideQueueRuns.Add(-1) }
+	endOp := s.beginOp()
+	end = func() {
+		s.outsideQueueRuns.Add(-1)
+		endOp()
+	}
 	if s.countOutsideQueueRun() {
 		return end
 	}
@@ -373,7 +377,7 @@ func (s *Server) takeEligible() (*queuedJob, *dynSem, time.Duration) {
 	// A key rotation is re-wrapping every stored data key; a backup started now
 	// would be sealed with the outgoing key and never re-wrapped, leaving it
 	// permanently "Key mismatch" (F16). Leave everything queued until it is done.
-	if s.rotating.Load() {
+	if s.rotating.Load() || s.isStopping() {
 		return nil, nil, 0
 	}
 	s.queueMu.Lock()
@@ -481,12 +485,18 @@ func (s *Server) runQueued(j *queuedJob, nsem *dynSem) {
 	}()
 	// The job is no longer pending once it finishes (ran or canceled-while-queued):
 	// drop its durable row so a restart doesn't re-run it.
-	defer func() { _ = s.store.DeleteQueuedJob(id) }()
+	keepForNextStart := false
+	defer func() {
+		if !keepForNextStart {
+			_ = s.store.DeleteQueuedJob(id)
+		}
+	}()
+	defer s.beginOp()()
 
 	// Generous safety cap so a large backup over a slow link can finish; the
 	// upload has its own no-progress stall guard. Background context — a user
 	// navigating away never affects an in-flight backup.
-	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+	ctx, cancel := context.WithTimeout(s.rootContext(), 24*time.Hour)
 	defer cancel()
 
 	// Wire up cancellation; bail out if it was canceled while still queued.
@@ -508,6 +518,14 @@ func (s *Server) runQueued(j *queuedJob, nsem *dynSem) {
 		s.logSink(id, "INFO", "Backup canceled by user")
 		s.metrics.recordBackup(false)
 		s.pushBackupStatus(id, j.opts.NodeID, "canceled")
+		return
+	}
+	// Cut short by DockBack stopping, not failed: it is kept to run again at the
+	// next start, as it would be after a crash, and the row goes the same way.
+	if err != nil && s.isStopping() {
+		keepForNextStart = true
+		_ = s.store.SetBackupStatus(id, "failed", store.BackupInterruptedByRestart)
+		s.logSink(id, "WARN", "Backup interrupted by DockBack stopping — it runs again at the next start")
 		return
 	}
 	if err != nil {

@@ -38,6 +38,12 @@ type Manifest struct {
 	ConsistencyGroup string `json:"consistency_group,omitempty"`
 	ConsistencyAt    int64  `json:"consistency_at,omitempty"`
 
+	// QuiesceRequested and QuiesceAchieved say how the container was to be held for
+	// the copy, and how it was. Quiesce* values. Absent on older backups, which
+	// means unknown, not live.
+	QuiesceRequested string `json:"quiesce_requested,omitempty"`
+	QuiesceAchieved  string `json:"quiesce_achieved,omitempty"`
+
 	TargetName  string `json:"target_name"`
 	ContainerID string `json:"container_id"`
 
@@ -82,7 +88,10 @@ type Manifest struct {
 	Incremental        bool     `json:"incremental,omitempty"`
 	ChainDepth         int      `json:"chain_depth,omitempty"`
 	Deleted            []string `json:"deleted,omitempty"`
-	VolIndex           string   `json:"vol_index,omitempty"`
+	// Replaced lists paths that changed type since Parent. A file cannot be
+	// extracted over a directory, so these go before this delta is extracted.
+	Replaced []string `json:"replaced,omitempty"`
+	VolIndex string   `json:"vol_index,omitempty"`
 	// Suspect (F69 ransomware tripwire): the human reason this delta touched an
 	// abnormal share of the volume ("" = clean). The backup still succeeds — the
 	// flag drives the critical alert + retention hold, never a failure.
@@ -977,6 +986,9 @@ const (
 	// findingRestartPolicyNotBootSafe — this container will not come back when
 	// the host reboots (#8).
 	findingRestartPolicyNotBootSafe = "restart-policy-not-boot-safe"
+	// findingCaptureOverridden: a saved per-service choice an app-consistent
+	// snapshot cannot honour, said on the archive instead of dropped.
+	findingCaptureOverridden = "capture-overridden"
 
 	// findingHealthcheckCannotFail — this container's health probe passes when
 	// the thing it checks is broken (#35).

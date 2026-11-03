@@ -166,7 +166,7 @@ func TestOnlyOneRotationHoldsTheQueue(t *testing.T) {
 // keys the restore was reading and missing the snapshot it was sealing.
 func TestRotationRefusedWhileARestoreRuns(t *testing.T) {
 	s := rotateTestServer(t)
-	_, finish, ok := s.beginRestoreRun(context.Background(), "b1", "web", "", time.Minute)
+	_, finish, ok := s.beginRestoreRun(context.Background(), "b1", "web", "", time.Minute, "")
 	if !ok {
 		t.Fatal("the restore was not registered")
 	}

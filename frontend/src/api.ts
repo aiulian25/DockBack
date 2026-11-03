@@ -377,6 +377,15 @@ export interface NotifyConfig {
   head_beacon: { enabled: boolean; interval_hours: number };
   digest: { enabled: boolean; time: string; success_mode: string; include_dr?: boolean }; // F15: daily summary; F60: DR confidence
 }
+export interface NotifyConfigResponse {
+  config: NotifyConfig;
+  gotify_token_set: boolean;
+  email_password_set: boolean;
+  webhook_url_set: boolean;
+  webhook_url_host: string;
+  heartbeat_url_set: boolean;
+  heartbeat_url_host: string;
+}
 export const emptyNotifyConfig: NotifyConfig = {
   gotify: { enabled: false, on_success: false, on_failure: true, min_severity: "", url: "", token: "", priority: 8 },
   email: { enabled: false, on_success: false, on_failure: true, min_severity: "", host: "", port: 587, username: "", password: "", from: "", to: "" },
@@ -435,8 +444,8 @@ export interface StackScheduleTiming {
 }
 export interface RetentionPreview {
   active: boolean; total_prune: number; total_prune_bytes: number;
-  targets: { node_id: string; node_name: string; target: string; keep: number; prune: number; prune_bytes: number;
-    items: { id: string; created_at: number; size_bytes: number; verified: string; action: string; pinned?: boolean; label?: string }[] }[];
+  targets: { node_id: string; node_name: string; target: string; keep: number; prune: number; prune_bytes: number; held?: boolean; no_known_good?: boolean;
+    items: { id: string; created_at: number; size_bytes: number; verified: string; action: string; pinned?: boolean; label?: string; reason?: string }[] }[];
 }
 
 // Insights aggregate (B6): trends/analytics computed from data already collected.
@@ -741,10 +750,12 @@ export interface ExportPreset {
 }
 // F100: one in-flight restore. `id` is the run id the log stream and the cancel
 // endpoint both key on: the backup id, "stack:<project>" or "node:<nodeId>".
-export interface RunningRestore { id: string; label: string; started_at: number; }
+export interface RunningRestore { id: string; execution_id?: string; label: string; started_at: number; }
 // F70 universal file index: cross-backup file search + generation diff.
 export interface FileSearchHit { backup_id: string; created_at: number; target: string; path: string; size: number; mtime: number; }
-export interface FileSearchResp { results: FileSearchHit[]; searched: number; skipped: number; truncated?: boolean; }
+// One page of a file search. next_cursor carries on into older history; without one,
+// nothing older is left, unless truncated says the hit cap stopped the page.
+export interface FileSearchResp { results: FileSearchHit[]; searched: number; skipped: number; truncated?: boolean; scanned?: number; next_cursor?: string; }
 export interface BackupDiffEntry { path: string; size: number; prev_size?: number; }
 export interface BackupDiffResp {
   a: { id: string; created_at: number }; b: { id: string; created_at: number };
@@ -1009,7 +1020,7 @@ export const api = {
   // cross-host grammar the stack dialog uses. Everything is in the body — the
   // offline key and the password have no business in a URL.
   restoreNodeAll: (id: string, opts?: StepUpCreds & {
-    skip_blocked?: boolean; target_node?: string; private_key?: string;
+    skip_blocked?: boolean; target_node?: string; private_key?: string; execution_id?: string;
     // F227: which services this run covers, by their plan label. Omitted = all.
     services?: string[];
     reconstruct_host?: boolean; host_base_dir?: string;
@@ -1260,7 +1271,7 @@ export const api = {
   // F100: which restores are in flight, so a page reloaded mid-restore can
   // re-attach to the run and offer Cancel again.
   runningRestores: () => req<{ running: RunningRestore[] }>("GET", "/api/restores"),
-  restore: async (id: string, body: { node_id: string; target_id: string; volumes: boolean; database: boolean; confirm: boolean; snapshot?: boolean; recreate?: boolean; promote_restart_policy?: boolean; inject_healthchecks?: boolean; source?: string; confirm_incompatible?: boolean; confirm_unverified?: boolean; confirm_missing_devices?: boolean; confirm_missing_networks?: boolean; allow_different_image?: boolean; files_only?: boolean; test_clone?: boolean; as_name?: string; isolated?: boolean; reconstruct_host?: boolean; host_base_dir?: string; remap_ip?: boolean; remap_from_ip?: string; remap_to_ip?: string; remap_domain?: boolean; remap_from_domain?: string; remap_to_domain?: string; remap_path?: boolean; remap_from_path?: string; remap_to_path?: string; new_site_address?: string; new_upstream_address?: string; private_key?: string; password?: string; code?: string }): Promise<{ status: string }> => {
+  restore: async (id: string, body: { execution_id?: string; node_id: string; target_id: string; volumes: boolean; database: boolean; confirm: boolean; snapshot?: boolean; recreate?: boolean; promote_restart_policy?: boolean; inject_healthchecks?: boolean; source?: string; confirm_incompatible?: boolean; confirm_unverified?: boolean; confirm_missing_devices?: boolean; confirm_missing_networks?: boolean; allow_different_image?: boolean; files_only?: boolean; test_clone?: boolean; as_name?: string; isolated?: boolean; reconstruct_host?: boolean; host_base_dir?: string; remap_ip?: boolean; remap_from_ip?: string; remap_to_ip?: string; remap_domain?: boolean; remap_from_domain?: string; remap_to_domain?: string; remap_path?: boolean; remap_from_path?: string; remap_to_path?: string; new_site_address?: string; new_upstream_address?: string; private_key?: string; password?: string; code?: string }): Promise<{ status: string }> => {
     const res = await fetch(`/api/backups/${id}/restore`, {
       method: "POST", credentials: "same-origin",
       headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf() },
@@ -1313,8 +1324,8 @@ export const api = {
   // F21: browse a backup's files, and a per-file download URL.
   backupEntries: (id: string) => req<{ entries: ArchiveEntry[] }>("GET", `/api/backups/${id}/entries`),
   // F70 universal file index: cross-backup file search + generation diff (index-only reads).
-  searchFile: (nodeId: string, q: string, target?: string) =>
-    req<FileSearchResp>("GET", `/api/backups/search-file${qstr({ node_id: nodeId, q, target })}`),
+  searchFile: (nodeId: string, q: string, target?: string, cursor?: string) =>
+    req<FileSearchResp>("GET", `/api/backups/search-file${qstr({ node_id: nodeId, q, target, cursor })}`),
   diffBackups: (a: string, b: string) => req<BackupDiffResp>("GET", `/api/backups/diff${qstr({ a, b })}`),
   backupExtractURL: (id: string, path: string, ticket: string) =>
     `/api/backups/${id}/extract?path=${encodeURIComponent(path)}&ticket=${encodeURIComponent(ticket)}`,
@@ -1370,8 +1381,9 @@ export const api = {
     req<{ ok: boolean; reason: string; head_id: number; current_head_id: number }>(
       "POST", "/api/audit/verify-beacon", { head_id, chain }),
 
-  getNotifications: () => req<{ config: NotifyConfig; gotify_token_set: boolean; email_password_set: boolean }>("GET", "/api/notifications"),
-  setNotifications: (c: NotifyConfig) => req<{ config: NotifyConfig; gotify_token_set: boolean; email_password_set: boolean }>("PUT", "/api/notifications", c),
+  getNotifications: () => req<NotifyConfigResponse>("GET", "/api/notifications"),
+  // A blank URL keeps what is stored; clearSecrets removes it.
+  setNotifications: (c: NotifyConfig, clearSecrets: string[] = []) => req<NotifyConfigResponse>("PUT", "/api/notifications", { ...c, clear_secrets: clearSecrets }),
   testNotification: (channel: string, config: NotifyConfig) => req<{ status: string }>("POST", "/api/notifications/test", { channel, config }),
   // Backup-page nudge: show the "set up notifications" hint only when no channel
   // is configured and the user hasn't dismissed it.

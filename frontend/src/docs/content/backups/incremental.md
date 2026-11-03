@@ -19,10 +19,10 @@ On a container's page, under **Backup options**, tick **Incremental volume captu
 Each incremental backup is a normal encrypted `.dback` archive, so nothing about security changes. Inside it carries:
 
 - **`volumes-delta.tar`** — only the changed files (instead of the full `volumes.tar`).
-- **`volumes-index.json.zst`** — the *complete* file list (path, size, modified-time) as of this backup, which the next delta diffs against.
+- **`volumes-index.json.zst`** — the *complete* inventory (every file, directory and link, with size, times, mode and owner) as of this backup, which the next delta diffs against.
 - Manifest fields recording the **parent** backup, the **chain depth**, the **deleted** paths, and a cryptographic **pin** of the parent (so a substituted or corrupt parent is detected, not blindly trusted).
 
-A file counts as *changed* when it's new or its **size or modified-time** differs from the parent. Changing the mount selection, or an unreadable index, safely forces a fresh full baseline rather than risk a wrong delta.
+An entry counts as *changed* when it's new or its **size, modified-time, change-time, permissions or owner** differs from the parent, so a `chmod`, a `chown`, a new empty directory, a replaced link, or a same-size write that puts the old modified-time back all land in the delta. The change-time comes from the kernel, which is what makes it hard to hide from. It counts whole seconds, so anything that changed in the same second as the previous backup's listing is copied again. An app that runs `chown -R` at every start therefore makes its next delta large, though that doesn't trip the mass-change alarm, which looks at content only. A listing that can't be completed, a parent from before this inventory existed, or a changed or removed name a delta can't carry (one with a newline in it, say) forces a **true full** instead, and that full becomes the new baseline. Changing the mount selection, or an unreadable index, safely forces a fresh full baseline rather than risk a wrong delta.
 
 > **The index is now universal.** Ordinary (non-incremental) full backups store the same `volumes-index.json.zst` too (on by default; *Settings → Performance & tuning → "Store a file index in every backup"*). It's what powers **Find a file** across backup generations, **Compare with previous** in a backup's drawer, and file browsing that never truncates — all from one small index read, without decrypting the whole archive. Backups made before indexing existed still browse via the slower streaming path and are simply skipped by search/diff.
 
@@ -30,7 +30,7 @@ A file counts as *changed* when it's new or its **size or modified-time** differ
 
 You restore an incremental backup exactly like any other — pick a version and click **Restore**. DockBack resolves the chain and, behind the scenes, applies the **full baseline first, then each delta in order**, removing files that were deleted along the way, so the container ends at the exact state of the version you chose. The restore drawer shows a short note; if a chain link is missing or fails verification, it warns you and you can pick the newest full baseline or a later generation instead.
 
-Restore drills and verification are chain-aware too: verification checks that a delta's parent still exists and matches its pin, so a broken chain is caught **before** you rely on it, not during a restore.
+Restore drills and verification are chain-aware too: verification checks that a delta's parent still exists and matches its pin, and a drill of a delta puts the whole chain back together and test-restores that state. A broken chain is caught **before** you rely on it, not during a restore, and the drill names the missing ancestor.
 
 ## Retention keeps chains whole
 

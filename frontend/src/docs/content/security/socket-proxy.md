@@ -23,18 +23,21 @@ POST: 1         # allow mutating calls: create / start / stop / exec / wait
 
 ## What's deliberately *not* enabled
 
-Anything outside this list — for example arbitrary host-level operations the proxy can gate — is not granted. The proxy is the boundary that keeps a powerful tool from becoming host root.
+Anything outside this list is refused, for example swarm, secrets, plugins and system-wide operations. That narrows what a mistake or a bug in DockBack can reach.
+
+It does **not** stop the proxy from being host root. `CONTAINERS` and `POST` together let a caller create a container that mounts the host's root filesystem, or runs privileged, and start it. Anyone who can reach a proxy with this whitelist can take over that host. Treat its port exactly like the raw Docker socket: reachable from DockBack and nothing else.
 
 ## Hardening the deployment
 
 - The raw socket is mounted **read-only** into the proxy only, never into DockBack.
+- **Keep Docker Engine patched on every node: 29.5.1 or later.** The proxy chooses which API calls get through, but it passes those calls to the daemon unchanged, so a daemon bug reachable through them is not stopped by it. 29.5.1 fixes the `docker cp` archive flaws (CVE-2026-41567, CVE-2026-41568, CVE-2026-42306), and 29.3.1 the AuthZ and plugin-privilege ones (CVE-2026-34040, CVE-2026-33997). Check a node with `docker version --format '{{.Server.Version}}'`.
 - DockBack talks to the local proxy over a **private, internal-only** Docker network.
-- For remote proxies, **firewall the port to the DockBack host** and never expose it publicly (*Connecting Servers → A remote Linux server*).
+- For remote proxies, **bind the port to a private overlay address** (WireGuard or Tailscale), never to all interfaces, and check that other machines are refused (*Connecting Servers → A remote Linux server*). A host firewall is not enough on its own: Docker's rules for published ports skip UFW's usual ones.
 - The DockBack app container itself runs **non-root, read-only rootfs, all Linux capabilities dropped, `no-new-privileges`**, and under a **custom seccomp allow-list** (`deploy/seccomp.json`) that permits only the syscalls a static Go/SQLite server needs — stricter than Docker's default. Remove that one `security_opt` line to fall back to the default profile.
 
 ## Ready-to-use compose for a remote node
 
-Run this on any host (or NAS) you want DockBack to manage, then add it as a *Remote socket-proxy (tcp)* node pointing at `tcp://<host-ip>:2375`. Project: [tecnativa/docker-socket-proxy](https://github.com/tecnativa/docker-socket-proxy).
+Run this on any host (or NAS) you want DockBack to manage, then add it as a *Remote socket-proxy (tcp)* node pointing at `tcp://<overlay-ip>:2375`. Replace `<overlay-ip>` with the host's WireGuard or Tailscale address; Compose refuses to start until you do. Project: [tecnativa/docker-socket-proxy](https://github.com/tecnativa/docker-socket-proxy).
 
 ```yaml
 services:
@@ -42,7 +45,7 @@ services:
     image: tecnativa/docker-socket-proxy:0.3.0
     restart: unless-stopped
     ports:
-      - "2375:2375"
+      - "<overlay-ip>:2375:2375"
     environment:
       CONTAINERS: 1
       IMAGES: 1
@@ -64,7 +67,7 @@ networks:
     driver: bridge
 ```
 
-> Keep `2375` firewalled to only the DockBack host — it speaks the Docker API.
+> This port is root on that host. Before adding the node, check it from a machine other than the DockBack host and make sure the connection is refused (*A remote Linux server → Check who can reach it*). No overlay? Use SSH or daemon mTLS instead.
 
 ## Volume sidecar image pinning
 

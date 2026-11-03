@@ -38,3 +38,5 @@ func TestLocalCapacity(t *testing.T) {
 		t.Fatal("Local must satisfy storage.Capacity")
 	}
 }
+
+var _ Versioned = (*S3)(nil)

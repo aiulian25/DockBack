@@ -595,18 +595,21 @@ func (s *Server) handleRetentionPreview(w http.ResponseWriter, r *http.Request) 
 		CreatedAt int64  `json:"created_at"`
 		SizeBytes int64  `json:"size_bytes"`
 		Verified  string `json:"verified"`
-		Action    string `json:"action"`          // keep | prune
-		Pinned    bool   `json:"pinned"`          // F2: kept because it is pinned ("keep forever")
-		Label     string `json:"label,omitempty"` // F48: so the UI can badge "auto:" snapshots
+		Action    string `json:"action"`           // keep | prune
+		Pinned    bool   `json:"pinned"`           // F2: kept because it is pinned ("keep forever")
+		Label     string `json:"label,omitempty"`  // F48: so the UI can badge "auto:" snapshots
+		Reason    string `json:"reason,omitempty"` // why a backup the policy would prune stays
 	}
 	type targetView struct {
-		NodeID     string     `json:"node_id"`
-		NodeName   string     `json:"node_name"`
-		Target     string     `json:"target"`
-		Keep       int        `json:"keep"`
-		Prune      int        `json:"prune"`
-		PruneBytes int64      `json:"prune_bytes"`
-		Items      []itemView `json:"items"`
+		NodeID      string     `json:"node_id"`
+		NodeName    string     `json:"node_name"`
+		Target      string     `json:"target"`
+		Keep        int        `json:"keep"`
+		Prune       int        `json:"prune"`
+		PruneBytes  int64      `json:"prune_bytes"`
+		Held        bool       `json:"held,omitempty"`
+		NoKnownGood bool       `json:"no_known_good,omitempty"`
+		Items       []itemView `json:"items"`
 	}
 	nodeName := map[string]string{}
 	out := []targetView{}
@@ -619,10 +622,14 @@ func (s *Server) handleRetentionPreview(w http.ResponseWriter, r *http.Request) 
 		if cfg.Active() {
 			anyActive = true
 		}
-		keep, prune := backup.SelectForRetention(list, cfg)
-		keepSet := map[string]bool{}
-		for _, b := range keep {
-			keepSet[b.ID] = true
+		plan, perr := s.engine.PlanRetention(k.node, k.target, list, cfg)
+		if perr != nil {
+			// The sweep skips this target for the same error, so nothing goes.
+			plan = backup.RetentionPlan{Keep: list}
+		}
+		pruneSet := map[string]bool{}
+		for _, b := range plan.Prune {
+			pruneSet[b.ID] = true
 		}
 		nn, ok := nodeName[k.node]
 		if !ok {
@@ -631,14 +638,14 @@ func (s *Server) handleRetentionPreview(w http.ResponseWriter, r *http.Request) 
 			}
 			nodeName[k.node] = nn
 		}
-		tv := targetView{NodeID: k.node, NodeName: nn, Target: k.target, Keep: len(keep), Prune: len(prune)}
+		tv := targetView{NodeID: k.node, NodeName: nn, Target: k.target, Keep: len(plan.Keep), Prune: len(plan.Prune), Held: plan.Held, NoKnownGood: plan.NoKnownGood}
 		for _, b := range list {
 			action := "keep"
-			if !keepSet[b.ID] {
+			if pruneSet[b.ID] {
 				action = "prune"
 				tv.PruneBytes += b.SizeBytes
 			}
-			tv.Items = append(tv.Items, itemView{ID: b.ID, CreatedAt: b.CreatedAt, SizeBytes: b.SizeBytes, Verified: b.Verified, Action: action, Pinned: b.Pinned, Label: b.Label})
+			tv.Items = append(tv.Items, itemView{ID: b.ID, CreatedAt: b.CreatedAt, SizeBytes: b.SizeBytes, Verified: b.Verified, Action: action, Pinned: b.Pinned, Label: b.Label, Reason: plan.Reasons[b.ID]})
 		}
 		totalPrune += tv.Prune
 		totalBytes += tv.PruneBytes

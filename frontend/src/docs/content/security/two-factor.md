@@ -23,12 +23,12 @@ Enter your username + password as usual; you'll then be asked for the **authenti
 
 ## Disable it
 
-**Settings → Two-Factor Authentication → Disable 2FA**, then confirm with your password. This clears the secret and all recovery codes.
+**Settings → Two-Factor Authentication → Disable 2FA**, then confirm with your password **and** a current code or a recovery code. This clears the secret and all recovery codes.
 
 ## Security notes
 
 - The TOTP secret is **encrypted at rest** with your master key; recovery codes are stored only as one-time hashes.
-- Wrong codes count toward the **login lockout** (the same per-IP/account throttle as passwords), so the 6-digit code can't be brute-forced.
+- Wrong codes count toward the **login lockout** (the same per-IP/account throttle as passwords), so the 6-digit code can't be brute-forced. A correct password doesn't clear those failures: they clear only after a sign-in or a 2FA disable that also passes the code.
 - Behind a reverse proxy, set `DOCKBACK_TRUST_PROXY` (and `DOCKBACK_TRUSTED_PROXIES`) so the lockout sees real client IPs — see *Socket-proxy permissions* / deployment notes.
 
 ## Locked out (no app, no recovery codes)

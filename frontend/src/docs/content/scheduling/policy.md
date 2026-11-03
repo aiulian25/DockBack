@@ -32,7 +32,9 @@ DockBack takes **protective snapshots automatically** before a risky change — 
 
 ## How retention chooses what to keep
 
-- Only **verified** backups count toward the kept set, so a failed/corrupt run never displaces a good one.
+- A backup that **failed verification** doesn't count toward the kept set, so a failed or corrupt run never displaces a good one. The newest backup always stays, even if it failed, as evidence of what happened; older failed ones are pruned. If every backup of a container failed, none is pruned, because one of them may be all that's left.
+- The **last healthy backup is always kept**: if your rules would keep nothing verified, the newest backup whose whole chain verified stays too, on top of your count. That can keep more than the number you set, and the preview says so.
+- A backup with **no verdict yet** (still being verified, or adopted from existing archives) counts like any other, but can't displace the last healthy one. If a container has nothing verified at all, the preview tells you.
 - Pruning is **per container** (node + container name), so each app keeps its own N most-recent copies.
 - Each backup shows its retention state in the UI: **Keep (N gen)** for copies within the limit, **Prunable** for ones that will be removed.
 

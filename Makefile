@@ -17,7 +17,7 @@ TRIVY_IMAGE    ?= aquasec/trivy:latest
 GRYPE_IMAGE    ?= anchore/grype:latest
 SYFT_IMAGE     ?= anchore/syft:latest
 HADOLINT_IMAGE ?= hadolint/hadolint:latest
-GOVULN         ?= golang.org/x/vuln/cmd/govulncheck@latest
+GOVULN         ?= golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
 DOCKER_RUN := docker run --rm
 
@@ -67,8 +67,10 @@ scan-dockerfile:
 
 ## scan-go: govulncheck — reachable vulns in Go modules (allowlist for no-fix advisories).
 scan-go:
+	@echo "▶ govulncheck wrapper contract"
+	sh scripts/test-govulncheck.sh
 	@echo "▶ govulncheck (Go)"
-	sh scripts/govulncheck.sh
+	GOVULN=$(GOVULN) sh scripts/govulncheck.sh
 
 ## scan-npm: npm audit on production frontend deps (high+ fails).
 scan-npm:

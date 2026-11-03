@@ -45,7 +45,7 @@ It also means **only one server may carry the identity at a time.** For a migrat
 
 "Restore as a copy" is how you rehearse a restore without touching production — an isolated container, fresh volumes, no published ports. That isolation is about your network, and it says nothing about what the copy can reach *outbound*. A copy of Plex needs nothing more than internet access to announce itself as the server you are still running.
 
-So before an isolated copy of Plex is started, DockBack clears the account token and publishing key **from the copy's own throwaway data**. The copy comes up, you can check its database and its artwork, and it cannot reach your Plex account or contend with the real server.
+So before an isolated copy of Plex is started for the first time, DockBack clears the account token and publishing key **from the copy's own throwaway data**, using a small helper container with no network that can reach only the copy's own volumes. The copy comes up, you can check its database and its artwork, and it cannot reach your Plex account or contend with the real server.
 
 Two details worth knowing:
 

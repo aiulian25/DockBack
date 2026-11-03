@@ -16,13 +16,15 @@ const transports = [
 ];
 
 // Ready-to-run docker-socket-proxy compose for a remote host / NAS. Grants
-// exactly what DockBack needs. Keep port 2375 firewalled to the DockBack host.
+// exactly what DockBack needs, which is root on that host, so the port is bound
+// to an overlay address the operator must fill in: Compose refuses the
+// placeholder, and a firewall such as UFW does not filter Docker-published ports.
 const SOCKET_PROXY_COMPOSE = `services:
   socket-proxy:
     image: tecnativa/docker-socket-proxy:0.3.0
     restart: unless-stopped
     ports:
-      - "2375:2375"
+      - "<overlay-ip>:2375:2375"
     environment:
       CONTAINERS: 1
       IMAGES: 1
@@ -65,7 +67,7 @@ function ComposeSnippet() {
           </button>
         </div>
         <pre className="max-h-56 overflow-auto rounded bg-surface px-3 py-2 font-mono text-[11px] leading-relaxed text-on-surface-variant">{SOCKET_PROXY_COMPOSE}</pre>
-        <p className="mt-1 text-on-surface-variant">Run <span className="font-mono">docker compose up -d</span> on the host, firewall <span className="font-mono">2375</span> to this server, then set the address to <span className="font-mono">tcp://&lt;host-ip&gt;:2375</span>.</p>
+        <p className="mt-1 text-on-surface-variant">This port is root on that host. Replace <span className="font-mono">&lt;overlay-ip&gt;</span> with its WireGuard or Tailscale address, run <span className="font-mono">docker compose up -d</span>, and check that another machine on your LAN is refused. Then set the address to <span className="font-mono">tcp://&lt;overlay-ip&gt;:2375</span>. No overlay? Use SSH or Daemon mTLS.</p>
       </div>
     </details>
   );

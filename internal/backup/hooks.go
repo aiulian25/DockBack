@@ -3,16 +3,23 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/client"
 
 	"dockback/internal/dockercli"
+	"dockback/internal/notify"
+	"dockback/internal/store"
 )
 
 // Hook is a single command run inside the target container around a backup
 // (application-aware quiesce, PLAN §9.5).
 type Hook struct {
+	// preset marks a built-in hook, which also runs on containers it does not apply
+	// to: a post-hook failing after its pre-hook failed the same way says nothing.
+	preset  bool
 	Cmd     []string
 	User    string
 	WorkDir string
@@ -187,7 +194,7 @@ func (e *Engine) gatherHooks(image, nodeID, name string) (pre, post []Hook) {
 			if on {
 				mode = "--on"
 			}
-			return Hook{Cmd: []string{"php", "occ", "maintenance:mode", mode}, User: "www-data", WorkDir: "/var/www/html", Ignore: true}
+			return Hook{preset: true, Cmd: []string{"php", "occ", "maintenance:mode", mode}, User: "www-data", WorkDir: "/var/www/html", Ignore: true}
 		}
 		pre = append(pre, nc(true))
 		post = append(post, nc(false))
@@ -213,6 +220,94 @@ func (e *Engine) gatherHooks(image, nodeID, name string) (pre, post []Hook) {
 		}
 	}
 	return pre, post
+}
+
+// hookCleanupTimeout bounds a window's post-hooks, on their own context: they have
+// to run after a canceled or expired backup too.
+const hookCleanupTimeout = 5 * time.Minute
+
+// hookBracket is one run's pre-hooks and the post-hooks that undo them.
+//
+// Armed before the first pre-hook runs, because a hook that changed state and then
+// exited nonzero still needs undoing, and released once, as soon as the capture is
+// done: an application held in maintenance through compression and upload is down
+// for far longer than the copy needed. Journaled, so a process that dies inside the
+// window has its post-hooks run at the next start.
+type hookBracket struct {
+	e                                *Engine
+	cli                              *client.Client
+	nodeID, containerID, name, image string
+	opID                             string
+	pre, post                        []Hook
+	exec                             func(ctx context.Context, h Hook) error
+	armed, released, presetPreFailed bool
+}
+
+func (e *Engine) newHookBracket(cli *client.Client, nodeID, containerID, name, image, opID string, pre, post []Hook) *hookBracket {
+	return &hookBracket{
+		e: e, cli: cli, nodeID: nodeID, containerID: containerID, name: name, image: image, opID: opID, pre: pre, post: post,
+		exec: func(ctx context.Context, h Hook) error {
+			_, err := dockercli.ExecHook(ctx, cli, containerID, h.Cmd, h.User, h.WorkDir)
+			return err
+		},
+	}
+}
+
+func (b *hookBracket) journalID() string { return holdRowID(b.opID, holdKindHooks+":"+b.containerID) }
+
+// runPre runs the pre-hooks, stopping at the first that fails for real. The release
+// is armed from before the first one, whatever happens here.
+func (b *hookBracket) runPre(ctx context.Context) error {
+	if len(b.pre) == 0 {
+		return nil
+	}
+	b.armed = true
+	_ = b.e.Store.AddWorkloadHold(store.WorkloadHold{
+		ID: b.journalID(), NodeID: b.nodeID, ContainerID: b.containerID, Name: b.name,
+		Kind: holdKindHooks, State: holdStateAcquired, Detail: b.image, CreatedAt: time.Now().Unix(),
+	})
+	for _, h := range b.pre {
+		b.e.logf(b.opID, "INFO", "pre-hook: %s", strings.Join(h.Cmd, " "))
+		err := b.exec(ctx, h)
+		if err == nil {
+			continue
+		}
+		if !h.Ignore {
+			return err
+		}
+		b.e.logf(b.opID, "WARN", "pre-hook failed (ignored): %v", err)
+		b.presetPreFailed = b.presetPreFailed || h.preset
+	}
+	return nil
+}
+
+// release runs the post-hooks once, on its own context. A failure does not fail a
+// backup that captured its data, but somebody has to hear about an application
+// that may still be in maintenance.
+func (b *hookBracket) release() {
+	if !b.armed || b.released {
+		return
+	}
+	b.released = true
+	ctx, cancel := context.WithTimeout(context.Background(), hookCleanupTimeout)
+	defer cancel()
+	var failed []string
+	for _, h := range b.post {
+		b.e.logf(b.opID, "INFO", "post-hook: %s", strings.Join(h.Cmd, " "))
+		err := b.exec(ctx, h)
+		if err == nil {
+			continue
+		}
+		b.e.logf(b.opID, "WARN", "post-hook failed: %v", err)
+		if !(h.preset && b.presetPreFailed) {
+			failed = append(failed, fmt.Sprintf("%s: %v", strings.Join(h.Cmd, " "), err))
+		}
+	}
+	_ = b.e.Store.DeleteWorkloadHold(b.journalID())
+	if len(failed) > 0 {
+		b.e.notify(notify.KindBackupFailed, "Post-backup hook failed: "+b.name,
+			fmt.Sprintf("A hook that ends %s's backup window failed, so it may still be in the state its pre-hook left it in, such as maintenance mode. Check it. %s", b.name, strings.Join(failed, "; ")))
+	}
 }
 
 // runHook executes one hook, honoring its Ignore flag.

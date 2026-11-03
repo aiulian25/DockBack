@@ -64,9 +64,13 @@ The common disaster isn't a dead machine. It's a deleted folder: a stack manager
 
 - your **compose file** and **`.env`**, with the reconstruction beside them (see below);
 - the project's **other files**: scripts, READMEs, extra env files (see *What a backup holds* below);
-- every **single-file bind** that is missing, such as a key or a licence, with its recorded owner and mode.
+- every **single-file bind** that is missing, such as a key or a licence, with its recorded owner and mode. It goes to the path the container mounts it from now, even if a redeploy has moved it since the backup.
 
-No container is stopped, restarted or changed, and **nothing that exists is overwritten**. A file still there is kept as it is, and the log says so.
+A full restore writes single-file binds the same way, to where the container mounts them. It stops the container first: if the container can't be stopped, the restore fails before any file is written. A file that can't be written also fails the restore.
+
+No container is stopped, restarted or changed, and **nothing that exists is overwritten**. A file still there is kept as it is, and the log says so. That includes a compose file or `.env` you edited after the backup: they aren't renamed aside or replaced, and the backup's copies stay in the archive. A full restore is different, because it puts back what the stack ran from: a different file there is renamed aside, never deleted.
+
+If any file can't be written, the files-only restore **fails** and names each one, instead of reporting success.
 
 Files only brings back **no data**. A bind-mounted data folder that was deleted is still held open by its running container, so it looks fine until that container restarts onto an empty folder. The restore names every such folder in its log. Run a full restore for those before the container restarts.
 
@@ -207,7 +211,7 @@ A container that is *reachable but at the wrong address* is recoverable; one tha
 
 **Only pinned addresses are restored.** A container that took whatever address Docker handed it stays dynamic — recording the lease it happened to hold would make it fail to restore the moment that address was in use.
 
-**Isolated clones get none of this.** A clone deliberately stays on its throwaway network and never claims the original's addresses.
+**Isolated clones get none of this.** A clone deliberately has no network and never claims the original's addresses.
 
 ### A logging driver the target host does not have
 

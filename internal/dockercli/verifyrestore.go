@@ -17,6 +17,21 @@ import (
 	"github.com/docker/docker/client"
 )
 
+// What one drill's throwaway container may use. A drill shares the node with the
+// workloads it protects, so it is held to a budget: generous enough for a database
+// import or an application's first start, small enough that it cannot starve the
+// host. A drill that needs more fails visibly rather than taking it.
+const (
+	drillMemoryBytes = 2 << 30
+	drillNanoCPUs    = 2_000_000_000
+	drillPidsLimit   = 1024
+)
+
+func drillResources() container.Resources {
+	pids := int64(drillPidsLimit)
+	return container.Resources{Memory: drillMemoryBytes, NanoCPUs: drillNanoCPUs, PidsLimit: &pids}
+}
+
 // VerifyRestoreDB test-restores a database dump into a THROWAWAY, fully isolated
 // container and runs a sanity query — proving the dump actually re-imports and
 // returns data, not just that it decompresses (PLAN §4.3). The container is
@@ -54,7 +69,7 @@ func VerifyRestoreDB(ctx context.Context, c *client.Client, image, engine string
 
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: image, Env: dbInitEnv(engine, randPassword()), Labels: sidecarLabels()},
-		&container.HostConfig{NetworkMode: "none", AutoRemove: false},
+		&container.HostConfig{NetworkMode: "none", AutoRemove: false, Resources: drillResources()},
 		nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("create throwaway db: %w", err)
@@ -182,6 +197,7 @@ func VerifyRestoreVolumes(ctx context.Context, c *client.Client, image string, i
 		AutoRemove:    false,
 		RestartPolicy: container.RestartPolicy{Name: "no"}, // no crash-loop; a clean exit signal
 		// Binds / Mounts deliberately empty — no host data, ever.
+		Resources: drillResources(),
 	}
 	created, err := c.ContainerCreate(ctx, cfg, hostCfg, nil, nil, name)
 	if err != nil {

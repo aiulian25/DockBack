@@ -13,22 +13,37 @@ import (
 // failed restore leaves behind is now decided on purpose.
 func TestWhatAFailedRestoreLeavesBehind(t *testing.T) {
 	cases := []struct {
-		name                               string
-		haveSnapshot, wasRunning, canceled bool
-		want                               failedRestoreStep
+		name                                         string
+		haveSnapshot, wasRunning, canceled, replaced bool
+		want                                         failedRestoreStep
 	}{
-		{"a snapshot exists: roll back to it", true, true, false, failedRestoreRollBack},
-		{"a snapshot exists even if it was stopped: still roll back", true, false, false, failedRestoreRollBack},
-		{"no snapshot, was running: start it again rather than leave it down", false, true, false, failedRestoreRestart},
-		{"no snapshot, was not running: leave it as it was", false, false, false, failedRestoreLeave},
+		{"a snapshot exists: roll back to it", true, true, false, false, failedRestoreRollBack},
+		{"a snapshot exists even if it was stopped: still roll back", true, false, false, false, failedRestoreRollBack},
+		{"no snapshot, was running: start it again rather than leave it down", false, true, false, false, failedRestoreRestart},
+		{"no snapshot, was not running: leave it as it was", false, false, false, false, failedRestoreLeave},
 		// A cancel is the operator stopping it — never roll back behind their back.
-		{"canceled with a snapshot: leave it, the operator decides", true, true, true, failedRestoreLeave},
-		{"canceled without a snapshot: leave it", false, true, true, failedRestoreLeave},
+		{"canceled with a snapshot: leave it, the operator decides", true, true, true, false, failedRestoreLeave},
+		{"canceled without a snapshot: leave it", false, true, true, false, failedRestoreLeave},
+		{"replaced, with a snapshot: roll back to it", true, true, false, true, failedRestoreRollBack},
+		// Starting it would run the backup's image over data it did not write.
+		{"replaced, no snapshot, was running: do not start it", false, true, false, true, failedRestoreLeave},
 	}
 	for _, tc := range cases {
-		if got := failedRestoreAction(tc.haveSnapshot, tc.wasRunning, tc.canceled); got != tc.want {
+		if got := failedRestoreAction(tc.haveSnapshot, tc.wasRunning, tc.canceled, tc.replaced); got != tc.want {
 			t.Errorf("%s: got %d, want %d", tc.name, got, tc.want)
 		}
+	}
+}
+
+// Only a rollback over a replaced container rebuilds it from the snapshot. An
+// in-place one must not: there the container's image never changed.
+func TestRollbackRebuildsOnlyAReplacedContainer(t *testing.T) {
+	opts := RestoreOptions{NodeID: "n1", TargetID: "cid"}
+	if got := rollbackOptions(opts, "snap", true); !got.Recreate || !got.rollback || got.BackupID != "snap" || got.TargetID != "cid" {
+		t.Errorf("after a replacement: %+v", got)
+	}
+	if got := rollbackOptions(opts, "snap", false); got.Recreate {
+		t.Errorf("after an in-place restore it must not recreate: %+v", got)
 	}
 }
 

@@ -1,7 +1,13 @@
 package api
 
 import (
+	"dockback/internal/backup"
+	"dockback/internal/storage"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,5 +70,93 @@ func TestDrillCandidatesScope(t *testing.T) {
 	// An unknown scope falls back to newest semantics.
 	if got := drillCandidates(all, "bogus"); len(got) != len(newest) {
 		t.Fatalf("unknown scope should behave like newest: got %d, want %d", len(got), len(newest))
+	}
+}
+
+// A pass recorded for a backup the drill had nothing to restore from proved nothing.
+func TestAnUntestedDrillPassEarnsNoGrade(t *testing.T) {
+	b := &store.Backup{Verified: "verified"}
+	man := &backup.Manifest{}
+	locs := []backup.Location{{Kind: "local"}, {Kind: "dest", DestID: "d1"}}
+	legacy := &store.Drill{OK: true, Detail: backup.LegacyUntestedDrillDetail}
+	real := &store.Drill{OK: true, Detail: "volumes: booted"}
+	legacyGrade, reasons := gradeBackup(b, man, locs, legacy, nil)
+	realGrade, _ := gradeBackup(b, man, locs, real, nil)
+	if legacyGrade == realGrade || !strings.Contains(strings.Join(reasons, " "), "never drilled") {
+		t.Fatalf("legacy %s (%v), real %s", legacyGrade, reasons, realGrade)
+	}
+}
+
+func drillTestServer(t *testing.T) *Server {
+	t.Helper()
+	st := testStore(t)
+	be, err := storage.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Server{store: st, engine: &backup.Engine{Store: st, Storage: be, WorkDir: t.TempDir(), Log: func(string, string, string) {}}}
+}
+
+func drillRow(t *testing.T, st *store.Store, id, target string, man backup.Manifest, createdAt int64) {
+	t.Helper()
+	b := &store.Backup{ID: id, NodeID: "n1", TargetName: target, Status: "success", CreatedAt: createdAt}
+	if err := st.CreateBackup(b); err != nil {
+		t.Fatal(err)
+	}
+	mj, _ := json.Marshal(&man)
+	b.ManifestJSON = string(mj)
+	b.StorageKey = "n1/" + id + ".dback"
+	b.LocationsJSON = `[{"kind":"local","name":"local","type":"local"}]`
+	if err := st.UpdateBackup(b); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A backup a drill cannot test is never recorded, so it stays the most overdue. It
+// must not use up the cycle and stop every other drill.
+func TestTheSweepMovesPastWhatItCannotDrill(t *testing.T) {
+	s := drillTestServer(t)
+	if err := s.store.SetSetting(drillIntervalKey, "1"); err != nil {
+		t.Fatal(err)
+	}
+	drillRow(t, s.store, "exportonly", "paperless", backup.Manifest{AppExport: &backup.AppExportRef{Tool: "paperless"}}, 1)
+	drillRow(t, s.store, "drillable", "app", backup.Manifest{Volumes: []backup.VolumeRef{{Destination: "/data"}}}, 2)
+	// Drilled long ago, so it is overdue but less so than the never-drilled export.
+	const longAgo = 1
+	if err := s.store.UpsertDrill("drillable", true, "volumes: booted", longAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	s.drillTick()
+	if d, err := s.store.GetDrill("drillable"); err != nil || d.RanAt == longAgo {
+		t.Fatalf("the drillable backup was never reached: %+v %v", d, err)
+	}
+	if _, err := s.store.GetDrill("exportonly"); err == nil {
+		t.Fatal("a backup a drill cannot test must not be recorded as drilled")
+	}
+}
+
+func TestADrillAlreadyRequestedIsNotStartedTwice(t *testing.T) {
+	s := drillTestServer(t)
+	drillRow(t, s.store, "b1", "app", backup.Manifest{Volumes: []backup.VolumeRef{{Destination: "/data"}}}, 1)
+	s.drillsInFlight.Store("b1", struct{}{})
+	r := httptest.NewRequest(http.MethodPost, "/api/backups/b1/drill", nil)
+	r.SetPathValue("id", "b1")
+	rec := httptest.NewRecorder()
+	s.handleDrillBackup(rec, r)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAnExportOnlyBackupCannotBeDrilledOnRequest(t *testing.T) {
+	s := drillTestServer(t)
+	drillRow(t, s.store, "b1", "paperless", backup.Manifest{AppExport: &backup.AppExportRef{Tool: "paperless"}}, 1)
+	r := httptest.NewRequest(http.MethodPost, "/api/backups/b1/drill", nil)
+	r.SetPathValue("id", "b1")
+	rec := httptest.NewRecorder()
+	s.handleDrillBackup(rec, r)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "export") {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
 }

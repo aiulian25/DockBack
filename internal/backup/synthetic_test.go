@@ -111,7 +111,12 @@ func mkChainGen(t *testing.T, e *Engine, id, parentID, parentPin string, depth i
 // newest-first catalog ordering is deterministic in tests.
 var synthTestSeq int64
 
-func idxOf(entries ...FileEntry) VolIndex { return VolIndex{Entries: entries} }
+// idxOf's walk is later than any timestamp these tests use, so nothing reads as racy.
+func idxOf(entries ...FileEntry) VolIndex {
+	return VolIndex{Version: volIndexVersion, WalkedAt: 1 << 40, Entries: entries}
+}
+
+func dirEntry(path string) FileEntry { return FileEntry{Path: path, Mode: modeDir | 0o755} }
 func fe(p string, size, mtime int64) FileEntry {
 	return FileEntry{Path: p, Size: size, MtimeUnix: mtime, Mode: 0o644}
 }
@@ -169,14 +174,17 @@ func TestSyntheticMerge(t *testing.T) {
 	ctx := context.Background()
 
 	baseIdx := idxOf(fe("a.txt", 2, 100), fe("sub/b.txt", 2, 100))
+	baseIdx.Others = []FileEntry{dirEntry("sub")}
 	b1 := mkChainGen(t, e, "gen1full0001", "", "", 0,
 		map[string][]byte{"a.txt": []byte("A1"), "sub/b.txt": []byte("B1")}, []string{"sub"}, baseIdx, nil)
 
 	d2Idx := idxOf(fe("c.txt", 2, 200), fe("sub/b.txt", 2, 200)) // b modified, a deleted
+	d2Idx.Others = baseIdx.Others
 	b2 := mkChainGen(t, e, "gen2delta001", b1.ID, b1.CipherSHA256, 1,
 		map[string][]byte{"sub/b.txt": []byte("B2"), "c.txt": []byte("C1")}, nil, d2Idx, []string{"a.txt"})
 
 	freshIdx := idxOf(fe("c.txt", 2, 200), fe("d.txt", 2, 300), fe("sub/b.txt", 2, 200))
+	freshIdx.Others = baseIdx.Others
 	freshChanged := []string{"d.txt"}
 	fresh := localDelta(t, map[string][]byte{"d.txt": []byte("D1")})
 
@@ -220,6 +228,45 @@ func TestSyntheticMerge(t *testing.T) {
 	sha2, _, err := e.synthesizeFullVolumes(ctx, chain, fresh, freshIdx, freshChanged, dst2)
 	if err != nil || sha2 != sha {
 		t.Fatalf("merge must be deterministic: %s vs %s (err %v)", sha, sha2, err)
+	}
+}
+
+// A delta can carry a directory now, and the merge must take the newest form of a
+// path whatever its type, and drop an empty directory that is gone.
+func TestSyntheticMergeFollowsTypeChangesAndDirectories(t *testing.T) {
+	e := synthEngine(t)
+	ctx := context.Background()
+
+	baseIdx := idxOf(fe("file-to-dir", 1, 100))
+	baseIdx.Others = []FileEntry{dirEntry("emptied"), dirEntry("kept")}
+	b1 := mkChainGen(t, e, "gen1full0002", "", "", 0,
+		map[string][]byte{"file-to-dir": []byte("F")}, []string{"emptied", "kept"}, baseIdx, nil)
+
+	d2Idx := idxOf()
+	d2Idx.Others = []FileEntry{dirEntry("file-to-dir"), dirEntry("fresh-empty"), dirEntry("kept")}
+	b2 := mkChainGen(t, e, "gen2delta002", b1.ID, b1.CipherSHA256, 1, nil, []string{"file-to-dir", "fresh-empty"}, d2Idx, []string{"emptied"})
+
+	var b2man Manifest
+	_ = json.Unmarshal([]byte(b2.ManifestJSON), &b2man)
+	chain, err := e.resolveRestoreChain(b2, &b2man)
+	if err != nil {
+		t.Fatalf("chain: %v", err)
+	}
+	dst := filepath.Join(t.TempDir(), "volumes.tar")
+	if _, _, err := e.synthesizeFullVolumes(ctx, chain, localDelta(t, nil), d2Idx, nil, dst); err != nil {
+		t.Fatalf("synthesize: %v", err)
+	}
+	files, others := readTar(t, dst)
+	if len(files) != 0 {
+		t.Errorf("the old file form survived: %v", files)
+	}
+	for _, want := range []string{"file-to-dir", "fresh-empty", "kept"} {
+		if !others[want] {
+			t.Errorf("%s missing from the merge: %v", want, others)
+		}
+	}
+	if others["emptied"] {
+		t.Error("a removed empty directory came back")
 	}
 }
 

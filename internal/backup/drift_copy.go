@@ -156,11 +156,11 @@ func describeDrift(entries []CopyDrift) string {
 // Returns nothing when the container is being STOPPED for the copy: its own
 // processes cannot write to a filesystem they are not running on, so there is
 // nothing to measure and no reason to pay for a walk.
-func (e *Engine) driftBaseline(ctx context.Context, cli *client.Client, containerID string, dests []string, pauseMode, image, logID string) *VolIndex {
+func (e *Engine) driftBaseline(ctx context.Context, cli *client.Client, containerID string, dests, excludes []string, pauseMode, image, logID string) *VolIndex {
 	if len(dests) == 0 || pauseMode == PauseStop {
 		return nil
 	}
-	idx, err := e.buildVolIndex(ctx, cli, containerID, dests, image)
+	idx, err := e.buildVolIndex(ctx, cli, containerID, dests, excludes, image)
 	if err != nil {
 		e.logf(logID, "INFO", "Could not list the files before the copy (%v) — the backup proceeds, but it cannot report what changed underneath it", err)
 		return nil

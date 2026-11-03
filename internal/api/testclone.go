@@ -60,8 +60,7 @@ func (s *Server) testCloneName(ctx context.Context, nodeID, target string) (stri
 	if err != nil {
 		// The node is unreachable; the restore itself is about to fail on that.
 		// Hand back the unsuffixed name rather than inventing a second error for
-		// the same cause — RecreateContainer replaces a stale same-named clone
-		// anyway, so this can only ever collide with a previous test clone.
+		// the same cause. A name that turns out to be taken is refused, not replaced.
 		return base, nil
 	}
 	name := base

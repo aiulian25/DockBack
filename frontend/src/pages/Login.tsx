@@ -65,27 +65,27 @@ export default function Login() {
           {!needCode ? (
             <>
               <div>
-                <Label>Username</Label>
-                <Input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus autoComplete="username" />
+                <Label htmlFor="login-username">Username</Label>
+                <Input id="login-username" value={username} onChange={(e) => setUsername(e.target.value)} autoFocus autoComplete="username" />
               </div>
               <div>
-                <Label>Password</Label>
-                <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+                <Label htmlFor="login-password">Password</Label>
+                <Input id="login-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
               </div>
             </>
           ) : (
             <div>
-              <Label>Authentication code</Label>
+              <Label htmlFor="login-code">Authentication code</Label>
               <Input
-                value={code} onChange={(e) => setCode(e.target.value)} autoFocus
+                id="login-code" aria-describedby="login-code-help" value={code} onChange={(e) => setCode(e.target.value)} autoFocus
                 inputMode="numeric" autoComplete="one-time-code" placeholder="6-digit code"
               />
-              <p className="mt-1 text-xs text-on-surface-variant">
+              <p id="login-code-help" className="mt-1 text-xs text-on-surface-variant">
                 Enter the code from your authenticator app, or a recovery code.
               </p>
             </div>
           )}
-          {err && <div className="rounded bg-error/10 px-3 py-2 text-sm text-error">{err}</div>}
+          {err && <div role="alert" className="rounded bg-error/10 px-3 py-2 text-sm text-error">{err}</div>}
           <Button variant="primary" className="w-full" disabled={busy}>
             {busy ? "Signing in…" : needCode ? "Verify" : "Sign In"}
           </Button>

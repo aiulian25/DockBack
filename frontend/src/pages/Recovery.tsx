@@ -11,6 +11,7 @@ import {
   HardDrive, AlertTriangle, CheckCircle2, XCircle, Loader2, Server as ServerIcon, Lock, RotateCcw, Share2, Copy, Check, Trash2, ServerCog,
 } from "lucide-react";
 import { followRun } from "../lib/logStream";
+import { newExecutionId } from "../lib/runDone";
 import { api, Node, NodeRestorePlanEntry, Runbook, RunbookNode, RunbookService, StepUpError, fmtAgo, fmtBytes } from "../api";
 import { Card, Button, Modal, Select } from "../components/ui";
 import StepUpPrompt from "../components/StepUpPrompt";
@@ -165,8 +166,10 @@ function RunbookView({ rb, keyRisk, downloadMd, onChanged }: { rb: Runbook; keyR
     // #N10: the structured verdict for the NODE's own run, with the shared
     // node line rules as the fallback. The stacks' lines are SHOWN (alsoShow)
     // but can never decide the outcome — followRun only judges the run's own.
+    const executionId = newExecutionId();
     esRef.current = followRun(logID, {
       mode: "node",
+      executionId,
       since: start - 2000, // skip replayed history
       alsoShow: [...stackIDs],
       onLine: (l) => setRLines((p) => [...p.slice(-120), {
@@ -180,6 +183,7 @@ function RunbookView({ rb, keyRisk, downloadMd, onChanged }: { rb: Runbook; keyR
     });
     try {
       await api.restoreNodeAll(node.node_id, {
+        execution_id: executionId,
         ...creds,
         ...(skipBlocked ? { skip_blocked: true } : {}),
         // F227: only when something was actually dropped — omitted means "every
@@ -675,6 +679,7 @@ function ServiceStep({ svc }: { svc: RunbookService }) {
             <HardDrive size={11} /> {l.name}
             {l.immutable && <Lock size={10} className="text-success" />}
             {l.status === "failed" && <span title={l.detail}>(failed)</span>}
+            {l.status === "incomplete" && <span title={l.detail}>(incomplete)</span>}
           </span>
         ))}
       </div>
@@ -746,7 +751,7 @@ function toMarkdown(rb: Runbook): string {
     for (const s of node.services) {
       L.push(`${s.order}. **${s.container}** — ${s.role === "database" ? (s.engine || "database") : "app"}${s.stack ? ` (stack: ${s.stack})` : ""}`);
       if (s.image) L.push(`   - Image: \`${s.image}${s.image_digest ? "@" + s.image_digest : ""}\``);
-      L.push(`   - Copies: ${s.locations.map((l) => l.name + (l.status === "failed" ? " (FAILED)" : "")).join(", ") || "local"}`);
+      L.push(`   - Copies: ${s.locations.map((l) => l.name + (l.status === "failed" ? " (FAILED)" : l.status === "incomplete" ? " (INCOMPLETE)" : "")).join(", ") || "local"}`);
       L.push(`   - Last backup: ${fmtDateShort(s.last_backup_at)}; last proven restore: ${s.last_drill_at ? fmtDateShort(s.last_drill_at) : "never"}`);
       if (s.standby_node) L.push(`   - Standby node: ${s.standby_node} — ${s.standby_ok === undefined ? "not yet rehearsed" : s.standby_ok ? `proven ${s.standby_at ? fmtDateShort(s.standby_at) : ""}` : "FAILING"}`);
       if (s.extensions?.length) L.push(`   - Reinstall extensions before import: ${s.extensions.join(", ")}`);

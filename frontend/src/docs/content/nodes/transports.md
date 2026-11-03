@@ -42,4 +42,4 @@ You're not locked into how a node was first added. Open **Servers → (node) →
 
 ## Security note
 
-Whichever transport you pick, keep the endpoint on a trusted path. A socket-proxy or mTLS port must be firewalled to **only** the DockBack host (or bound to a private overlay interface), and never exposed to the internet.
+Whichever transport you pick, keep the endpoint on a trusted path. A socket-proxy port must be **bound to a private overlay interface**, never to all interfaces. A host firewall such as UFW does not filter ports Docker publishes, so check from another machine that the port is refused. An mTLS port authenticates DockBack, but it is still root on the host: limit who can reach it, and never expose either one to the internet.

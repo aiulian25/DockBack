@@ -2,7 +2,13 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"log"
 	"net/http"
+	"regexp"
 	"sort"
 	"time"
 
@@ -32,6 +38,26 @@ type restoreRun struct {
 	// polling a proxy this run is saturating (#40). Empty when the caller does
 	// not know it, which simply leaves the polling as it was.
 	nodeID string
+	// executionID is this run's own identity, since id is reused by every restore of
+	// the same backup or stack.
+	executionID string
+}
+
+// executionIDPattern is what a client may propose: newRestoreExecutionID's shape.
+var executionIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// restoreExecutionIDBytes is the random size of an execution id.
+const restoreExecutionIDBytes = 16
+
+// resolveExecutionID keeps a well-formed id a client chose, so its console can know
+// which run is its own from before the run starts, and otherwise makes one.
+func resolveExecutionID(proposed string) string {
+	if executionIDPattern.MatchString(proposed) {
+		return proposed
+	}
+	raw := make([]byte, restoreExecutionIDBytes)
+	_, _ = rand.Read(raw)
+	return hex.EncodeToString(raw)
 }
 
 // beginRestoreRun registers a cancelable restore under id and returns its
@@ -39,23 +65,36 @@ type restoreRun struct {
 // with that id is already registered (the stack/container locks normally
 // prevent this; this is the last-resort guard). A restore writes a safety
 // snapshot outside the job queue, so it is counted for key rotation, waiting
-// first while a rotation is under way (beginOutsideQueueRun).
-func (s *Server) beginRestoreRun(parent context.Context, id, label, nodeID string, timeout time.Duration) (context.Context, func(), bool) {
+// first while a rotation is under way (beginOutsideQueueRun). proposedExecutionID may
+// be empty. The run is recorded, and a run that ends without reporting an outcome is
+// recorded as interrupted when finish runs.
+func (s *Server) beginRestoreRun(parent context.Context, id, label, nodeID string, timeout time.Duration, proposedExecutionID string) (context.Context, func(), bool) {
+	if s.isStopping() {
+		return nil, nil, false
+	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
+	stopWithProcess := context.AfterFunc(s.rootContext(), cancel)
 	s.restoreMu.Lock()
 	if s.restores == nil {
 		s.restores = map[string]*restoreRun{}
 	}
 	if _, dup := s.restores[id]; dup {
 		s.restoreMu.Unlock()
+		stopWithProcess()
 		cancel()
 		return nil, nil, false
 	}
-	s.restores[id] = &restoreRun{cancel: cancel, startedAt: time.Now().Unix(), label: label, nodeID: nodeID}
+	executionID := resolveExecutionID(proposedExecutionID)
+	s.restores[id] = &restoreRun{cancel: cancel, startedAt: time.Now().Unix(), label: label, nodeID: nodeID, executionID: executionID}
 	s.restoreMu.Unlock()
+	if err := s.store.BeginRestoreExecution(executionID, id, label); err != nil {
+		log.Printf("restore %s: could not record its start: %v", id, err)
+	}
 	endRun := s.beginOutsideQueueRun(id)
 
 	return ctx, func() {
+		s.finishUnreportedExecution(id, executionID)
+		stopWithProcess()
 		endRun()
 		s.restoreMu.Lock()
 		delete(s.restores, id)
@@ -107,15 +146,17 @@ func (s *Server) handleCancelRestore(w http.ResponseWriter, r *http.Request) {
 
 // RunningRestore is one in-flight restore as the UI sees it (F100).
 //
-// Deliberately three fields. A page reloaded mid-restore needs to know WHICH run
-// to re-attach to (ID), what to call it in a banner (Label), and how long it has
-// been going (StartedAt) — and nothing else. The restore's target container,
+// Deliberately few fields. A page reloaded mid-restore needs to know WHICH run to
+// re-attach to (ID, and ExecutionID since ID is reused), what to call it in a banner
+// (Label), and how long it has been going (StartedAt) — and nothing else. The restore's target container,
 // node and options stay server-side: this endpoint exists to let an operator
 // find and stop a running restore, not to describe one.
 type RunningRestore struct {
 	ID        string `json:"id"`
 	Label     string `json:"label"`
 	StartedAt int64  `json:"started_at"`
+	// ExecutionID tells this run apart from any other restore under the same ID.
+	ExecutionID string `json:"execution_id"`
 }
 
 // runningRestores returns the restores currently in flight, so a UI that was
@@ -128,7 +169,7 @@ func (s *Server) runningRestores() []RunningRestore {
 	defer s.restoreMu.Unlock()
 	out := make([]RunningRestore, 0, len(s.restores))
 	for id, r := range s.restores {
-		out = append(out, RunningRestore{ID: id, Label: r.label, StartedAt: r.startedAt})
+		out = append(out, RunningRestore{ID: id, Label: r.label, StartedAt: r.startedAt, ExecutionID: r.executionID})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].StartedAt != out[j].StartedAt {
@@ -143,6 +184,73 @@ func (s *Server) runningRestores() []RunningRestore {
 // target, node or credential detail.
 func (s *Server) handleListRestores(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"running": s.runningRestores()})
+}
+
+// handleRestoreStatus — GET /api/restores/{id}/status[?execution=<id>]. The authority
+// on how a restore ended, for a console that missed run.done or reattached. It reports
+// the named execution, or the newest under this id. 404 means no such record.
+func (s *Server) handleRestoreStatus(w http.ResponseWriter, r *http.Request) {
+	execution, err := s.store.GetRestoreExecution(r.PathValue("id"), r.URL.Query().Get("execution"))
+	if errors.Is(err, sql.ErrNoRows) {
+		errJSON(w, http.StatusNotFound, "no record of that restore")
+		return
+	}
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "could not read restore status")
+		return
+	}
+	writeJSON(w, http.StatusOK, execution)
+}
+
+// restoreRunExecution is the execution behind a registered run, or "" for none.
+func (s *Server) restoreRunExecution(id string) string {
+	s.restoreMu.Lock()
+	defer s.restoreMu.Unlock()
+	if r, ok := s.restores[id]; ok {
+		return r.executionID
+	}
+	return ""
+}
+
+// finishRestoreExecution records how a restore ended and only then announces it, so
+// a console that hears the event and asks gets the same answer. It is what every
+// restore path ends through.
+func (s *Server) finishRestoreExecution(id, outcome, message string) {
+	executionID := s.restoreRunExecution(id)
+	if executionID != "" {
+		if _, err := s.store.FinishRestoreExecution(executionID, outcome, message); err != nil {
+			log.Printf("restore %s: could not record its outcome: %v", id, err)
+		}
+	}
+	s.publishExecutionDone(id, executionID, outcome, message)
+}
+
+// finishUnreportedExecution closes a run that returned without an outcome, which a
+// panic does. Without this it would read as running until the next restart.
+func (s *Server) finishUnreportedExecution(id, executionID string) {
+	const message = "This restore ended without reporting an outcome. Check the log, and what state the container is in."
+	finished, err := s.store.FinishRestoreExecution(executionID, runOutcomeInterrupted, message)
+	if err != nil {
+		log.Printf("restore %s: could not record its outcome: %v", id, err)
+		return
+	}
+	if finished {
+		s.publishExecutionDone(id, executionID, runOutcomeInterrupted, message)
+	}
+}
+
+// interruptAbandonedRestores settles what the last process left running: at startup
+// nothing can be, so a row that says so belongs to a run that died with it.
+func (s *Server) interruptAbandonedRestores() {
+	const message = "DockBack stopped before this restore finished, so it did not complete. Data already written stays written."
+	count, err := s.store.InterruptRunningRestoreExecutions(runOutcomeInterrupted, message)
+	if err != nil {
+		log.Printf("startup: could not settle restores the last process left running: %v", err)
+		return
+	}
+	if count > 0 {
+		log.Printf("startup: %d restore(s) were running when DockBack last stopped, recorded as interrupted", count)
+	}
 }
 
 // restoreOutcome logs a restore's terminal line, distinguishing an operator
@@ -164,17 +272,23 @@ func (s *Server) restoreOutcome(id string, err error, doneMsg string) {
 	switch {
 	case err == nil:
 		s.logSink(id, "INFO", doneMsg)
-		s.publishRunDone(id, runOutcomeOK, doneMsg)
+		s.finishRestoreExecution(id, runOutcomeOK, doneMsg)
 	case s.restoreWasCanceled(id):
 		s.logSink(id, "WARN", "Restore CANCELED by the operator: "+err.Error())
-		s.publishRunDone(id, runOutcomeCanceled, err.Error())
+		s.finishRestoreExecution(id, runOutcomeCanceled, err.Error())
 		// F92: a canceled restore is not a failure — the operator chose it — but a
 		// DESTRUCTIVE operation was interrupted part-way, so the alert inbox keeps
 		// a record of what state things were left in. Warning, not critical.
 		s.notify(notify.KindRestoreCanceled, "Restore canceled: "+s.restoreLabel(id),
 			"A restore was stopped by the operator before it finished. Data already written stays written — DockBack does not roll back behind your back. "+err.Error())
+	case s.isStopping():
+		msg := "Restore interrupted by DockBack stopping: " + err.Error()
+		s.logSink(id, "ERR", msg)
+		s.finishRestoreExecution(id, runOutcomeInterrupted, msg)
+		s.notify(notify.KindRestoreFailed, "Restore interrupted: "+s.restoreLabel(id),
+			"DockBack stopped during this restore, so it did not finish. Data already written stays written. "+err.Error())
 	default:
 		s.logSink(id, "ERR", "Restore failed: "+err.Error())
-		s.publishRunDone(id, runOutcomeFailed, err.Error())
+		s.finishRestoreExecution(id, runOutcomeFailed, err.Error())
 	}
 }

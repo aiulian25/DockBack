@@ -60,6 +60,34 @@ func (e *Engine) incrementalPolicy(nodeID, name string) (enabled bool, fullEvery
 // the same compression/export/save-image the user picked manually.
 func BackupOptionsKey(nodeID, name string) string { return "backupopts:" + nodeID + ":" + name }
 
+// What a manifest records about holding a container for its copy, beside the
+// PausePause and PauseStop a hold can achieve.
+const (
+	QuiesceLive           = "live"            // copied while it ran, as asked
+	QuiesceDatabaseDump   = "database-dump"   // dumped live by its own tools
+	QuiesceAlreadyStopped = "already-stopped" // was not running, so nothing to hold
+	QuiesceAlreadyPaused  = "already-paused"  // somebody else was holding it still
+	QuiesceNoVolumes      = "no-volumes"      // nothing to copy
+)
+
+// quiesceEvidence is what a run that takes no hold of its own has to say for itself.
+// A run that does take one overwrites the achieved half with what happened.
+func quiesceEvidence(pm, engineKind string, running bool, volCount int) (requested, achieved string) {
+	requested = pm
+	if pm == PauseNone {
+		requested = QuiesceLive
+	}
+	switch {
+	case !running:
+		return requested, QuiesceAlreadyStopped
+	case engineKind != "":
+		return requested, QuiesceDatabaseDump
+	case volCount == 0:
+		return requested, QuiesceNoVolumes
+	}
+	return requested, QuiesceLive
+}
+
 // shouldPause reports whether an app container should be quiesced (paused or
 // stopped) during the volume copy. Only a non-database, currently-RUNNING
 // container that has volume data is quiesced: a database is dumped live (§4.1),

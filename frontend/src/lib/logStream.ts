@@ -12,7 +12,7 @@
 // rules themselves live in the tested helpers next door (stackRunProgress,
 // restoreLogFilter); this module decides which of them applies and says the
 // verdict once.
-import { parseRunDone, RunOutcome } from "./runDone";
+import { isRunOutcome, parseRunDone, RunOutcome } from "./runDone";
 import { stackVerdict } from "./stackRunProgress";
 
 /** A line as the server writes it onto the stream. */
@@ -208,14 +208,43 @@ export type FollowOptions = {
   alsoShowContainers?: string[];
   /** Show only lines this accepts (e.g. isRestoreProgressLine). */
   filter?: (msg: string) => boolean;
+  /**
+   * Which restore under this reused run id is being followed, so another run's
+   * verdict cannot end it. Without one, a recorded run older than `since` is ignored.
+   */
+  executionId?: string;
 };
+
+/** How often a follower asks for the outcome, in case it heard nothing at all. */
+const RUN_STATUS_POLL_MS = 30_000;
+const SECONDS_TO_MS = 1000;
+const HTTP_NOT_FOUND = 404;
+
+type RunStatus = { outcome: string; message?: string; started_at: number };
+
+/** The server's record of a run: its status, "none" if it has none, or null if unknown. */
+async function fetchRunStatus(runId: string, executionId?: string): Promise<RunStatus | "none" | null> {
+  const query = executionId ? `?execution=${encodeURIComponent(executionId)}` : "";
+  try {
+    const res = await fetch(`/api/restores/${encodeURIComponent(runId)}/status${query}`, { credentials: "same-origin" });
+    if (res.status === HTTP_NOT_FOUND) return "none";
+    return res.ok ? ((await res.json()) as RunStatus) : null;
+  } catch {
+    return null;
+  }
+}
+
+const activeFollowers = new Set<() => void>();
 
 /**
  * followRun watches one run and reports when it is over.
  *
- * The structured `run.done` event is the verdict when it arrives. The line rules
- * remain as the fallback, deliberately: run.done is not replayed to a console
- * that connects late.
+ * For a restore the server's record decides, heard as `run.done` or by asking. A log
+ * line that reads as final only prompts the question: a post-restore hook can log an
+ * error and the restore still succeed, so "still running" means carry on. A run with
+ * no record, such as a stack backup, falls back to the line rules. Asking also
+ * happens on reconnect and on a slow poll, which recovers a verdict missed while
+ * disconnected, since run.done is not replayed.
  *
  * Returns a function that stops following. It is safe to call after the run has
  * already ended.
@@ -226,12 +255,19 @@ export function followRun(runId: string, opts: FollowOptions): () => void {
   let finished = false;
   let stopLines: (() => void) | null = null;
   let detachDone: (() => void) | null = null;
+  let detachConnection: (() => void) | null = null;
+  let poll: ReturnType<typeof setInterval> | null = null;
 
   const stop = () => {
     detachDone?.();
     detachDone = null;
     stopLines?.();
     stopLines = null;
+    detachConnection?.();
+    detachConnection = null;
+    if (poll !== null) clearInterval(poll);
+    poll = null;
+    activeFollowers.delete(cancel);
   };
 
   const finish = (outcome: FollowOutcome, message: string) => {
@@ -239,6 +275,22 @@ export function followRun(runId: string, opts: FollowOptions): () => void {
     finished = true;
     stop();
     opts.onDone?.(outcome, message);
+  };
+
+  const cancel = () => { if (!finished) { finished = true; stop(); } };
+
+  const isEarlierRun = (status: RunStatus) =>
+    !opts.executionId && opts.since !== undefined && status.started_at * SECONDS_TO_MS < opts.since;
+
+  // lineSays is the verdict a log line suggests, used only if the server has no record.
+  const reconcile = async (lineSays?: { outcome: FollowOutcome; message: string }) => {
+    const status = await fetchRunStatus(runId, opts.executionId);
+    if (finished || status === null) return;
+    if (status === "none" || isEarlierRun(status)) {
+      if (lineSays) finish(lineSays.outcome, lineSays.message);
+      return;
+    }
+    if (isRunOutcome(status.outcome)) finish(status.outcome, status.message ?? "");
   };
 
   stopLines = subscribeLines((line) => {
@@ -250,21 +302,30 @@ export function followRun(runId: string, opts: FollowOptions): () => void {
     opts.onLine?.(line);
     if (!own) return; // another run's progress never ends this one
     const outcome = lineVerdict(opts.mode, line.msg, line.level);
-    if (outcome) finish(outcome, verdictMessage(outcome, line.msg));
+    if (outcome) void reconcile({ outcome, message: verdictMessage(outcome, line.msg) });
   });
 
   // The structural verdict rides the same connection, dispatched through this
   // module's own fan-out so it survives a reconnect.
   detachDone = subscribeEvent("run.done", (data) => {
     const d = parseRunDone(data, runId);
-    if (d) finish(d.outcome, d.message);
+    if (!d) return;
+    if (opts.executionId && d.executionId && d.executionId !== opts.executionId) return;
+    finish(d.outcome, d.message);
   });
 
-  return () => { if (!finished) { finished = true; stop(); } };
+  detachConnection = subscribeConnection((connected) => { if (connected) void reconcile(); });
+  poll = setInterval(() => { void reconcile(); }, RUN_STATUS_POLL_MS);
+  activeFollowers.add(cancel);
+  // Attaching to a run already under way: it may have ended just before now.
+  if (opts.since === undefined) void reconcile();
+
+  return cancel;
 }
 
 /** Test seam: drop all state so one test cannot leak into the next. */
 export function __resetLogStream() {
+  activeFollowers.forEach((cancel) => cancel());
   lineSubs.clear();
   statusSubs.clear();
   eventSubs.clear();
