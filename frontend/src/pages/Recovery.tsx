@@ -11,6 +11,8 @@ import {
   HardDrive, AlertTriangle, CheckCircle2, XCircle, Loader2, Server as ServerIcon, Lock, RotateCcw, Share2, Copy, Check, Trash2, ServerCog,
 } from "lucide-react";
 import { followRun } from "../lib/logStream";
+import { announceRunEnd, runEndNotice } from "../lib/runNotice";
+import { useToast } from "../components/Toast";
 import { newExecutionId } from "../lib/runDone";
 import { api, Node, NodeRestorePlanEntry, Runbook, RunbookNode, RunbookService, StepUpError, fmtAgo, fmtBytes } from "../api";
 import { Card, Button, Modal, Select } from "../components/ui";
@@ -46,6 +48,7 @@ export default function Recovery() {
 // (F6): a "Restore entire node" action that executes the computed order and
 // streams progress into the same live log the stack restore uses.
 function RunbookView({ rb, keyRisk, downloadMd, onChanged }: { rb: Runbook; keyRisk: boolean; downloadMd: () => void; onChanged: () => void }) {
+  const toast = useToast();
   const [activeNode, setActiveNode] = useState<string>("");
   const [rState, setRState] = useState<"idle" | "running" | "done" | "failed">("idle");
   const [rLines, setRLines] = useState<{ level: string; msg: string }[]>([]);
@@ -178,6 +181,7 @@ function RunbookView({ rb, keyRisk, downloadMd, onChanged }: { rb: Runbook; keyR
       onDone: (outcome, message) => {
         if (outcome === "ok") setRState("done");
         else { setRState("failed"); setRErr(message); }
+        announceRunEnd(toast, runEndNotice(`Restore of node “${node.node_name}”`, "finished", outcome, message));
         onChanged();
       },
     });

@@ -89,7 +89,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   return (
     <Ctx.Provider value={api}>
       {children}
-      <div className="pointer-events-none fixed bottom-4 right-4 z-[70] flex w-[min(92vw,22rem)] flex-col gap-2">
+      <div aria-live="polite" className="pointer-events-none fixed bottom-4 right-4 z-[70] flex w-[min(92vw,22rem)] flex-col gap-2">
         {items.map((t) => (
           <ToastCard key={t.id} t={t} onUndo={() => doUndo(t)} onAction={() => doAction(t)} onDismiss={() => dismiss(t)} />
         ))}

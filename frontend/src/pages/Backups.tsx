@@ -20,6 +20,7 @@ import { isRestoreProgressLine } from "../lib/restoreLogFilter";
 import { Button, Card, Chip, Label, Select } from "../components/ui";
 import BackupCloudIcon from "../components/BackupCloudIcon";
 import { useToast } from "../components/Toast";
+import { announceRunEnd, runEndNotice } from "../lib/runNotice";
 import { useEventStream } from "../hooks/useEventStream";
 import { useStickyScroll } from "../hooks/useStickyScroll";
 import { NodeAvatar } from "../components/NodeAvatar";
@@ -709,6 +710,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
   // `b` below merges the row's fresh scalars with the fetched blobs, so every
   // existing read in this large component works unchanged for both shapes.
   const [full, setFull] = useState<Backup | null>(null);
+  const toast = useToast();
   useEffect(() => {
     let gone = false;
     api.backup(row.id).then((f) => { if (!gone) setFull(f); }).catch(() => {});
@@ -1222,6 +1224,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
         if (outcome === "ok") setRState("done");
         else if (outcome === "canceled") { setRState("canceled"); setRErr(message); }
         else { setRState("failed"); setRErr(message); }
+        announceRunEnd(toast, runEndNotice(`Restore of ${b.target_name}`, "finished", outcome, message));
         onChanged(); onRestoresChanged();
       },
     });
@@ -1429,6 +1432,7 @@ function Detail({ b: row, nodeName, nodes, drills, siblings, stackServices, onPi
         if (outcome === "ok") setRState("done");
         else if (outcome === "canceled") { setRState("canceled"); setRErr(message); }
         else { setRState("failed"); setRErr(message); }
+        announceRunEnd(toast, runEndNotice(`Restore of ${b.target_name}`, "finished", outcome, message));
         onChanged(); onRestoresChanged();
       },
     });

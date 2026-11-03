@@ -1,5 +1,6 @@
 // Thin typed client for the DockBack REST API. Mutations attach the CSRF
 // token from the cookie set at login (double-submit).
+import type { CreationOptionsJSON, RequestOptionsJSON } from "./lib/passkey";
 
 // qstr builds a "?a=1&b=2" query string from a params object, skipping empty/
 // undefined values so a blank search/filter doesn't constrain the result.
@@ -912,8 +913,33 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   return data as T;
 }
 
+// publicPost is a call made before there is a session (sign-in): its errors are
+// the server's message, never a redirect to /login.
+async function publicPost<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const data = parseBody(await res.text());
+  if (!res.ok) throw httpError(res, data);
+  return data as T;
+}
+
 // Optional step-up credentials (F64) attached to security-critical calls.
 export type StepUpCreds = { password?: string; code?: string };
+
+// Whether passkeys work here, and why not: they need DockBack at the name in
+// DOCKBACK_PUBLIC_URL, over https. `offered` means someone here has one.
+export interface PasskeyStatus { usable: boolean; offered?: boolean; reason: string; origin: string }
+export interface PasskeyCeremony<Options> { ceremony: string; options: Options }
+export interface Passkey {
+  id: string;
+  name: string;
+  created_at: number;
+  last_used_at: number; // 0 = not used yet
+  synced: boolean; // kept by a password manager that syncs it between devices
+  other_host?: string; // made for another address: browsers won't offer it here
+}
 
 // A backup's restore-drill outcome (PLAN §9.4): the last sandbox test-restore of
 // that specific backup. One row per backup_id; absent means never drilled.
@@ -956,6 +982,21 @@ export const api = {
   // Both factors: the code being removed has to confirm its own removal.
   twofaDisable: (password: string, code: string) =>
     req<{ status: string }>("POST", "/api/account/2fa/disable", { password, code }),
+  // Passkeys. Signing in uses publicPost, like login: a refused passkey is a
+  // message on the sign-in page, not a redirect back to it.
+  passkeyStatus: () => req<PasskeyStatus>("GET", "/api/passkeys/status"),
+  passkeySignInBegin: () => publicPost<PasskeyCeremony<RequestOptionsJSON>>("/api/passkeys/login/begin", {}),
+  passkeySignIn: (ceremony: string, credential: Record<string, unknown>) =>
+    publicPost<{ username: string }>("/api/passkeys/login/finish", { ceremony, credential }),
+  listPasskeys: () => req<PasskeyStatus & { passkeys: Passkey[] }>("GET", "/api/account/passkeys"),
+  // A fresh password (and code) first: a session left open can't plant a passkey.
+  addPasskeyBegin: (creds: StepUpCreds) =>
+    req<PasskeyCeremony<CreationOptionsJSON>>("POST", "/api/account/passkeys/begin", creds),
+  addPasskey: (ceremony: string, credential: Record<string, unknown>, name: string) =>
+    req<Passkey>("POST", "/api/account/passkeys/finish", { ceremony, credential, name }),
+  renamePasskey: (id: string, name: string) =>
+    req<{ name: string }>("PATCH", `/api/account/passkeys/${encodeURIComponent(id)}`, { name }),
+  removePasskey: (id: string) => req<unknown>("DELETE", `/api/account/passkeys/${encodeURIComponent(id)}`),
   logout: () => req<unknown>("POST", "/api/logout", {}),
 
   // Application (whole-app) backup & restore — distinct from container backups.

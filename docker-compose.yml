@@ -72,6 +72,9 @@ services:
       DOCKBACK_TRUST_PROXY: ${DOCKBACK_TRUST_PROXY:-false}
       DOCKBACK_TRUSTED_PROXIES: ${DOCKBACK_TRUSTED_PROXIES:-}
       DOCKBACK_EGRESS_ALLOW: ${DOCKBACK_EGRESS_ALLOW:-}
+      # The https address you open DockBack at, e.g. https://dockback.example.org.
+      # Passkeys are bound to its name; without it (or at an IP address) they are off.
+      DOCKBACK_PUBLIC_URL: ${DOCKBACK_PUBLIC_URL:-}
       # Sign-in policy. Boot defaults; Settings -> Security -> Sign-in policy can
       # view/edit all three live (an in-app value overrides these). Session
       # lifetime is the absolute cap; idle is the inactivity timeout. The minimum

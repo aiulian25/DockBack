@@ -54,6 +54,9 @@ type Server struct {
 	// guard throttles/locks out abusive logins and bounds argon2 cost (§10.1).
 	guard *loginGuard
 
+	// passkeys is the WebAuthn relying party and its ceremonies under way.
+	passkeys *passkeyService
+
 	// decoyHash is a fixed argon2id hash verified against when a login names a
 	// non-existent account, so timing never reveals valid usernames (§10.1).
 	decoyHash string
@@ -238,6 +241,7 @@ func New(cfg *config.Config, st *store.Store, reg *dockercli.Registry) *Server {
 		reg:          reg,
 		bcast:        newBroadcaster(500),
 		guard:        newLoginGuard(st),
+		passkeys:     newPasskeyService(cfg.PublicURL),
 		machines:     newMachineCache(), // F105 host probe cache
 		fsUsage:      newFSUsageCache(), // #37 restore capacity panel
 		backupSem:    newDynSem(cfg.MaxConcurrentBackups),
@@ -1231,6 +1235,9 @@ func (s *Server) Handler(uiFS fs.FS) http.Handler {
 	// --- Auth (no session required) ---
 	mux.HandleFunc("POST /api/login", s.handleLogin)
 	mux.HandleFunc("POST /api/logout", s.handleLogout)
+	mux.HandleFunc("GET /api/passkeys/status", s.handlePasskeyStatus)
+	mux.HandleFunc("POST /api/passkeys/login/begin", s.handlePasskeySignInBegin)
+	mux.HandleFunc("POST /api/passkeys/login/finish", s.handlePasskeySignIn)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /api/version", s.handleVersion)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -1275,6 +1282,11 @@ func (s *Server) Handler(uiFS fs.FS) http.Handler {
 	mux.Handle("POST /api/account/2fa/begin", s.auth(s.csrf(http.HandlerFunc(s.handleTOTPBegin))))
 	mux.Handle("POST /api/account/2fa/enable", s.auth(s.csrf(http.HandlerFunc(s.handleTOTPEnable))))
 	mux.Handle("POST /api/account/2fa/disable", s.auth(s.csrf(http.HandlerFunc(s.handleTOTPDisable))))
+	mux.Handle("GET /api/account/passkeys", s.auth(http.HandlerFunc(s.handleListPasskeys)))
+	mux.Handle("POST /api/account/passkeys/begin", s.auth(s.csrf(http.HandlerFunc(s.handleAddPasskeyBegin))))
+	mux.Handle("POST /api/account/passkeys/finish", s.auth(s.csrf(http.HandlerFunc(s.handleAddPasskey))))
+	mux.Handle("PATCH /api/account/passkeys/{id}", s.auth(s.csrf(http.HandlerFunc(s.handleRenamePasskey))))
+	mux.Handle("DELETE /api/account/passkeys/{id}", s.auth(s.csrf(http.HandlerFunc(s.handleRemovePasskey))))
 	// F104 clusters: grouping + the cluster tier of the policy chain. Deleting a
 	// cluster removes a grouping only — never a node, container or backup.
 	mux.Handle("GET /api/clusters", s.auth(http.HandlerFunc(s.handleListClusters)))

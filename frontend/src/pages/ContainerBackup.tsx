@@ -28,6 +28,7 @@ import BackupCloudIcon from "../components/BackupCloudIcon";
 import ScheduleList from "../components/ScheduleList";
 import BackupConsole from "../components/BackupConsole";
 import { useToast } from "../components/Toast";
+import { announceRunEnd, runEndNotice } from "../lib/runNotice";
 import { usePoll } from "../hooks/usePoll";
 
 
@@ -390,8 +391,12 @@ export default function ContainerBackup() {
     finally { setCritSaving(false); }
   };
 
+  // The backup this page started, followed until it ends so its finish is
+  // announced however long it runs, not only when it beats the first poll.
+  const [watchedId, setWatchedId] = useState<string | null>(null);
+
   // Reset the (per-container) mount data + pending-run bridge when switching containers.
-  useEffect(() => { setMounts(null); setSelMounts(new Set()); setPendingId(null); }, [id, cid]);
+  useEffect(() => { setMounts(null); setSelMounts(new Set()); setPendingId(null); setWatchedId(null); }, [id, cid]);
 
 
   // Load the container's mounts (volumes/binds) with sizes so the user can pick
@@ -455,10 +460,12 @@ export default function ContainerBackup() {
         // started. Track that run so the button reflects it.
         toast.info(`A backup of ${c?.name || "this container"} is already ${res.status === "already_running" ? "running" : "queued"}.`);
         setPendingId(res.backup_id || null);
+        setWatchedId(res.backup_id || null);
       } else {
         const where = ["Local", ...dests.filter((d) => selDests.has(d.id)).map((d) => d.name)].join(", ");
         setMsg(`${useExport ? `App-native (${exportTool}) backup` : "Backup"} initiated → ${where}. Watch the console below.`);
         setPendingId(res.backup_id || null);
+        setWatchedId(res.backup_id || null);
       }
       // Refresh now (the run usually appears within a second) and again shortly
       // after, so the pending state resolves without waiting for the 6s poll.
@@ -469,20 +476,21 @@ export default function ContainerBackup() {
     finally { setStarting(false); }
   };
 
-  // Resolve the pending run once it shows up in the polled list. Large
-  // containers surface as "running" (the in-progress state takes over); small
-  // ones can finish between polls — surface THAT explicitly, so a backup that
-  // completed in under a second doesn't look like a click that never happened.
+  // Resolve the pending run once it shows up in the polled list: from then on
+  // the in-progress state takes over the button.
   useEffect(() => {
-    if (!pendingId) return;
-    const row = backups.find((b) => b.id === pendingId);
-    if (!row) return;
-    setPendingId(null);
-    if (row.status === "success") toast.success(`Backup of ${c?.name || row.target_name} completed.`);
-    else if (row.status === "failed") toast.error(`Backup of ${c?.name || row.target_name} failed${row.error ? `: ${row.error}` : ""}.`);
-    // "running" needs no toast — the button flips to "Backup in progress…".
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (pendingId && backups.some((b) => b.id === pendingId)) setPendingId(null);
   }, [backups, pendingId]);
+
+  // Announce the watched backup's end, whether it took a second or an hour.
+  useEffect(() => {
+    if (!watchedId) return;
+    const row = backups.find((b) => b.id === watchedId);
+    if (!row || row.status === "running") return;
+    setWatchedId(null);
+    announceRunEnd(toast, runEndNotice(`Backup of ${c?.name || row.target_name}`, "finished", row.status === "success" ? "ok" : "failed", row.error));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backups, watchedId]);
 
   // Failsafe: never leave the button stuck if the accepted run's row can't be
   // observed (e.g. it stays queued behind other work on this node for a long

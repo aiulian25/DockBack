@@ -66,6 +66,22 @@ CREATE TABLE IF NOT EXISTS sessions (
   last_seen  INTEGER NOT NULL DEFAULT 0
 );
 
+-- Passkeys: signing in with the device's own lock instead of the password and
+-- code. Only the public key is kept (inside credential_json, go-webauthn's
+-- credential record), and each one works only for the host it was made for.
+CREATE TABLE IF NOT EXISTS passkeys (
+  id              TEXT PRIMARY KEY,
+  user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  rp_id           TEXT NOT NULL,
+  credential_id   TEXT NOT NULL UNIQUE,
+  credential_json TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  synced          INTEGER NOT NULL DEFAULT 0,
+  created_at      INTEGER NOT NULL,
+  last_used_at    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS passkeys_user ON passkeys(user_id);
+
 -- Scoped API tokens for non-interactive automation (F45). Only the SHA-256 hash
 -- of the token value is stored (the plaintext is shown once at creation); lookup
 -- is by exact hash, so comparison is constant-time by construction.
@@ -653,6 +669,17 @@ func (s *Store) RenameUser(id int64, newName string) error {
 }
 
 // GetUserByName looks up a user by username.
+// GetUserByID looks up one user by id.
+func (s *Store) GetUserByID(id int64) (*User, error) {
+	u := &User{}
+	err := s.db.QueryRow(`SELECT id, username, password_hash, totp_secret, totp_pending, totp_recovery, totp_last_step FROM users WHERE id=?`, id).
+		Scan(&u.ID, &u.Username, &u.PasswordHash, &u.TOTPSecret, &u.TOTPPending, &u.TOTPRecovery, &u.TOTPLastStep)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return u, err
+}
+
 func (s *Store) GetUserByName(username string) (*User, error) {
 	u := &User{}
 	err := s.db.QueryRow(`SELECT id, username, password_hash, totp_secret, totp_pending, totp_recovery, totp_last_step FROM users WHERE username=?`, username).

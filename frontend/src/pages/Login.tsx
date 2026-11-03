@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
+import { KeyRound } from "lucide-react";
 import { api } from "../api";
+import { answerWithPasskey, passkeysSupported } from "../lib/passkey";
 import { Button, Input, Label } from "../components/ui";
 
 export default function Login() {
@@ -16,6 +18,29 @@ export default function Login() {
   // Remember the last code we auto-submitted so a rejected code doesn't loop —
   // the user must change it (which yields a new value) before we retry.
   const lastTried = useRef("");
+  // Offered once someone here has a passkey, at the address passkeys are bound
+  // to, in a browser that can use one: no username asked first.
+  const [passkeyOffered, setPasskeyOffered] = useState(false);
+  useEffect(() => {
+    api.passkeyStatus()
+      .then((st) => setPasskeyOffered(!!st.offered && st.origin === window.location.origin && passkeysSupported()))
+      .catch(() => setPasskeyOffered(false));
+  }, []);
+
+  const signInWithPasskey = async () => {
+    if (busy) return;
+    setBusy(true); setErr("");
+    try {
+      const begun = await api.passkeySignInBegin();
+      const credential = await answerWithPasskey(begun.options);
+      await api.passkeySignIn(begun.ceremony, credential);
+      navigate("/");
+    } catch (e) {
+      setErr((e as Error).message || "passkey sign-in failed");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -89,6 +114,11 @@ export default function Login() {
           <Button variant="primary" className="w-full" disabled={busy}>
             {busy ? "Signing in…" : needCode ? "Verify" : "Sign In"}
           </Button>
+          {passkeyOffered && !needCode && (
+            <Button type="button" variant="secondary" className="w-full" disabled={busy} onClick={signInWithPasskey}>
+              <KeyRound size={15} /> Sign in with a passkey
+            </Button>
+          )}
         </div>
       </form>
     </div>

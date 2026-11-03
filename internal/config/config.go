@@ -70,6 +70,11 @@ type Config struct {
 	// are hostnames, *.suffix domains, IPs, or CIDRs (DOCKBACK_EGRESS_ALLOW).
 	EgressAllow []string
 
+	// PublicURL is the address people open DockBack at, e.g.
+	// https://dockback.example.org (DOCKBACK_PUBLIC_URL). Passkeys are bound to
+	// its host name, so they are unavailable while it is unset or an IP address.
+	PublicURL string
+
 	// Fleet-scale backup concurrency (PLAN §4.13/§9.9): a global cap and a
 	// per-node cap so a nightly window across many nodes fans out fairly and one
 	// busy node can't starve the others' backups.
@@ -138,6 +143,7 @@ func Load() (*Config, error) {
 		TrustProxy:        envBool("DOCKBACK_TRUST_PROXY", false),
 		TrustedProxies:    trustedProxies,
 		EgressAllow:       parseList(os.Getenv("DOCKBACK_EGRESS_ALLOW")),
+		PublicURL:         strings.TrimSpace(os.Getenv("DOCKBACK_PUBLIC_URL")),
 
 		MaxConcurrentBackups: envIntMin("DOCKBACK_MAX_CONCURRENT_BACKUPS", 3, 1),
 		MaxConcurrentPerNode: envIntMin("DOCKBACK_MAX_CONCURRENT_PER_NODE", 2, 1),

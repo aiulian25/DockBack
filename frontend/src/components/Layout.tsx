@@ -11,6 +11,7 @@ import KeyEscrowBanner from "./KeyEscrowBanner";
 import VersionModal from "./VersionModal";
 import CommandPalette from "./CommandPalette";
 import QuickBackup from "./QuickBackup";
+import ScrollToTop from "./ScrollToTop";
 import { onAlertsChanged } from "../lib/alertsChanged";
 import { usePoll } from "../hooks/usePoll";
 
@@ -55,6 +56,8 @@ const nav = [
 export default function Layout({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   const location = useLocation();
+  // The pages scroll inside <main>, not the window.
+  const mainRef = useRef<HTMLElement>(null);
   // Logout is an SPA navigation (module state survives), so the once-per-load
   // session gate must be re-armed here (perf Fix 4).
   const logout = async () => { await api.logout().catch(() => {}); sessionGate.checked = false; navigate("/login"); };
@@ -273,12 +276,13 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         </header>
-        <main className="flex-1 overflow-y-auto p-5">
+        <main ref={mainRef} className="flex-1 overflow-y-auto p-5">
           <div className="mx-auto max-w-container">
             <KeyEscrowBanner />
             {children}
           </div>
         </main>
+        <ScrollToTop target={mainRef} />
       </div>
 
       {/* Command palette (Cmd/Ctrl-K) — replaces the old dead search box. */}

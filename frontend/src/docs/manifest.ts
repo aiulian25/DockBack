@@ -134,6 +134,7 @@ export const categories: DocCategory[] = [
       { slug: "write-only", title: "Write-only backups (DockBack can't read them)", file: "security/write-only" },
       { slug: "app-backup", title: "Back up & restore DockBack itself", file: "security/app-backup" },
       { slug: "two-factor", title: "Two-factor authentication (2FA)", file: "security/two-factor" },
+      { slug: "passkeys", title: "Passkeys", file: "security/passkeys" },
       { slug: "socket-proxy", title: "Socket-proxy permissions explained", file: "security/socket-proxy" },
       { slug: "tls", title: "HTTPS & TLS", file: "security/tls" },
       { slug: "path-confinement", title: "Destination path confinement", file: "security/path-confinement" },

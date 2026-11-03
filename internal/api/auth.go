@@ -446,20 +446,29 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	s.guard.reset(ip, user)
 
+	csrf, err := s.issueSession(w, r, u)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "session error")
+		return
+	}
+	_ = s.store.Audit(u.Username, "login.ok", "", "")
+	writeJSON(w, http.StatusOK, map[string]string{"username": u.Username, "csrf": csrf})
+}
+
+// issueSession signs u in on this browser: a new session, its CSRF pair and both
+// cookies. Every way of signing in ends here, so they all get the same session.
+func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, u *store.User) (string, error) {
 	token := randToken()
 	// F202: record where this sign-in came from, so the owner can later tell
 	// their own sessions apart from one they do not recognise.
 	if err := s.store.CreateSessionFrom(token, u.ID, s.sessionTTL(), s.clientIP(r), safeLabel(r.UserAgent(), maxUserAgentLen)); err != nil {
-		errJSON(w, http.StatusInternalServerError, "session error")
-		return
+		return "", err
 	}
 	csrf := randToken()
 	// Stash csrf alongside the session so we can validate the double-submit.
 	_ = s.store.SetSetting(csrfKey(store.SessionKey(token)), csrf)
 	s.setSessionCookies(w, r, token, csrf, int(s.sessionTTL().Seconds()))
-
-	_ = s.store.Audit(u.Username, "login.ok", "", "")
-	writeJSON(w, http.StatusOK, map[string]string{"username": u.Username, "csrf": csrf})
+	return csrf, nil
 }
 
 // handleChangePassword re-authenticates with the current password, sets a new

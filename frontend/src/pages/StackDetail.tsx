@@ -26,6 +26,7 @@ import ScheduleWhenFields from "../components/ScheduleWhenFields";
 import { useStickyScroll } from "../hooks/useStickyScroll";
 import { usePoll } from "../hooks/usePoll";
 import { useToast } from "../components/Toast";
+import { announceRunEnd, runEndNotice } from "../lib/runNotice";
 
 // F115: how many services' mounts are measured at once. Measuring runs `du` in a
 // sidecar per container and can take minutes on a large bind, so a wide stack
@@ -194,12 +195,13 @@ export default function StackDetail() {
         const p = stackProgress(l.msg);
         if (p) setRunProgress(p);
       },
-      onDone: (outcome) => {
+      onDone: (outcome, message) => {
         setRunState(outcome === "ok" ? "ok" : "fail");
+        announceRunEnd(toast, runEndNotice(`Stack “${project}” ${kind}`, "finished", outcome, message));
         loadStack(); loadGroups(); loadRunning();
       },
     });
-  }, [project, rows, loadStack, loadGroups, loadRunning]);
+  }, [project, rows, loadStack, loadGroups, loadRunning, toast]);
 
   // Arriving back from the restore page: attach to the run it just started.
   useEffect(() => {

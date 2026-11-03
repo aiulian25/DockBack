@@ -18,6 +18,7 @@ import KeyEscrowModal from "../components/KeyEscrowModal";
 import KeyRotateModal from "../components/KeyRotateModal";
 import AddDestinationModal from "../components/AddDestinationModal";
 import TwoFactorCard from "../components/TwoFactorCard";
+import PasskeysCard from "../components/PasskeysCard";
 import NotificationsCard from "../components/NotificationsCard";
 import ClustersCard from "../components/ClustersCard";
 import { SettingsSaveProvider, useRegisterSaver } from "../components/SettingsSave";
@@ -1823,6 +1824,7 @@ function SettingsInner() {
             the stack's first rendered child on its own tab (no stray leading gap). */}
         <div className={tab === "notifications" ? "" : "hidden"}><NotificationsCard /></div>
         <div className={tab === "security" ? "" : "hidden"}><TwoFactorCard /></div>
+        <div className={tab === "security" ? "" : "hidden"}><PasskeysCard /></div>
       </div>
 
       {/* Application Backup & Restore (the app's own state — PLAN §6.5/§9.3) */}

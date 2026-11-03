@@ -17,6 +17,7 @@ import BackupCloudIcon from "../components/BackupCloudIcon";
 import { useEventStream } from "../hooks/useEventStream";
 import { useStickyScroll } from "../hooks/useStickyScroll";
 import { useToast } from "../components/Toast";
+import { announceRunEnd, runEndNotice } from "../lib/runNotice";
 import { copyText, hasTextSelection } from "../clipboard";
 import UnprotectedBanner from "../components/UnprotectedBanner";
 import BackupTargetsModal from "../components/BackupTargetsModal";
@@ -323,8 +324,9 @@ export default function NodeDetail() {
       mode: "stack",
       since: start - 2000,
       onLine: (l) => setStackLines((p) => [...p.slice(-80), { level: l.level, msg: l.msg }]),
-      onDone: (outcome) => {
+      onDone: (outcome, message) => {
         setStackDone(outcome === "ok" ? "ok" : "fail");
+        announceRunEnd(toast, runEndNotice(`Stack “${project}” ${kind}`, "finished", outcome, message));
         if (outcome === "ok") { loadContainers(); loadStacks(); }
       },
     });

@@ -210,7 +210,7 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   machine when a destination is set. It warns when that backup is stale or fails,
   and when every copy of every backup sits on one machine. Only one DockBack runs
   against a data directory at a time; a second start exits instead of interfering.
-- **Hardened, single-admin web UI** — argon2id auth with optional TOTP 2FA,
+- **Hardened, single-admin web UI** — argon2id auth with optional TOTP 2FA and passkeys,
   absolute + idle **auto-logout**, escalating login lockout, CSRF, **step-up
   re-authentication ("sudo mode")** for key-material actions, expiring API
   tokens, a **tamper-evident (hash-chained) audit trail**,
@@ -222,7 +222,9 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   console shows every service's output, labelled, and ends on one line that says
   whether every service got its backup; a container's console follows its part of
   a stack backup too. Run buttons read **Backup in progress…** whenever one is
-  running, whoever started it.
+  running, whoever started it. When a backup or restore you started finishes, a
+  **notification pops up** saying how it ended, so you never scroll a log to find
+  out, and long pages have a **back-to-top** button.
   See **[Access control & account security](#access-control--account-security)** below.
 - **Homepage widget** — a [Homepage](https://gethomepage.dev) tile with nodes,
   backups, failures and unprotected containers, read by its Custom API widget
@@ -406,6 +408,12 @@ default — a defense-in-depth complement to the private-network access above.
   codes** are stored only as hashes, and a single-use step guard blocks code
   **replay**. Turning 2FA **off** takes a current code (or a recovery code) as
   well as your password, so a borrowed session cannot quietly remove it.
+- **Passkeys** — sign in with your fingerprint, face or device PIN instead of the
+  password and code. DockBack keeps only each passkey's public key, bound to the
+  name in `DOCKBACK_PUBLIC_URL`. A passkey must verify you to count, every
+  challenge works once and only for its purpose, adding one needs your password
+  (and code), and a refused passkey counts against the same lockout as a wrong
+  password.
 
 **Anti-abuse & anti-tamper**
 
@@ -549,6 +557,7 @@ existing series, so anything already summing them keeps working and gains a free
 | `DOCKBACK_TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto` from your reverse proxy. |
 | `DOCKBACK_TRUSTED_PROXIES` | *(empty)* | Source ranges whose forwarded headers are believed, e.g. `172.16.0.0/12`. List every proxy in the chain. Empty trusts any caller, which DockBack alerts on. An entry that does not parse refuses to start. |
 | `DOCKBACK_EGRESS_ALLOW` | *(empty)* | Optional default-deny outbound allow-list. |
+| `DOCKBACK_PUBLIC_URL` | *(empty)* | The `https://` address you open DockBack at. Passkeys are bound to its name; empty or an IP address keeps them off. |
 | `DOCKBACK_MAX_CONCURRENT_BACKUPS` | `3` | Total backups running at once. |
 | `DOCKBACK_MAX_CONCURRENT_PER_NODE` | `2` | Backups at once on any one node. |
 | `DOCKBACK_MAX_UPLOAD_MBPS` | `0` | Cap offsite upload rate (0 = unlimited). |
