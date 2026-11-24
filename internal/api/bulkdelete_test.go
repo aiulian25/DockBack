@@ -27,7 +27,7 @@ func TestBulkDeleteBackups(t *testing.T) {
 		t.Fatal(err)
 	}
 	eng := &backup.Engine{Store: st, Storage: be, Key: make([]byte, 32), Log: func(string, string, string) {}}
-	s := &Server{store: st, engine: eng}
+	s := &Server{store: st, locks: newOpLocks(), engine: eng}
 
 	for _, id := range []string{"a", "b", "c"} {
 		if err := st.CreateBackup(&store.Backup{ID: id, NodeID: "n", TargetName: "svc-" + id, Status: "success", CreatedAt: 1}); err != nil {

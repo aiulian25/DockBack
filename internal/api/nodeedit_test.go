@@ -127,6 +127,7 @@ func TestPurgeNodePagesLargeCatalog(t *testing.T) {
 	}
 	s := &Server{
 		store:    st,
+		locks:    newOpLocks(),
 		reg:      dockercli.NewRegistry(),
 		engine:   &backup.Engine{Store: st, Storage: sb, Log: func(string, string, string) {}},
 		machines: newMachineCache(),
@@ -141,7 +142,7 @@ func TestPurgeNodePagesLargeCatalog(t *testing.T) {
 		if err := st.CreateBackup(&store.Backup{ID: id, NodeID: "n1", TargetName: "app", Status: "success", CreatedAt: int64(i)}); err != nil {
 			t.Fatal(err)
 		}
-		// A unique, non-existent storage key: DeleteArtifacts then targets a file
+		// A unique, non-existent storage key: the delete then targets a file
 		// that isn't there (a clean no-op) instead of the storage root.
 		_ = st.SetBackupStorageKey(id, "k-"+id)
 	}

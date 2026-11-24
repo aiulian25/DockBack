@@ -98,6 +98,10 @@ type Server struct {
 	// backup can't be mirrored twice concurrently (a wasteful re-upload race).
 	mirrorInFlight sync.Map // backupID -> struct{}
 
+	// purgeDeferred remembers why a forgotten node could not be purged, so the
+	// reason is logged when it changes and not on every sweep.
+	purgeDeferred sync.Map // node id -> reason
+
 	// backfill tracks a per-destination "backfill existing history" sweep (F51):
 	// one at a time per destination, with live progress for the GET status endpoint.
 	backfillMu sync.Mutex
@@ -552,6 +556,14 @@ func (s *Server) purgeExpiredNodes() {
 // row itself (which holds the sealed connection credentials). Never touches the
 // remote host (PLAN §5.4) — it only forgets state DockBack stored.
 func (s *Server) purgeNode(id string) {
+	summaries, err := s.store.ListBackupSummaries(id, purgeEveryBackup)
+	if err != nil {
+		return // the next sweep tries again
+	}
+	if reason := s.purgeBlocked(id, summaries); reason != "" {
+		s.reportPurgeDeferred(id, reason)
+		return
+	}
 	// Stop using the connection (idempotent — the soft-delete already did this).
 	s.reg.Remove(id)
 	s.stopWatcher(id)
@@ -562,35 +574,12 @@ func (s *Server) purgeNode(id string) {
 	// can't block the purge sweep forever.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	// Page the catalog rather than materialising it. Each row carries the manifest,
-	// verification and locations JSON blobs, and DeleteArtifacts needs the storage
-	// key and locations of the row it is deleting — so the fields cannot be trimmed,
-	// only the number held at once. Each pass re-reads from the top because the
-	// previous pass deleted its rows.
-	deletedBackups := 0
-	const purgeBatch = 200
-	for {
-		backups, err := s.store.ListBackups(id, purgeBatch)
-		if err != nil || len(backups) == 0 {
-			break
-		}
-		progressed := false
-		for _, b := range backups {
-			s.engine.DeleteArtifacts(ctx, b)
-			if derr := s.store.DeleteBackup(b.ID); derr == nil {
-				deletedBackups++
-				progressed = true
-			}
-		}
-		if !progressed {
-			// Every row in this batch failed to delete: another pass would fetch the
-			// same rows forever. Stop rather than spin.
-			break
-		}
-		if ctx.Err() != nil {
-			break
-		}
+	deletedBackups, keptBackups, finished := s.purgeNodeBackups(ctx, summaries)
+	if !finished {
+		s.reportPurgeDeferred(id, "not all of its backups could be deleted yet")
+		return
 	}
+	s.purgeDeferred.Delete(id)
 
 	// Drop this node's targets from every saved schedule.
 	s.removeNodeFromSchedules(id)
@@ -603,8 +592,70 @@ func (s *Server) purgeNode(id string) {
 	s.machineForget(id)        // F105: never let a recycled id inherit another machine's hardware
 	_ = s.store.DeleteNode(id) // removes the row + its sealed credentials last
 
-	s.logSink("node", "INFO", fmt.Sprintf("Purged forgotten node %s and its data (%d backup(s) removed)", id, deletedBackups))
-	_ = s.store.Audit("system", "node.purge", id, fmt.Sprintf("backups_deleted=%d", deletedBackups))
+	s.logSink("node", "INFO", fmt.Sprintf("Purged forgotten node %s and its data (%d backup(s) removed, %d kept listed until their last copy can be deleted)", id, deletedBackups, keptBackups))
+	_ = s.store.Audit("system", "node.purge", id, fmt.Sprintf("backups_deleted=%d backups_deletion_incomplete=%d", deletedBackups, keptBackups))
+}
+
+// purgeEveryBackup is more rows than one node can have: the purge lists them all at
+// once, as slim rows, because a backup whose copy cannot be removed stays in the
+// catalog and a paged re-read from the top would meet it again forever.
+const purgeEveryBackup = 10_000_000
+
+// purgeBlocked names what stops a forgotten node from being purged this sweep, or
+// "" when nothing does. A hold freezes its backups until someone has looked, and a
+// backup that is being read must not lose its archive.
+func (s *Server) purgeBlocked(id string, summaries []*store.Backup) string {
+	if held := backup.HeldTargets(s.store, id); len(held) > 0 {
+		return "on hold after a suspicious change: " + strings.Join(held, ", ")
+	}
+	for _, b := range summaries {
+		if reader := s.backupInUse(b); reader != "" {
+			return reader + " is using a backup of " + b.TargetName
+		}
+	}
+	return ""
+}
+
+// reportPurgeDeferred logs why a forgotten node is still here, once per reason
+// rather than once per sweep.
+func (s *Server) reportPurgeDeferred(id, reason string) {
+	if last, _ := s.purgeDeferred.Swap(id, reason); last == reason {
+		return
+	}
+	s.logSink("node", "WARN", fmt.Sprintf("Forgotten node %s is not purged yet: %s. It is tried again every minute", id, reason))
+}
+
+// purgeNodeBackups deletes a node's backups everywhere they are stored. A backup
+// with a copy that cannot be removed yet stays listed as "deletion incomplete" and
+// is counted as kept. finished=false means some backup was not dealt with at all,
+// so the node must stay until a later sweep has.
+func (s *Server) purgeNodeBackups(ctx context.Context, summaries []*store.Backup) (deleted, kept int, finished bool) {
+	for _, summary := range summaries {
+		if ctx.Err() != nil {
+			return deleted, kept, false
+		}
+		if summary.Status == store.BackupStatusDeleting {
+			kept++
+			continue
+		}
+		b, err := s.store.GetBackup(summary.ID)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return deleted, kept, false
+		}
+		deletion, err := s.engine.DeleteBackup(ctx, b)
+		if err != nil {
+			return deleted, kept, false
+		}
+		if !deletion.Removed {
+			kept++
+			continue
+		}
+		deleted++
+	}
+	return deleted, kept, true
 }
 
 // removeNodeFromSchedules drops every target belonging to a node from all saved

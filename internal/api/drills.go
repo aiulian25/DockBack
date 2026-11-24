@@ -149,9 +149,14 @@ func (s *Server) drillTick() {
 		if s.engine.DrillSkipReason(full) != "" {
 			continue
 		}
+		// Registered like a manual drill, so a delete knows the backup is being read.
+		if _, running := s.drillsInFlight.LoadOrStore(full.ID, struct{}{}); running {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 		s.runBackupDrill(ctx, full)
 		cancel()
+		s.drillsInFlight.Delete(full.ID)
 		ran++
 	}
 }

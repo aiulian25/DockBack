@@ -86,6 +86,13 @@ func (l *opLocks) acquireRestore(stackKey string) bool {
 	return true
 }
 
+// isRestoring reports (without acquiring) whether a restore holds the stack.
+func (l *opLocks) isRestoring(stackKey string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.restoring[stackKey]
+}
+
 func (l *opLocks) releaseRestore(stackKey string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

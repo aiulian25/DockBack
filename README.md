@@ -142,6 +142,9 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
   records the version the bucket gave it, so a delete marker or a newer object
   under the same name cannot hide or replace it from a restore, and pruning
   counts space as freed only when the provider has really removed it.
+  A delete never forgets a copy it could not remove: if one is locked or its
+  destination does not answer, the backup stays listed as **Deletion
+  incomplete** and DockBack finishes the delete when it can.
 - **Scheduling & retention** — multiple named schedules, GFS retention,
   per-cluster / per-node / per-container overrides resolved most-specific-first,
   low-RPO protection for critical databases, and an
@@ -195,7 +198,8 @@ Shipped as a single, hardened, distroless image — **just pull and run**.
 - **Ransomware tripwire** — a backup whose delta suddenly touches most of a
   volume (mass encryption / mass deletion) is flagged **suspect**, alerts
   critically, and **freezes retention** for that container so clean pre-event
-  generations can't be pruned away underneath the attack.
+  generations can't be pruned away underneath the attack, deleted by hand, or
+  lost by removing the server.
 - **Find any file, in any generation** — every backup stores a complete file
   index: search a path across all generations, diff two backups
   (added/changed/deleted), browse without limits, and pull back a single file —

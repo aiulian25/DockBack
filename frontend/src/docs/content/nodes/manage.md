@@ -14,6 +14,11 @@ The **Cluster** field is a picker over your existing clusters; typing a name tha
 
 Removing a node (**Forget node**) disconnects DockBack from that server and **permanently deletes all of its backups**, local and offsite, along with its stored connection credentials. It does not touch the server itself. You have about two minutes to **Undo** before the deletion runs; after that the backups cannot be recovered from DockBack. If you want to keep a node's history, leave the node in place.
 
+Two things can stand in the way:
+
+- **A container on hold.** A server with a container that is on hold after a suspected mass-change event (see **Ransomware tripwire**) cannot be removed. Review the container and clear its hold first.
+- **A copy that cannot be deleted.** If a backup has a copy that is locked, or on a destination that does not answer, that backup stays in **Backups** as **Deletion incomplete** after the server is gone. DockBack removes it once the copy can be deleted.
+
 Removing a node is not the same as removing a **cluster**: removing a cluster only removes a grouping and never disconnects a server.
 
 ## Reachability indicator

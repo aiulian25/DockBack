@@ -6,9 +6,10 @@ import "time"
 // costs one query when nothing is pending, and a window opens at minute precision.
 const offsiteDrainInterval = time.Minute
 
-// startOffsiteDrain sends pending offsite copies in the background. One pass runs at a
-// time, under the lifecycle: shutdown cancels an upload in flight, and the copy stays
-// pending for the next process to send.
+// startOffsiteDrain sends pending offsite copies in the background, and finishes
+// deletes that left a copy behind (DBK-029). One pass runs at a time, under the
+// lifecycle: shutdown cancels an upload in flight, and the copy stays pending for
+// the next process to send.
 func (s *Server) startOffsiteDrain() {
 	go func() {
 		t := time.NewTicker(offsiteDrainInterval)
@@ -30,4 +31,5 @@ func (s *Server) drainOffsiteOnce(now time.Time) {
 	}
 	defer s.beginOp()()
 	s.engine.DrainOffsite(s.rootContext(), now)
+	s.engine.RetryPendingDeletions(s.rootContext(), now)
 }

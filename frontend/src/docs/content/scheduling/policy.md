@@ -43,3 +43,10 @@ Save with **Save policy**.
 ## Deleting backups by hand
 
 Automatic pruning aside, you can remove specific backups yourself from **Backups → a node**. Tick the checkboxes on the rows you want gone (or the header checkbox to select the whole page) and click **Delete selected**; a single backup can also be deleted from its detail drawer. Deletion removes the encrypted archive from **every** location it lives in and is **permanent** — it asks for confirmation first, and each removal is recorded in the Audit Trail. A copy held on a destination under an **immutable / WORM object-lock** is left in place until its lock expires — that's the whole point of the lock — so it can survive an accidental delete.
+
+**A backup is only forgotten once no copy of it is left.** If a copy cannot be removed (it is locked, or its destination did not answer), DockBack removes everything else and keeps the backup listed as **Deletion incomplete**. Open the row to see which copy is left and why. DockBack finishes the delete by itself when the lock ends or the destination answers again; you can also **Try again now**, or **Stop tracking** the backup, which leaves that copy where it is for you to remove by hand. A backup that is being deleted can no longer be restored, and it no longer counts as a backup anywhere in DockBack.
+
+Two deletes are refused, with the reason:
+
+- a backup that a restore, a restore drill or an offsite copy is reading right now. Try again when it has finished.
+- any backup of a container that is **on hold** after a suspected mass-change event (see **Ransomware tripwire**). Clear the hold on the container's page first.

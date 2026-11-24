@@ -8,7 +8,7 @@
 # project, a localhost-only port, and throwaway volumes/containers, all removed
 # on exit. It only ever backs up the one throwaway container it creates.
 #
-# Nineteen cases, selected with E2E_CASE:
+# Twenty cases, selected with E2E_CASE:
 #
 #   sentinel (default) — the drill above: volume data lost and brought back.
 #   deleted-binds      — the recovery of 2026-10-04: a RUNNING container whose
@@ -80,6 +80,11 @@
 #                        snapshot: its image is bundled, its file index written, the
 #                        paths its profile never keeps left out, and what a group
 #                        cannot honour (export, incremental) recorded rather than dropped.
+#   delete-incomplete  — a backup is deleted while its offsite copy cannot be
+#                        removed. The local copy goes, the backup stays listed as
+#                        being deleted and names the copy that is left, it can no
+#                        longer be restored, and deleting it again once the
+#                        destination allows it removes the copy and the record.
 #   pg-hash            — #18's content baseline: a PostgreSQL database with a
 #                        timestamptz column is backed up, restored into another
 #                        container, and the restored cluster is then put in a
@@ -90,6 +95,7 @@
 #   ./scripts/e2e.sh
 #   E2E_CASE=pg-hash ./scripts/e2e.sh
 #   E2E_CASE=offsite-envelope ./scripts/e2e.sh
+#   E2E_CASE=delete-incomplete ./scripts/e2e.sh
 #   E2E_CASE=offsite-window ./scripts/e2e.sh
 #   E2E_CASE=restore-outcome ./scripts/e2e.sh
 #   E2E_CASE=clone-redaction ./scripts/e2e.sh
@@ -1528,6 +1534,64 @@ case_offsite_envelope() {
   printf '\033[1;32mE2E PASSED (offsite-envelope): a copy that lost its envelope was found, repaired in place, and opened from its own files.\033[0m\n'
 }
 
+# ── case: delete-incomplete ──────────────────────────────────────────────────
+
+case_delete_incomplete() {
+  local DEST_ROOT="/app/backups/e2e-undeletable" APP_ID DEST_ID CID BID KEY COPY_DIR REPLY CODE
+  docker volume create "$VOL" >/dev/null
+  docker run -d --name "$TARGET" -v "$VOL":/data alpine sleep 900 >/dev/null
+  docker exec "$TARGET" sh -c 'echo delete-data > /data/file'
+  APP_ID="$("${COMPOSE[@]}" ps -q backup-app)"
+  # in_app_volumes <command> — run a root shell over the app's own volumes.
+  in_app_volumes() { docker run --rm --volumes-from "$APP_ID" alpine sh -c "$1"; }
+  # backup_field <python expression over d> — one field of the backup's catalog row.
+  backup_field() { curl -fsS -b "$JAR" "$BASE/api/backups/$BID" | jget "$1"; }
+  # delete_backup — ask for the delete and print the reply.
+  delete_backup() { curl -fsS "${auth[@]}" -X DELETE "$BASE/api/backups/$BID"; }
+
+  step "Back up to an offsite destination"
+  DEST_ID="$(curl -fsS "${auth[@]}" -X POST "$BASE/api/destinations" \
+    -d "{\"name\":\"e2e-undeletable\",\"type\":\"local\",\"config\":{\"path\":\"$DEST_ROOT\"}}" | jget 'd["id"]')" \
+    || fail "could not add the destination"
+  CID="$(find_container "$TARGET")"
+  BID="$(backup_and_verify "$CID" "$TARGET" "$DEST_ID")"
+  KEY="$(backup_field 'd["storage_key"]')"
+  COPY_DIR="$(dirname "$DEST_ROOT/$KEY")"
+  in_app_volumes "test -f '$DEST_ROOT/$KEY' && test -f '/app/backups/$KEY'" || fail "the backup should be stored locally and offsite"
+
+  step "Make the offsite copy impossible to delete, then delete the backup"
+  # The app does not run as root, so a root-owned folder it may only read refuses its unlink.
+  in_app_volumes "chown root:root '$COPY_DIR' && chmod 555 '$COPY_DIR'"
+  REPLY="$(delete_backup)"
+  [ "$(printf '%s' "$REPLY" | jget 'd["status"]')" = "incomplete" ] || fail "the delete should answer incomplete: $REPLY"
+  [ "$(printf '%s' "$REPLY" | jget 'd["kept"][0]["location"]')" = "e2e-undeletable" ] || fail "the reply should name the copy that is left: $REPLY"
+  echo "  the delete answered: $REPLY"
+
+  step "The backup stays listed, holding only what is left"
+  [ "$(backup_field 'd["status"]')" = "deleting" ] || fail "the backup should be listed as being deleted"
+  [ "$(backup_field 'len(json.loads(d["locations"]))')" = "1" ] || fail "only the copy that is left should be listed"
+  [ "$(backup_field 'json.loads(d["locations"])[0].get("delete_outcome","")')" = "failed" ] || fail "the copy should say its delete failed"
+  in_app_volumes "test ! -e '/app/backups/$KEY'" || fail "the local copy could be deleted, so it must be gone"
+  in_app_volumes "test -f '$DEST_ROOT/$KEY' && test -f '$DEST_ROOT/$KEY.manifest.json'" || fail "the copy that stays must keep its archive and its manifest"
+
+  step "It can no longer be restored"
+  CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${auth[@]}" -X POST "$BASE/api/backups/$BID/restore" \
+    -d "{\"node_id\":\"local\",\"target_id\":\"$CID\",\"volumes\":true,\"confirm\":true}")"
+  [ "$CODE" = "409" ] || fail "restoring a backup that is being deleted should be refused, got $CODE"
+
+  step "Deleting it again while nothing changed leaves it listed"
+  [ "$(delete_backup | jget 'd["status"]')" = "incomplete" ] || fail "a retry that cannot finish should still answer incomplete"
+
+  step "Once the destination allows it, the same delete finishes"
+  in_app_volumes "chown 65532:65532 '$COPY_DIR' && chmod 755 '$COPY_DIR'"
+  [ "$(delete_backup | jget 'd["status"]')" = "deleted" ] || fail "the delete should finish once the copy can be removed"
+  CODE="$(curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" "$BASE/api/backups/$BID")"
+  [ "$CODE" = "404" ] || fail "the backup should have left the catalog, got $CODE"
+  in_app_volumes "test ! -e '$DEST_ROOT/$KEY' && test ! -e '$DEST_ROOT/$KEY.manifest.json'" || fail "the offsite copy and its manifest should be gone"
+
+  printf '\033[1;32mE2E PASSED (delete-incomplete): a copy that could not be deleted kept its backup listed, and the delete finished when it could.\033[0m\n'
+}
+
 # ── case: offsite-window ─────────────────────────────────────────────────────
 
 case_offsite_window() {
@@ -1914,9 +1978,10 @@ case "$E2E_CASE" in
   hold-required) case_hold_required ;;
   incremental-fidelity) case_incremental_fidelity ;;
   offsite-envelope) case_offsite_envelope ;;
+  delete-incomplete) case_delete_incomplete ;;
   offsite-window) case_offsite_window ;;
   restore-outcome) case_restore_outcome ;;
   clone-redaction) case_clone_redaction ;;
   stack-parity) case_stack_parity ;;
-  *) fail "unknown E2E_CASE '$E2E_CASE' (known: offsite-envelope, offsite-window, restore-outcome, clone-redaction, stack-parity, sentinel, pg-hash, deleted-binds, moved-bind, stack-folder, files-only, stack-selection, clone-ownership, clone-sandbox, revert-rollback, shutdown-holds, hook-cleanup, hold-required, incremental-fidelity)" ;;
+  *) fail "unknown E2E_CASE '$E2E_CASE' (known: delete-incomplete, offsite-envelope, offsite-window, restore-outcome, clone-redaction, stack-parity, sentinel, pg-hash, deleted-binds, moved-bind, stack-folder, files-only, stack-selection, clone-ownership, clone-sandbox, revert-rollback, shutdown-holds, hook-cleanup, hold-required, incremental-fidelity)" ;;
 esac

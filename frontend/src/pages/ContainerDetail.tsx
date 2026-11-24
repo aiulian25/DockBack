@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { followRun } from "../lib/logStream";
 import { newExecutionId } from "../lib/runDone";
+import { isDeletionIncomplete } from "../lib/backupDeletion";
 import { api, Backup, ContainerInfo, ContainerSizes, DrillStatus, RestoreCompatError, RestoreReadiness, StepUpError, fmtBytes, fmtAgo } from "../api";
 import { isRestoreProgressLine } from "../lib/restoreLogFilter";
 import { Button, Card, Chip, Modal } from "../components/ui";
@@ -776,6 +777,7 @@ function BackupStatus({ b }: { b: Backup }) {
   if (b.status === "running") return <span className="flex items-center gap-2 text-secondary"><BackupCloudIcon size={15} active /> In Progress</span>;
   if (b.status === "canceled") return <span className="flex items-center gap-2 text-on-surface-variant"><XCircle size={15} /> Canceled</span>;
   if (b.status === "failed") return <span className="flex items-center gap-2 text-error"><XCircle size={15} /> Failed</span>;
+  if (isDeletionIncomplete(b)) return <span className="flex items-center gap-2 text-warning"><XCircle size={15} /> Deletion incomplete</span>;
   return <span className="flex items-center gap-2 text-success">{b.verified === "verified" ? <ShieldCheck size={15} /> : <CheckCircle2 size={15} />} {b.verified === "verified" ? "Verified" : "Success"}</span>;
 }
 function healthText(c: ContainerInfo | null): string {

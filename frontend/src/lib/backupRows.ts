@@ -12,6 +12,9 @@ export interface BackupLocation {
   lock_until?: number;
   verified_at?: number;
   verify_ok?: boolean;
+  /** Set on a copy that outlived its backup's deletion: "locked" or "failed", and why. */
+  delete_outcome?: string;
+  delete_detail?: string;
 }
 
 /** The per-row flags the list chips are drawn from. */

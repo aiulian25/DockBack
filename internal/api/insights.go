@@ -189,7 +189,7 @@ func (s *Server) handleInsights(w http.ResponseWriter, r *http.Request) {
 	dayMap := map[int64]*insightsDay{}
 	var t30, v30 int
 	for _, b := range list {
-		if b.Status == "running" {
+		if b.Status == "running" || b.Deleting() {
 			continue
 		}
 		if b.CreatedAt >= cutoff30 {

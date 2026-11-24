@@ -2479,6 +2479,51 @@ func (s *Store) LastSuccessfulByNode() (map[string]int64, error) {
 	return out, rows.Err()
 }
 
+// BackupStatusDeleting is a backup whose deletion was asked for while a copy could
+// not be removed: it is locked, or its destination did not answer. The row stays so
+// that copy stays findable, and its locations hold only what is left. It is not a
+// successful backup, so nothing restores from it, counts it or keeps it.
+const BackupStatusDeleting = "deleting"
+
+// Deleting reports whether the backup was deleted and only waits for its last
+// copies to be removed. Such a row is not a run to count, any more than a row that
+// is already gone.
+func (b *Backup) Deleting() bool { return b.Status == BackupStatusDeleting }
+
+// ListBackupsDeleting returns every backup still waiting for its last copies to be
+// removed, oldest first.
+func (s *Store) ListBackupsDeleting() ([]*Backup, error) {
+	rows, err := s.db.Query(`SELECT id FROM backups WHERE status=? ORDER BY created_at ASC`, BackupStatusDeleting)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]*Backup, 0, len(ids))
+	for _, id := range ids {
+		b, err := s.GetBackup(id)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
 // DeleteBackup removes a backup record (caller deletes the artifact separately).
 func (s *Store) DeleteBackup(id string) error {
 	// One transaction: a crash between these statements used to leave the catalog

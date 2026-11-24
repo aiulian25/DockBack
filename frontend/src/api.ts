@@ -1,6 +1,7 @@
 // Thin typed client for the DockBack REST API. Mutations attach the CSRF
 // token from the cookie set at login (double-submit).
 import type { CreationOptionsJSON, RequestOptionsJSON } from "./lib/passkey";
+import type { KeptCopy } from "./lib/backupDeletion";
 
 // qstr builds a "?a=1&b=2" query string from a params object, skipping empty/
 // undefined values so a blank search/filter doesn't constrain the result.
@@ -271,6 +272,14 @@ export interface BackupSummary {
   db_fallback?: boolean; // F103/F154: a database in this backup was copied as raw files rather than snapshotted consistently
   db_count?: number; image?: string; image_digest?: string; copies?: BackupCopy[];
 }
+/** What a delete did: the backup is gone, a copy is still stored, or it was let go. */
+export interface DeleteBackupResult {
+  status: "deleted" | "incomplete" | "forgotten";
+  kept?: KeptCopy[];
+  /** Chain delete only: the members that still have a copy stored. */
+  incomplete?: string[];
+}
+
 export interface Backup {
   id: string; node_id: string; stack: string; target_name: string; status: string;
   verified: string; size_bytes: number; cipher_sha256: string; storage_key: string;
@@ -1285,8 +1294,12 @@ export const api = {
     req<{ restore_health_timeout_seconds: number; restore_health_timeout_override: number }>("PUT", `/api/nodes/${id}/containers/${cid}/restore-timeout`, { seconds }),
   // cascade (F63): also delete every incremental descendant, newest-first —
   // offered after a 409 "baseline of N deltas" refusal.
-  deleteBackup: (id: string, cascade?: boolean) => req<unknown>("DELETE", `/api/backups/${id}`, cascade ? { cascade: true } : undefined),
-  deleteBackups: (ids: string[]) => req<{ deleted: number; failed: { id: string; error: string }[] }>("POST", "/api/backups/delete", { ids }),
+  // A delete answers "deleted", or "incomplete" with the copies it could not remove:
+  // the backup then stays listed until they can be. Deleting it again is a retry.
+  deleteBackup: (id: string, cascade?: boolean) => req<DeleteBackupResult>("DELETE", `/api/backups/${id}`, cascade ? { cascade: true } : undefined),
+  // Stop tracking a backup whose deletion is incomplete; its remaining copies stay where they are.
+  forgetBackup: (id: string) => req<DeleteBackupResult>("DELETE", `/api/backups/${id}`, { forget: true }),
+  deleteBackups: (ids: string[]) => req<{ deleted: number; incomplete?: string[]; failed: { id: string; error: string }[] }>("POST", "/api/backups/delete", { ids }),
   cancelBackup: (id: string) => req<{ status: string }>("POST", `/api/backups/${id}/cancel`),
   // F44: re-verify (scrub) a backup. Pass a source ("local" or a destination ID) to
   // scrub a specific copy; omit to scrub the local copy (or, for an adopted

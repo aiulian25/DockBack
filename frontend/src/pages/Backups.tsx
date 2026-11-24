@@ -31,6 +31,8 @@ import { usePoll } from "../hooks/usePoll";
 import ExportDownloadButton from "../components/ExportDownloadButton";
 import RestoreFileButton from "../components/RestoreFileButton";
 import StepUpPrompt from "../components/StepUpPrompt";
+import DeletionIncomplete from "../components/DeletionIncomplete";
+import { BACKUP_STATUS_DELETING, isDeletionIncomplete, keptCopiesNotice } from "../lib/backupDeletion";
 
 
 function verifyChip(v: string) {
@@ -39,10 +41,20 @@ function verifyChip(v: string) {
     : <Chip kind="warn"><ShieldAlert size={12} /> Unverified</Chip>;
   return <span title={verificationScope(v)}>{chip}</span>;
 }
+// Long enough to read a sentence that names what a delete left behind.
+const DELETE_NOTICE_MS = 12000;
+// A backup can outlive its server: one whose last copy could not be deleted yet.
+const REMOVED_SERVER_NAME = "a server that was removed";
+
+function incompleteDeletesNotice(count: number) {
+  return `${count} backup${count === 1 ? " still has" : "s still have"} a copy that could not be deleted yet. ${count === 1 ? "It stays" : "They stay"} listed as "Deletion incomplete" until DockBack can remove ${count === 1 ? "it" : "them"}.`;
+}
+
 function statusChip(s: string) {
   if (s === "success") return <Chip kind="ok">Success</Chip>;
   if (s === "running") return <Chip kind="info"><BackupCloudIcon size={12} active /> Running</Chip>;
   if (s === "failed") return <Chip kind="err">Failed</Chip>;
+  if (s === BACKUP_STATUS_DELETING) return <Chip kind="warn">Deletion incomplete</Chip>;
   return <Chip kind="muted">{s}</Chip>;
 }
 // F50: a single A–F restore-confidence grade. A/B green, C amber, D/F red.
@@ -264,7 +276,10 @@ export default function Backups() {
       message: `Deleted backup of ${b.target_name}`,
       onUndo: () => unpend([b.id]),
       onCommit: async () => {
-        try { await api.deleteBackup(b.id); }
+        try {
+          const result = await api.deleteBackup(b.id);
+          if (result.status === "incomplete") toast.info(keptCopiesNotice(result.kept || []), DELETE_NOTICE_MS);
+        }
         catch (e) {
           const msg = (e as Error).message;
           // F63: the server refused because newer incremental backups depend on
@@ -274,7 +289,12 @@ export default function Backups() {
               message: `This backup is the baseline of newer incremental backups. Deleting it alone would make them unrestorable.`,
               actionLabel: "Delete the whole chain",
               onAction: async () => {
-                try { await api.deleteBackup(b.id, true); toast.success("Chain deleted."); }
+                try {
+                  const result = await api.deleteBackup(b.id, true);
+                  const leftListed = result.incomplete?.length || 0;
+                  if (leftListed) toast.info(incompleteDeletesNotice(leftListed), DELETE_NOTICE_MS);
+                  else toast.success("Chain deleted.");
+                }
                 catch (e2) { toast.error(`Couldn't delete the chain: ${(e2 as Error).message}`); }
                 finally { load(); loadPage(); }
               },
@@ -301,6 +321,8 @@ export default function Backups() {
           const res = await api.deleteBackups(ids);
           const failedN = res.failed?.length || 0;
           if (failedN) toast.error(`${failedN} backup${failedN === 1 ? "" : "s"} could not be deleted: ${res.failed.map((f) => f.error).join(", ")}`);
+          const leftListed = res.incomplete?.length || 0;
+          if (leftListed) toast.info(incompleteDeletesNotice(leftListed), DELETE_NOTICE_MS);
         } catch (e) {
           toast.error(`Bulk delete failed: ${(e as Error).message}`);
         } finally {
@@ -543,7 +565,7 @@ export default function Backups() {
                     <td className="px-5 py-4">
                       <div className="flex items-center gap-1.5">
                         {gradeBadge(b.confidence)}
-                        {verifyChip(b.verified)}
+                        {!isDeletionIncomplete(b) && verifyChip(b.verified)}
                         {failedCopies(b).length > 0 && (
                           <span title={`Off-site incomplete: ${failedCopies(b).map((l) => l.name).join(", ")} not fully uploaded`}>
                             <Chip kind="warn"><AlertTriangle size={12} /> Degraded</Chip>
@@ -633,11 +655,19 @@ export default function Backups() {
                             <Pin size={15} className={b.pinned ? "fill-current" : ""} />
                           </button>
                         )}
-                        <Button variant="secondary" size="sm"
-                          onClick={(e) => { e.stopPropagation(); setSel(b); }}
-                          title="Restore this backup — opens options (choose target node, download, delete, view report)">
-                          <RotateCcw size={14} className="text-primary" /> Restore…
-                        </Button>
+                        {isDeletionIncomplete(b) ? (
+                          <Button variant="secondary" size="sm"
+                            onClick={(e) => { e.stopPropagation(); setSel(b); }}
+                            className="whitespace-nowrap" title="See which copy is still stored, and why">
+                            What's left
+                          </Button>
+                        ) : (
+                          <Button variant="secondary" size="sm"
+                            onClick={(e) => { e.stopPropagation(); setSel(b); }}
+                            title="Restore this backup — opens options (choose target node, download, delete, view report)">
+                            <RotateCcw size={14} className="text-primary" /> Restore…
+                          </Button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -661,7 +691,9 @@ export default function Backups() {
         </>
       )}
 
-      {sel && <Detail b={sel} nodeName={nodeById[sel.node_id]?.name || sel.node_id} nodes={nodes} drills={drills}
+      {sel && isDeletionIncomplete(sel) && <DeletionIncomplete backup={sel} nodeName={nodeById[sel.node_id]?.name || REMOVED_SERVER_NAME}
+        onClose={() => setSel(null)} onChanged={() => { load(); loadPage(); }} />}
+      {sel && !isDeletionIncomplete(sel) && <Detail b={sel} nodeName={nodeById[sel.node_id]?.name || sel.node_id} nodes={nodes} drills={drills}
         siblings={list.filter((x) => x.node_id === sel.node_id && x.target_name === sel.target_name && x.status === "success")}
         stackServices={sel.stack ? new Set(list.filter((x) => x.node_id === sel.node_id && x.stack === sel.stack && x.status === "success").map((x) => x.target_name)).size : 0}
         onPick={setSel} onClose={() => setSel(null)} onDelete={() => del(sel)} onChanged={load}

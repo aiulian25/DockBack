@@ -19,7 +19,7 @@ The backup itself **still succeeds** — capturing the evidence (and the deletio
 
 1. The backup row is flagged **suspect** (a red chip on the Backups page, with the reason in its tooltip).
 2. A **critical-path alert** fires through your notification channels: *"Possible mass-change/ransomware event"*, naming the container and the counts.
-3. A **retention hold** is placed on that container: no pruning — scheduled, post-backup, or manual sweep — touches its backups until you clear the hold. Your clean pre-event generations stay exactly where they are.
+3. A **retention hold** is placed on that container: no pruning — scheduled, post-backup, or manual sweep — touches its backups until you clear the hold. They cannot be deleted by hand either, and the container's server cannot be removed. Your clean pre-event generations stay exactly where they are.
 
 ## Reviewing and clearing
 

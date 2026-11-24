@@ -281,7 +281,7 @@ func TestDeletingARecordedVersionFreesItsBytes(t *testing.T) {
 	e, bucket, backend := versionedEngine(t, 0)
 	b := remoteOnlyBackup(t, e, backend, "archive-bytes")
 
-	deletions := e.DeleteArtifacts(context.Background(), b)
+	deletions, _ := e.deleteCopies(context.Background(), b)
 
 	if len(deletions) != 1 || deletions[0].Outcome != CopyRemoved || !Reclaimed(deletions) {
 		t.Fatalf("want the copy removed and reclaimed, got %+v", deletions)
@@ -297,7 +297,7 @@ func TestARetainedVersionIsNotCountedAsFreed(t *testing.T) {
 	e, bucket, backend := versionedEngine(t, 30)
 	b := remoteOnlyBackup(t, e, backend, "archive-bytes")
 
-	deletions := e.DeleteArtifacts(context.Background(), b)
+	deletions, _ := e.deleteCopies(context.Background(), b)
 
 	if len(deletions) != 1 || deletions[0].Outcome != CopyFailed || Reclaimed(deletions) {
 		t.Fatalf("a refused version delete must be reported as failed, got %+v", deletions)
@@ -319,7 +319,7 @@ func TestALegacyCopyIsDeletedWithoutClaimingTheBytes(t *testing.T) {
 		t.Fatalf("a legacy copy must stay readable by key: %v", err)
 	}
 	rc.Close()
-	deletions := e.DeleteArtifacts(context.Background(), b)
+	deletions, _ := e.deleteCopies(context.Background(), b)
 
 	if len(deletions) != 1 || deletions[0].Outcome != CopyUnconfirmed || Reclaimed(deletions) {
 		t.Fatalf("want an unconfirmed delete, got %+v", deletions)

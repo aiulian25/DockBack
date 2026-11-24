@@ -52,6 +52,13 @@ type Location struct {
 	// behind on a versioned bucket is unknown.
 	VersionID   string `json:"version_id,omitempty"`
 	Unversioned bool   `json:"unversioned,omitempty"`
+
+	// Set on a copy that outlived its backup's deletion (DBK-029): CopyLocked or
+	// CopyFailed, and the reason in words. Such a backup is in
+	// store.BackupStatusDeleting, where Attempts and NextAttemptAt count the delete's
+	// retries instead of an upload's.
+	DeleteOutcome string `json:"delete_outcome,omitempty"`
+	DeleteDetail  string `json:"delete_detail,omitempty"`
 }
 
 // Copy deletion outcomes (DBK-030): what deleting a backup did to one copy.
@@ -381,46 +388,57 @@ func (e *Engine) warnCopyFallback(ctx context.Context, b *store.Backup, loc Loca
 	}
 }
 
-// DeleteArtifacts removes a backup's archive + manifest from EVERY location it
-// lives in (local + all destinations), and says what happened to each copy.
-func (e *Engine) DeleteArtifacts(ctx context.Context, b *store.Backup) []CopyDeletion {
-	now := time.Now().Unix()
-	var deletions []CopyDeletion
+// sidecarSuffixes are the files written beside an archive, under its key.
+var sidecarSuffixes = []string{".manifest.json", ".manifest.json.sig", ".manifest.json.enc", ".verification.json"}
+
+// deleteCopies removes a backup's archive and sidecars from every location it lives
+// in (local and all destinations) and says what happened to each copy. remaining is
+// the copies still stored afterwards, each stamped with why and with when trying
+// again is worth it. A backup that never stored anything has no copies to remove.
+func (e *Engine) deleteCopies(ctx context.Context, b *store.Backup) (deletions []CopyDeletion, remaining []Location) {
+	if b.StorageKey == "" {
+		return nil, nil
+	}
+	now := time.Now()
 	for _, loc := range e.locations(b) {
 		if noData(loc.Status) {
 			continue // nothing was written there (failed/deferred)
 		}
-		if loc.Immutable && loc.LockUntil > now {
-			// WORM-locked: the object store refuses deletion until expiry — that's
-			// the whole point. Skip it (and don't generate noisy errors). PLAN §9.1.
-			until := time.Unix(loc.LockUntil, 0).UTC().Format("2006-01-02")
-			e.logf(b.ID, "INFO", "Keeping WORM-locked copy on %s (immutable until %s)", loc.Name, until)
-			deletions = append(deletions, CopyDeletion{Location: loc.Name, Outcome: CopyLocked, Detail: "immutable until " + until})
-			continue
-		}
-		be, err := e.backendForLocation(loc)
-		if err != nil {
-			deletions = append(deletions, CopyDeletion{Location: loc.Name, Outcome: CopyFailed, Detail: err.Error()})
-			continue
-		}
-		deletion := deleteCopy(ctx, be, loc, b.StorageKey)
-		// Surface a failure to remove the main archive: the catalog row is deleted
-		// regardless (so it leaves the list), which would otherwise silently orphan
-		// the file and waste space. The WARN + "Find orphaned files" sweep make it
-		// reclaimable instead of invisible (PLAN §4.6).
-		switch deletion.Outcome {
-		case CopyFailed:
-			e.logf(b.ID, "WARN", "Could not remove backup file from %s (%s) — it may remain as reclaimable space; use Settings → Find orphaned files to clean it up", loc.Name, deletion.Detail)
-		case CopyUnconfirmed:
-			e.logf(b.ID, "INFO", "Removed the backup file from %s by name. %s", loc.Name, deletion.Detail)
-		}
-		_ = be.Delete(ctx, b.StorageKey+".manifest.json")
-		_ = be.Delete(ctx, b.StorageKey+".manifest.json.sig")
-		_ = be.Delete(ctx, b.StorageKey+".manifest.json.enc")
-		_ = be.Delete(ctx, b.StorageKey+".verification.json")
+		deletion := e.deleteLocation(ctx, b, loc, now)
 		deletions = append(deletions, deletion)
+		if copyStillStored(deletion.Outcome) {
+			remaining = append(remaining, awaitingDeletion(loc, deletion, now))
+		}
 	}
-	return deletions
+	return deletions, remaining
+}
+
+// deleteLocation removes one copy and its sidecars. The sidecars go only once the
+// archive has: a copy that stays must still say what it is.
+func (e *Engine) deleteLocation(ctx context.Context, b *store.Backup, loc Location, now time.Time) CopyDeletion {
+	if loc.Immutable && loc.LockUntil > now.Unix() {
+		// WORM-locked: the object store refuses deletion until expiry — that's
+		// the whole point. Skip it (and don't generate noisy errors). PLAN §9.1.
+		until := time.Unix(loc.LockUntil, 0).UTC().Format("2006-01-02")
+		e.logf(b.ID, "INFO", "Keeping WORM-locked copy on %s (immutable until %s)", loc.Name, until)
+		return CopyDeletion{Location: loc.Name, Outcome: CopyLocked, Detail: "immutable until " + until}
+	}
+	be, err := e.backendForLocation(loc)
+	if err != nil {
+		return CopyDeletion{Location: loc.Name, Outcome: CopyFailed, Detail: err.Error()}
+	}
+	deletion := deleteCopy(ctx, be, loc, b.StorageKey)
+	switch deletion.Outcome {
+	case CopyFailed:
+		e.logf(b.ID, "WARN", "Could not remove the backup file from %s (%s). The backup stays listed as \"deletion incomplete\" and the delete is tried again", loc.Name, deletion.Detail)
+		return deletion
+	case CopyUnconfirmed:
+		e.logf(b.ID, "INFO", "Removed the backup file from %s by name. %s", loc.Name, deletion.Detail)
+	}
+	for _, suffix := range sidecarSuffixes {
+		_ = be.Delete(ctx, b.StorageKey+suffix)
+	}
+	return deletion
 }
 
 // deleteCopy removes one copy's archive as precisely as its recorded evidence

@@ -28,7 +28,7 @@ const digestLastSentKey = "digest.last_sent"
 // matches the Insights page for the same window. Pure.
 func aggregateBackupCounts(list []*store.Backup, since int64) (total, verified, failed int) {
 	for _, b := range list {
-		if b.Status == "running" || b.CreatedAt < since {
+		if b.Status == "running" || b.Deleting() || b.CreatedAt < since {
 			continue
 		}
 		total++

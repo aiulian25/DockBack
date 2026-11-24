@@ -359,6 +359,13 @@ func (s *Server) handleResetHostKey(w http.ResponseWriter, r *http.Request) {
 // row and its derived state once that window elapses.
 func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// A hold freezes a container's backups until someone has looked (F69), and
+	// removing its server would delete them. Refused while the server is still on
+	// screen, so the hold can be reviewed and cleared first (DBK-029).
+	if held := backup.HeldTargets(s.store, id); len(held) > 0 {
+		errJSON(w, http.StatusConflict, "this server has containers on hold after a suspicious change ("+strings.Join(held, ", ")+"). Review each one and clear its hold on the container's page before removing the server")
+		return
+	}
 	if err := s.store.SoftDeleteNode(id); err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1722,16 +1729,16 @@ func (s *Server) handleRestoreReadiness(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleDeleteBackup removes a backup record and its artifacts.
-// deleteBackupByID removes a single backup's artifacts from EVERY location
-// (local + destinations) and its catalog row, then audits it. Shared by the
-// single and bulk delete handlers so behaviour is identical: an immutable/WORM
-// offsite copy is enforced by the destination and survives per §9.1, and every
-// deletion is individually recorded in the append-only audit trail. Returns
-// errNotFound when the id doesn't exist.
-func (s *Server) deleteBackupByID(ctx context.Context, actor, id string) error {
+// deleteBackupByID deletes a single backup from EVERY location (local +
+// destinations) and audits it. Shared by the single, chain and bulk delete
+// handlers so behaviour is identical. The catalog row goes only when no copy is
+// left: a copy that is locked, or whose destination refused or did not answer,
+// keeps the backup listed as "deletion incomplete" and is retried (DBK-029).
+// Returns errNotFound when the id doesn't exist.
+func (s *Server) deleteBackupByID(ctx context.Context, actor, id string) (backup.BackupDeletion, error) {
 	b, err := s.store.GetBackup(id)
 	if err != nil {
-		return errNotFound
+		return backup.BackupDeletion{}, errNotFound
 	}
 	// Chain guard (F63): deleting the ancestor of a live incremental backup
 	// would strand every descendant ("backup chain is broken" on restore).
@@ -1741,18 +1748,105 @@ func (s *Server) deleteBackupByID(ctx context.Context, actor, id string) error {
 	// than risk orphaning a chain.
 	pm, perr := s.store.BackupParentMap(b.NodeID, b.TargetName)
 	if perr != nil {
-		return fmt.Errorf("cannot verify incremental-chain dependents: %w", perr)
+		return backup.BackupDeletion{}, fmt.Errorf("cannot verify incremental-chain dependents: %w", perr)
 	}
 	if deps := backup.ChainDescendants(id, pm); len(deps) > 0 {
-		return &errHasDependents{ids: deps}
+		return backup.BackupDeletion{}, &errHasDependents{ids: deps}
 	}
-	s.engine.DeleteArtifacts(ctx, b) // best-effort per location; WORM copies stay locked
+	if reader := s.backupInUse(b); reader != "" {
+		return backup.BackupDeletion{}, &errBackupInUse{reader: reader}
+	}
+	deletion, err := s.engine.DeleteBackup(ctx, b)
+	if err != nil {
+		return deletion, err
+	}
+	s.auditBackupDeletion(actor, b, deletion)
+	return deletion, nil
+}
+
+// Audit actions of a delete: the backup is gone, a copy of it is still stored, or
+// the operator chose to stop tracking what is left.
+const (
+	auditBackupDelete           = "backup.delete"
+	auditBackupDeleteIncomplete = "backup.delete.incomplete"
+	auditBackupDeleteForget     = "backup.delete.forget"
+)
+
+// auditBackupDeletion records a delete, naming every copy it had to leave.
+func (s *Server) auditBackupDeletion(actor string, b *store.Backup, deletion backup.BackupDeletion) {
+	if deletion.Removed {
+		_ = s.store.Audit(actor, auditBackupDelete, b.ID, b.TargetName)
+		return
+	}
+	_ = s.store.Audit(actor, auditBackupDeleteIncomplete, b.ID, b.TargetName+" — still stored: "+describeKeptCopies(deletion.Kept()))
+}
+
+// describeKeptCopies lists copies a delete left behind, each with its reason.
+func describeKeptCopies(kept []backup.CopyDeletion) string {
+	parts := make([]string, 0, len(kept))
+	for _, c := range kept {
+		parts = append(parts, c.Location+" ("+c.Detail+")")
+	}
+	return strings.Join(parts, "; ")
+}
+
+// backupInUse names what is reading a backup right now, or "" when nothing is.
+// Deleting under a reader would pull the archive out from under it.
+func (s *Server) backupInUse(b *store.Backup) string {
+	s.restoreMu.Lock()
+	_, restoring := s.restores[b.ID]
+	s.restoreMu.Unlock()
+	if restoring || s.locks.isRestoring(stackKey(b.NodeID, b.Stack, b.TargetName)) {
+		return "a restore"
+	}
+	if _, drilling := s.drillsInFlight.Load(b.ID); drilling {
+		return "a restore drill"
+	}
+	if _, mirroring := s.mirrorInFlight.Load(b.ID); mirroring {
+		return "an offsite copy"
+	}
+	return ""
+}
+
+// errBackupInUse: something is reading the backup, so it cannot be deleted yet.
+type errBackupInUse struct{ reader string }
+
+func (e *errBackupInUse) Error() string {
+	return e.reader + " is using this backup right now — try again when it has finished"
+}
+
+// deleteRefusal maps a delete that was refused, rather than one that broke, to its
+// HTTP status. ok=false means the error is not a refusal.
+func deleteRefusal(err error) (status int, ok bool) {
+	var inUse *errBackupInUse
+	switch {
+	case errors.Is(err, errNotFound):
+		return http.StatusNotFound, true
+	case errors.Is(err, backup.ErrTargetHeld), errors.As(err, &inUse):
+		return http.StatusConflict, true
+	}
+	return 0, false
+}
+
+// forgetBackup stops tracking a backup whose deletion could not finish. The copies
+// it still names stay where they are, and the audit trail keeps their names: this
+// is the operator deciding to let go, never something a delete does by itself.
+func (s *Server) forgetBackup(actor, id string) error {
+	b, err := s.store.GetBackup(id)
+	if err != nil {
+		return errNotFound
+	}
+	if b.Status != store.BackupStatusDeleting {
+		return errNotDeleting
+	}
 	if err := s.store.DeleteBackup(id); err != nil {
 		return err
 	}
-	_ = s.store.Audit(actor, "backup.delete", id, b.TargetName)
+	_ = s.store.Audit(actor, auditBackupDeleteForget, id, b.TargetName+" — left in place: "+s.engine.DescribeRemainingCopies(b))
 	return nil
 }
+
+var errNotDeleting = errors.New("only a backup whose deletion is incomplete can be forgotten")
 
 var errNotFound = errors.New("not found")
 
@@ -1768,28 +1862,29 @@ func (e *errHasDependents) Error() string {
 // (F63): repeated passes over the remaining set delete every row whose children
 // are already gone, so no intermediate orphan state ever exists. Bounded by the
 // chain-depth cap. Returns the ids actually deleted, in deletion order.
-func (s *Server) deleteChainCascade(actor, id string, deps []string) ([]string, error) {
+func (s *Server) deleteChainCascade(actor, id string, deps []string) (deleted, incomplete []string, err error) {
 	remaining := append(append([]string{}, deps...), id)
-	var deleted []string
 	for pass := 0; pass < backup.IncrementalFullEveryMax+2 && len(remaining) > 0; pass++ {
 		var next []string
 		progress := false
 		for _, did := range remaining {
 			dctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			err := s.deleteBackupByID(dctx, actor, did)
+			deletion, derr := s.deleteBackupByID(dctx, actor, did)
 			cancel()
-			switch {
-			case err == nil, errors.Is(err, errNotFound):
-				deleted = append(deleted, did)
-				progress = true
-			default:
-				var dep *errHasDependents
-				if errors.As(err, &dep) {
-					next = append(next, did) // children still pending — later pass
-					continue
-				}
-				return deleted, err
+			var dep *errHasDependents
+			if errors.As(derr, &dep) {
+				next = append(next, did) // children still pending — later pass
+				continue
 			}
+			if derr != nil && !errors.Is(derr, errNotFound) {
+				return deleted, incomplete, derr
+			}
+			progress = true
+			if derr == nil && !deletion.Removed {
+				incomplete = append(incomplete, did)
+				continue
+			}
+			deleted = append(deleted, did)
 		}
 		remaining = next
 		if !progress {
@@ -1797,17 +1892,47 @@ func (s *Server) deleteChainCascade(actor, id string, deps []string) ([]string, 
 		}
 	}
 	if len(remaining) > 0 {
-		return deleted, fmt.Errorf("could not delete %d chain member(s): %v", len(remaining), remaining)
+		return deleted, incomplete, fmt.Errorf("could not delete %d chain member(s): %v", len(remaining), remaining)
 	}
-	return deleted, nil
+	return deleted, incomplete, nil
+}
+
+// Statuses a delete answers with.
+const (
+	deleteStatusDeleted    = "deleted"
+	deleteStatusIncomplete = "incomplete"
+	deleteStatusForgotten  = "forgotten"
+)
+
+// deletionReply is the body for one finished delete: gone, or which copies stay.
+func deletionReply(deletion backup.BackupDeletion) map[string]any {
+	if deletion.Removed {
+		return map[string]any{"status": deleteStatusDeleted}
+	}
+	return map[string]any{"status": deleteStatusIncomplete, "kept": deletion.Kept()}
+}
+
+// writeDeleteError answers a delete that did not happen.
+func writeDeleteError(w http.ResponseWriter, err error) {
+	if status, refused := deleteRefusal(err); refused {
+		errJSON(w, status, err.Error())
+		return
+	}
+	if errors.Is(err, errNotDeleting) {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	errJSON(w, http.StatusInternalServerError, err.Error())
 }
 
 func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	// Optional body {"cascade":true} (F63): delete the backup AND every
-	// incremental descendant in one audited operation.
+	// Optional body. cascade (F63): delete the backup AND every incremental
+	// descendant in one audited operation. forget (DBK-029): stop tracking a backup
+	// whose deletion is incomplete, leaving its remaining copies where they are.
 	var req struct {
 		Cascade bool `json:"cascade"`
+		Forget  bool `json:"forget"`
 	}
 	if r.ContentLength != 0 {
 		if err := readJSON(r, &req); err != nil {
@@ -1815,37 +1940,47 @@ func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	actor := userFrom(r)
+	if req.Forget {
+		if err := s.forgetBackup(actor, id); err != nil {
+			writeDeleteError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": deleteStatusForgotten})
+		return
+	}
 	dctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
-	actor := userFrom(r)
-	err := s.deleteBackupByID(dctx, actor, id)
+	deletion, err := s.deleteBackupByID(dctx, actor, id)
 	var dep *errHasDependents
 	if errors.As(err, &dep) {
-		if !req.Cascade {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"error":      "this backup " + dep.Error() + " — deleting it would make them unrestorable",
-				"dependents": dep.ids,
-			})
-			return
-		}
-		deleted, cerr := s.deleteChainCascade(actor, id, dep.ids)
-		if cerr != nil {
-			errJSON(w, http.StatusInternalServerError, cerr.Error())
-			return
-		}
-		_ = s.store.Audit(actor, "backup.delete.cascade", id, fmt.Sprintf("chain of %d backup(s) deleted", len(deleted)))
-		writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "cascade": true, "deleted": deleted})
+		s.deleteBackupChain(w, actor, id, dep, req.Cascade)
 		return
 	}
 	if err != nil {
-		if errors.Is(err, errNotFound) {
-			errJSON(w, http.StatusNotFound, "not found")
-			return
-		}
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		writeDeleteError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	writeJSON(w, http.StatusOK, deletionReply(deletion))
+}
+
+// deleteBackupChain answers a delete of a backup that newer incrementals depend
+// on: refused with their ids, or, when the caller asked to cascade, the whole chain.
+func (s *Server) deleteBackupChain(w http.ResponseWriter, actor, id string, dep *errHasDependents, cascade bool) {
+	if !cascade {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":      "this backup " + dep.Error() + " — deleting it would make them unrestorable",
+			"dependents": dep.ids,
+		})
+		return
+	}
+	deleted, incomplete, err := s.deleteChainCascade(actor, id, dep.ids)
+	if err != nil {
+		writeDeleteError(w, err)
+		return
+	}
+	_ = s.store.Audit(actor, "backup.delete.cascade", id, fmt.Sprintf("chain of %d backup(s) deleted, %d with a copy still stored", len(deleted)+len(incomplete), len(incomplete)))
+	writeJSON(w, http.StatusOK, map[string]any{"status": deleteStatusDeleted, "cascade": true, "deleted": deleted, "incomplete": incomplete})
 }
 
 // handleSetBackupPin pins/unpins a backup as "keep forever" — a pinned backup is
@@ -1932,6 +2067,7 @@ func (s *Server) handleBulkDeleteBackup(w http.ResponseWriter, r *http.Request) 
 		Error string `json:"error"`
 	}
 	deleted := 0
+	incomplete := []string{}
 	failed := []failItem{}
 	// Chain-aware ordering (F63): repeated passes let descendants in THIS
 	// request delete before their ancestors regardless of the ids' order. An
@@ -1943,8 +2079,13 @@ func (s *Server) handleBulkDeleteBackup(w http.ResponseWriter, r *http.Request) 
 		progress := false
 		for _, id := range remaining {
 			dctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			err := s.deleteBackupByID(dctx, actor, id)
+			deletion, err := s.deleteBackupByID(dctx, actor, id)
 			cancel()
+			if err == nil && !deletion.Removed {
+				incomplete = append(incomplete, id)
+				progress = true
+				continue
+			}
 			if err == nil {
 				deleted++
 				progress = true
@@ -1967,7 +2108,7 @@ func (s *Server) handleBulkDeleteBackup(w http.ResponseWriter, r *http.Request) 
 		pmMsg := "is the baseline of newer incremental backups — include them in the deletion or use the chain delete"
 		failed = append(failed, failItem{ID: id, Error: pmMsg})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "failed": failed})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "incomplete": incomplete, "failed": failed})
 }
 
 type restoreReq struct {
@@ -2095,6 +2236,10 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	b, berr := s.store.GetBackup(id)
 	if berr != nil {
 		errJSON(w, http.StatusNotFound, "backup not found")
+		return
+	}
+	if b.Status == store.BackupStatusDeleting {
+		errJSON(w, http.StatusConflict, "this backup is being deleted, so it cannot be restored")
 		return
 	}
 	// F218: a backup whose LAST VERIFICATION FAILED is known-bad — it was re-read
@@ -2784,7 +2929,7 @@ func (s *Server) backupRate(nodeID string) map[string]any {
 	cutoff := time.Now().AddDate(0, 0, -30).Unix()
 	var total, verified int
 	for _, b := range list {
-		if b.CreatedAt < cutoff || b.Status == "running" {
+		if b.CreatedAt < cutoff || b.Status == "running" || b.Deleting() {
 			continue
 		}
 		total++

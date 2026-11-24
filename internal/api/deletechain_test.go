@@ -20,7 +20,7 @@ func chainTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Server{store: st, engine: &backup.Engine{Store: st, Storage: be, Log: func(string, string, string) {}}}
+	return &Server{store: st, locks: newOpLocks(), engine: &backup.Engine{Store: st, Storage: be, Log: func(string, string, string) {}}}
 }
 
 // mkChainRow persists a backup row whose manifest records a chain parent.
@@ -46,7 +46,7 @@ func TestDeleteChainGuardAndCascade(t *testing.T) {
 	ctx := context.Background()
 
 	// Deleting the baseline with live deltas → typed dependents error, row kept.
-	err := s.deleteBackupByID(ctx, "admin", "full00000001")
+	_, err := s.deleteBackupByID(ctx, "admin", "full00000001")
 	var dep *errHasDependents
 	if !errors.As(err, &dep) {
 		t.Fatalf("baseline delete must refuse with dependents, got %v", err)
@@ -60,17 +60,17 @@ func TestDeleteChainGuardAndCascade(t *testing.T) {
 	// Mid-chain delete refuses too (separate var — dep still holds the
 	// baseline's full dependent set for the cascade below).
 	var midDep *errHasDependents
-	if err := s.deleteBackupByID(ctx, "admin", "delta0000001"); !errors.As(err, &midDep) {
+	if _, err := s.deleteBackupByID(ctx, "admin", "delta0000001"); !errors.As(err, &midDep) {
 		t.Fatalf("mid-chain delete must refuse, got %v", err)
 	}
 
 	// A chainless backup deletes exactly like today.
-	if err := s.deleteBackupByID(ctx, "admin", "solo00000001"); err != nil {
+	if _, err := s.deleteBackupByID(ctx, "admin", "solo00000001"); err != nil {
 		t.Fatalf("chainless delete must succeed: %v", err)
 	}
 
 	// Cascade removes the whole subtree newest-first (leaves before ancestors).
-	deleted, cerr := s.deleteChainCascade("admin", "full00000001", dep.ids)
+	deleted, _, cerr := s.deleteChainCascade("admin", "full00000001", dep.ids)
 	if cerr != nil {
 		t.Fatalf("cascade: %v (deleted=%v)", cerr, deleted)
 	}
@@ -101,7 +101,7 @@ func TestDeleteChainBulk(t *testing.T) {
 	for pass := 0; pass < 3 && len(remaining) > 0; pass++ {
 		var next []string
 		for _, id := range remaining {
-			err := s.deleteBackupByID(ctx, "admin", id)
+			_, err := s.deleteBackupByID(ctx, "admin", id)
 			if err == nil {
 				deletedCount++
 				continue
@@ -122,7 +122,7 @@ func TestDeleteChainBulk(t *testing.T) {
 	// A baseline whose delta is NOT in the request stays refused.
 	mkChainRow(t, s.store, "cfull0000001", "", 0, 5000)
 	mkChainRow(t, s.store, "cdelta000001", "cfull0000001", 1, 6000)
-	if err := s.deleteBackupByID(ctx, "admin", "cfull0000001"); err == nil {
+	if _, err := s.deleteBackupByID(ctx, "admin", "cfull0000001"); err == nil {
 		t.Fatal("baseline with an outside-request delta must stay refused")
 	}
 	if _, gerr := s.store.GetBackup("cdelta000001"); gerr != nil {

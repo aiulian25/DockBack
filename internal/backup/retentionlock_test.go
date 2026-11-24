@@ -119,7 +119,7 @@ func TestMirrorAppliesAndRecordsRetentionLock(t *testing.T) {
 
 // A live lock survives prune; an expired one does not. A copy that can never be
 // removed is a disk that eventually fills, so the expiry has to actually work.
-func TestDeleteArtifactsHonoursLockUntilThenReleases(t *testing.T) {
+func TestDeleteCopiesHonoursLockUntilThenReleases(t *testing.T) {
 	e, st, key, _ := lockTestEngine(t)
 	ctx := context.Background()
 	destDir := t.TempDir()
@@ -143,7 +143,7 @@ func TestDeleteArtifactsHonoursLockUntilThenReleases(t *testing.T) {
 
 	// Prune while the lock is live: the copy stays, and hasLiveImmutable retains
 	// the whole backup — the existing WORM behaviour, now reachable for a NAS.
-	e.DeleteArtifacts(ctx, b)
+	e.deleteCopies(ctx, b)
 	if _, ok, _ := be.Stat(ctx, lockArchiveKey); !ok {
 		t.Fatal("a copy under a live retention lock must survive prune")
 	}
@@ -158,7 +158,7 @@ func TestDeleteArtifactsHonoursLockUntilThenReleases(t *testing.T) {
 	if e.hasLiveImmutable(b) {
 		t.Fatal("an expired lock must not retain the backup")
 	}
-	e.DeleteArtifacts(ctx, b)
+	e.deleteCopies(ctx, b)
 	if _, ok, _ := be.Stat(ctx, lockArchiveKey); ok {
 		t.Fatal("an expired lock must not block prune — the disk would fill forever")
 	}

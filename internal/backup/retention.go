@@ -232,6 +232,25 @@ func RetentionHoldKey(nodeID, target string) string {
 	return "retention.hold." + nodeID + "." + target
 }
 
+// retentionHoldPrefix is what every hold key of one node starts with.
+func retentionHoldPrefix(nodeID string) string {
+	return RetentionHoldKey(nodeID, "")
+}
+
+// HeldTargets names the targets of a node that are under a tripwire hold (F69).
+func HeldTargets(st *store.Store, nodeID string) []string {
+	prefix := retentionHoldPrefix(nodeID)
+	keys, err := st.SettingKeysWithPrefix(prefix)
+	if err != nil {
+		return nil
+	}
+	targets := make([]string, 0, len(keys))
+	for _, key := range keys {
+		targets = append(targets, strings.TrimPrefix(key, prefix))
+	}
+	return targets
+}
+
 // retentionHeld reports whether a tripwire hold is active for the target (F69).
 func (e *Engine) retentionHeld(nodeID, target string) bool {
 	v, _ := e.Store.GetSetting(RetentionHoldKey(nodeID, target), "")
@@ -506,13 +525,17 @@ func (e *Engine) pruneTarget(ctx context.Context, nodeID, target string, list []
 	}
 	for _, old := range plan.Prune {
 		e.logf(old.ID, "INFO", "Retention: pruning old backup of %s (GFS policy)", target)
-		deletions := e.DeleteArtifacts(ctx, old)
-		if derr := e.Store.DeleteBackup(old.ID); derr != nil {
+		deletion, derr := e.DeleteBackup(ctx, old)
+		if derr != nil {
 			e.logf(old.ID, "ERR", "Retention prune failed: %v", derr)
 			continue
 		}
+		if !deletion.Removed {
+			e.logf(old.ID, "INFO", "Retention: a copy of this backup of %s could not be removed yet, so it stays listed as \"deletion incomplete\" until it can", target)
+			continue
+		}
 		pruned++
-		if !Reclaimed(deletions) {
+		if !Reclaimed(deletion.Copies) {
 			e.logf(old.ID, "INFO", "Retention: this backup of %s left the catalog, but not all of its storage is confirmed freed, so its size is not counted as freed", target)
 			continue
 		}
