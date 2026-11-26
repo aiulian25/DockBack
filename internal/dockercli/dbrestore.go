@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -55,14 +56,30 @@ func WipeDir(ctx context.Context, c *client.Client, targetID, dir string) error 
 	if dir == "" {
 		return nil
 	}
-	// The removal itself tolerates globs that match nothing; the final test is
-	// what reports success — the directory must really be empty. It used to end
-	// in `|| true`, so a wipe that failed half-way looked like one that worked.
-	cmd := fmt.Sprintf(`rm -rf %[1]q/* %[1]q/.[!.]* %[1]q/..?* 2>/dev/null; [ -z "$(ls -A %[1]q 2>/dev/null)" ]`, dir)
+	cmd, err := wipeDirCommand(dir)
+	if err != nil {
+		return err
+	}
 	if err := runSidecar(ctx, c, targetID, cmd, 5*time.Minute); err != nil {
 		return fmt.Errorf("wipe of %s did not leave it empty: %w", dir, err)
 	}
 	return nil
+}
+
+// wipeDirCommand is the shell line that empties dir. The path goes in as a
+// single-quoted literal, where a shell expands nothing, so a path holding $(…) or
+// a backtick is a strange folder name and never a command (SEC-006). It must be
+// absolute and must not be the root: the helper's root holds every mounted volume.
+func wipeDirCommand(dir string) (string, error) {
+	cleaned := path.Clean(dir)
+	if !path.IsAbs(dir) || cleaned == "/" {
+		return "", fmt.Errorf("refusing to wipe %q: not an absolute folder inside the container", dir)
+	}
+	quoted := "'" + shellEscape(cleaned) + "'"
+	// The removal itself tolerates globs that match nothing; the final test is
+	// what reports success — the directory must really be empty. It used to end
+	// in `|| true`, so a wipe that failed half-way looked like one that worked.
+	return fmt.Sprintf(`rm -rf %[1]s/* %[1]s/.[!.]* %[1]s/..?* 2>/dev/null; [ -z "$(ls -A %[1]s 2>/dev/null)" ]`, quoted), nil
 }
 
 // WaitForDB blocks until the database inside the container accepts queries, or

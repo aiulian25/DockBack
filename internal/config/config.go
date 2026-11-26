@@ -184,8 +184,9 @@ func Load() (*Config, error) {
 
 	if c.TrustProxy && len(c.TrustedProxies) == 0 {
 		fmt.Fprintln(os.Stderr, "WARNING: DOCKBACK_TRUST_PROXY=true with no DOCKBACK_TRUSTED_PROXIES set — "+
-			"X-Forwarded-* is trusted from ANY peer. If the app is also reachable directly (e.g. LAN HTTP), set "+
-			"DOCKBACK_TRUSTED_PROXIES to your proxy's source CIDR(s) so clients can't spoof X-Forwarded-For (§10.1).")
+			"X-Forwarded-* is trusted from any peer on this machine or a private network, and ignored from public addresses. "+
+			"Anything on your LAN that can reach the app directly can still spoof X-Forwarded-For, and a proxy on a public "+
+			"address is not trusted at all: set DOCKBACK_TRUSTED_PROXIES to your proxy's source CIDR(s) (§10.1).")
 	}
 
 	port, err := strconv.Atoi(envOr("PORT", "28734"))

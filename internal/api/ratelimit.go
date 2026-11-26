@@ -307,6 +307,11 @@ func remoteHost(r *http.Request) string {
 // trusted: TrustProxy must be on, and — when a TrustedProxies allowlist is set —
 // the direct peer must be in it. This stops a directly-reachable (e.g. LAN HTTP)
 // client from spoofing X-Forwarded-For to dodge the login lockout (§10.1).
+//
+// With no allowlist the peer must at least be on this machine or a private
+// network, which is where a reverse proxy in front of DockBack lives (SEC-005). A
+// peer on a public address is never a proxy nobody listed: it is a client, and
+// its headers are its own claim.
 func (s *Server) trustForwarded(r *http.Request) bool {
 	// Nil-safe: this now runs on the API-token authentication path (F201), and a
 	// nil dereference in the auth middleware is a crash on every request rather
@@ -315,14 +320,20 @@ func (s *Server) trustForwarded(r *http.Request) bool {
 	if s == nil || s.cfg == nil || !s.cfg.TrustProxy {
 		return false
 	}
-	if len(s.cfg.TrustedProxies) == 0 {
-		return true // legacy trust-all (warned at startup)
-	}
 	ip := net.ParseIP(remoteHost(r))
 	if ip == nil {
 		return false
 	}
+	if len(s.cfg.TrustedProxies) == 0 {
+		return onLocalNetwork(ip) // no list (warned at startup)
+	}
 	return s.trustedProxy(ip)
+}
+
+// onLocalNetwork reports whether ip is this machine or a private or link-local
+// address, as opposed to one routed on the public internet.
+func onLocalNetwork(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 // trustedProxy reports whether ip is one of our own configured reverse proxies.

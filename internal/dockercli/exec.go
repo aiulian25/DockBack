@@ -55,6 +55,31 @@ const sidecarLabelKey = "com.dockback.sidecar"
 
 func sidecarLabels() map[string]string { return map[string]string{sidecarLabelKey: "1"} }
 
+// Helper containers get nothing they do not need (SEC-002). They copy, list and
+// fix up files in mounts and stream the result back over the Docker connection, so
+// they have no use for a network, for new privileges, or for most of what root in a
+// container can do. Should the helper image ever be the wrong one, it then runs
+// with a container's files and no way to send them anywhere.
+const (
+	helperNetwork         = "none"
+	helperNoNewPrivileges = "no-new-privileges"
+)
+
+// helperCapabilities is what file work as root still needs: read and write files
+// whoever owns them, give restored files their owner, mode and set-id bits back,
+// and recreate device nodes and file capabilities that a volume held.
+var helperCapabilities = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "MKNOD", "SETFCAP"}
+
+// confineHelper applies those limits to a helper's host configuration and returns
+// it. Mounts are the caller's business and are left as given.
+func confineHelper(hostConfig *container.HostConfig) *container.HostConfig {
+	hostConfig.NetworkMode = helperNetwork
+	hostConfig.CapDrop = []string{"ALL"}
+	hostConfig.CapAdd = helperCapabilities
+	hostConfig.SecurityOpt = append(hostConfig.SecurityOpt, helperNoNewPrivileges)
+	return hostConfig
+}
+
 // RemoveOrphanSidecars force-removes leftover DockBack sidecar containers that
 // are no longer running (created/exited/dead) on the given node — defense in
 // depth so a sidecar whose explicit removal failed (network blip, app restart
@@ -544,7 +569,7 @@ func runMountProbe(ctx context.Context, c *client.Client, targetID string, paths
 
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sh", "-c", mountProbeScript(paths, withSizes)}, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}}, nil, nil, "")
+		confineHelper(&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}}), nil, nil, "")
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("mount probe sidecar create: %w", err)
 	}
@@ -640,7 +665,7 @@ func DetectSQLiteFiles(ctx context.Context, c *client.Client, targetID string, m
 
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sh", "-c", script.String()}, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}}, nil, nil, "")
+		confineHelper(&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}}), nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("sqlite detect sidecar create: %w", err)
 	}
@@ -839,7 +864,7 @@ func SnapshotSQLite(ctx context.Context, c *client.Client, targetID string, dbPa
 
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sh", "-c", script.String()}, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}, AutoRemove: false}, nil, nil, "")
+		confineHelper(&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}, AutoRemove: false}), nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("sqlite snapshot sidecar create: %w", err)
 	}
@@ -1204,7 +1229,7 @@ func TarVolumesExcluding(ctx context.Context, c *client.Client, targetID string,
 
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: args, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}, AutoRemove: false},
+		confineHelper(&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}, AutoRemove: false}),
 		nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("sidecar create: %w", err)

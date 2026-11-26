@@ -27,7 +27,7 @@ A pinned token presented from any other address is refused with **403**, *before
 
 The pin covers `/metrics` too, which is where it earns its keep — a scrape token pinned to your Prometheus host is useless to anyone who copies it out of a config file.
 
-> **One prerequisite, and DockBack enforces it.** If `DOCKBACK_TRUST_PROXY` is on with no `DOCKBACK_TRUSTED_PROXIES` set, DockBack believes the `X-Forwarded-For` header from *anyone* — so any caller could claim an allowed address and the pin would keep out nobody. Creating a pinned token in that configuration is **refused**, with the fix named: set `DOCKBACK_TRUSTED_PROXIES` to your reverse proxy's address. A pin that can be spoofed is worse than no pin, because you would stop guarding the token by other means.
+> **One prerequisite, and DockBack enforces it.** If `DOCKBACK_TRUST_PROXY` is on with no `DOCKBACK_TRUSTED_PROXIES` set, DockBack believes the `X-Forwarded-For` header from *anyone on this machine or a private network* — so any caller there could claim an allowed address and the pin would keep out nobody. Creating a pinned token in that configuration is **refused**, with the fix named: set `DOCKBACK_TRUSTED_PROXIES` to your reverse proxy's address. A pin that can be spoofed is worse than no pin, because you would stop guarding the token by other means.
 
 The pin is fixed at creation, like the expiry. To change it, mint a new token and revoke the old one — the shown value can never be re-displayed anyway.
 

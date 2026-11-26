@@ -559,7 +559,7 @@ existing series, so anything already summing them keeps working and gains a free
 | `DOCKBACK_ADMIN_USER` | `admin` | Single admin username. |
 | `DOCKBACK_ADMIN_PASSWORD` | *(generated)* | Printed once on first run if blank. |
 | `DOCKBACK_TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto` from your reverse proxy. |
-| `DOCKBACK_TRUSTED_PROXIES` | *(empty)* | Source ranges whose forwarded headers are believed, e.g. `172.16.0.0/12`. List every proxy in the chain. Empty trusts any caller, which DockBack alerts on. An entry that does not parse refuses to start. |
+| `DOCKBACK_TRUSTED_PROXIES` | *(empty)* | Source ranges whose forwarded headers are believed, e.g. `172.16.0.0/12`. List every proxy in the chain. Empty trusts callers on this machine or a private network only, never a public address, and DockBack alerts on it. An entry that does not parse refuses to start. |
 | `DOCKBACK_EGRESS_ALLOW` | *(empty)* | Optional default-deny outbound allow-list. |
 | `DOCKBACK_PUBLIC_URL` | *(empty)* | The `https://` address you open DockBack at. Passkeys are bound to its name; empty or an IP address keeps them off. |
 | `DOCKBACK_MAX_CONCURRENT_BACKUPS` | `3` | Total backups running at once. |

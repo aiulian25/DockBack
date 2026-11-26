@@ -71,7 +71,7 @@ func FileModes(ctx context.Context, c *client.Client, targetID string, paths []s
 
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sh", "-c", script.String()}, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}}, nil, nil, "")
+		confineHelper(&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}}), nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("permission audit sidecar create: %w", err)
 	}

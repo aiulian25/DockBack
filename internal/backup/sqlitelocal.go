@@ -1,12 +1,14 @@
 package backup
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	// The SQLite engine DockBack carries for its own catalog.
 	_ "modernc.org/sqlite"
@@ -103,13 +105,38 @@ func stageRawSQLite(dir, idx, stage string) (string, error) {
 // vacuumInto writes one consistent copy of the database at src to dst, reading
 // through its journal as SQLite does when it opens a copy after a crash.
 func vacuumInto(src, dst string) error {
-	db, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=busy_timeout(%d)", src, sqliteBusyTimeoutMillis))
+	db, err := sql.Open("sqlite", untrustedSQLiteDSN(src, fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMillis)))
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	_, err = db.Exec("VACUUM INTO " + sqliteStringLiteral(dst))
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteSnapshotTimeLimit)
+	defer cancel()
+	_, err = db.ExecContext(ctx, "VACUUM INTO "+sqliteStringLiteral(dst))
 	return err
+}
+
+// A database file from a container is input from whoever controls that container,
+// and a database file is not inert: its schema is SQL the engine runs while it
+// vacuums, checks and counts (SEC-004). So every connection to one is opened the
+// way SQLite's own guidance for untrusted files says to, and every statement on it
+// has a time limit, so a schema built to run for ever costs one database its
+// snapshot instead of hanging the backup.
+const (
+	// sqliteUntrustedPragmas: schema objects may not call anything but harmless
+	// built-in functions, and page cells are bounds-checked as they are read.
+	sqliteUntrustedPragmas = "trusted_schema(0),cell_size_check(1)"
+	// The limits are generous for a real database of many gigabytes on a slow disk.
+	sqliteSnapshotTimeLimit = 30 * time.Minute
+	sqliteCheckTimeLimit    = 30 * time.Minute
+	sqliteCountTimeLimit    = 10 * time.Minute
+)
+
+// untrustedSQLiteDSN is the connection string for a database file that came from a
+// container, with any further pragmas the caller needs. Pure.
+func untrustedSQLiteDSN(path string, pragmas ...string) string {
+	all := append(strings.Split(sqliteUntrustedPragmas, ","), pragmas...)
+	return path + "?_pragma=" + strings.Join(all, "&_pragma=")
 }
 
 // sqliteIntegrity is the first line of PRAGMA integrity_check on path: "ok" for
@@ -120,8 +147,10 @@ func sqliteIntegrity(path string) string {
 		return err.Error()
 	}
 	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteCheckTimeLimit)
+	defer cancel()
 	var verdict string
-	if err := db.QueryRow("PRAGMA integrity_check").Scan(&verdict); err != nil {
+	if err := db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&verdict); err != nil {
 		return err.Error()
 	}
 	return verdict
@@ -137,7 +166,9 @@ func countSQLite(path string) (tables int, rows int64, perTable string) {
 		return tables, rows, ""
 	}
 	defer db.Close()
-	names, quoted, err := userTables(db)
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteCountTimeLimit)
+	defer cancel()
+	names, quoted, err := userTables(ctx, db)
 	if err != nil {
 		return tables, rows, ""
 	}
@@ -149,7 +180,7 @@ func countSQLite(path string) (tables int, rows int64, perTable string) {
 	counts := make([]int64, len(names))
 	rows = 0
 	for i, name := range names {
-		if err := db.QueryRow(`SELECT count(*) FROM "` + strings.ReplaceAll(name, `"`, `""`) + `"`).Scan(&counts[i]); err != nil {
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM "`+strings.ReplaceAll(name, `"`, `""`)+`"`).Scan(&counts[i]); err != nil {
 			return tables, -1, ""
 		}
 		rows += counts[i]
@@ -166,8 +197,8 @@ func countSQLite(path string) (tables int, rows int64, perTable string) {
 
 // userTables lists a database's own tables, with each name as SQLite's quote()
 // writes it — the form the per-table counts are keyed by on both sides.
-func userTables(db *sql.DB) (names, quoted []string, err error) {
-	rs, err := db.Query(`SELECT name, quote(name) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+func userTables(ctx context.Context, db *sql.DB) (names, quoted []string, err error) {
+	rs, err := db.QueryContext(ctx, `SELECT name, quote(name) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -185,7 +216,7 @@ func userTables(db *sql.DB) (names, quoted []string, err error) {
 // openSnapshot opens a snapshot for reading only, so measuring it can never
 // change the bytes whose checksum the backup records.
 func openSnapshot(path string) (*sql.DB, error) {
-	return sql.Open("sqlite", path+"?_pragma=query_only(1)")
+	return sql.Open("sqlite", untrustedSQLiteDSN(path, "query_only(1)"))
 }
 
 // integrityFailureKind says what a failed integrity check means: corruption of

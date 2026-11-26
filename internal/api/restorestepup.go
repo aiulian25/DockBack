@@ -63,10 +63,7 @@ func restoreStepUpKeyFor(nodeID, name string) string {
 // Derived rather than stored, so a container marked critical tomorrow is
 // protected tomorrow without anyone remembering to come back here.
 func (s *Server) restoreStepUpDefault(nodeID, name string) bool {
-	if _, ok := s.loadCriticalDBs()[critKey(nodeID, name)]; ok {
-		return true
-	}
-	return s.engine.RequireWriteOnly(nodeID, name)
+	return s.isCriticalDB(nodeID, name) || s.engine.RequireWriteOnly(nodeID, name)
 }
 
 // restoreStepUpRequired resolves the effective policy: an explicit per-container
@@ -76,14 +73,23 @@ func (s *Server) restoreStepUpDefault(nodeID, name string) bool {
 // decided this container does not need it is making an informed choice, and a
 // setting that could only ever be turned ON would be a setting nobody trusts.
 func (s *Server) restoreStepUpRequired(nodeID, name string) bool {
+	if require, recorded := s.explicitRestoreStepUp(nodeID, name); recorded {
+		return require
+	}
+	return s.restoreStepUpDefault(nodeID, name)
+}
+
+// explicitRestoreStepUp returns the operator's recorded choice for a container,
+// and whether one is recorded at all.
+func (s *Server) explicitRestoreStepUp(nodeID, name string) (require, recorded bool) {
 	explicit, _ := s.store.GetSetting(restoreStepUpKeyFor(nodeID, name), "")
 	switch strings.TrimSpace(explicit) {
 	case "true":
-		return true
+		return true, true
 	case "false":
-		return false
+		return false, true
 	}
-	return s.restoreStepUpDefault(nodeID, name)
+	return false, false
 }
 
 // restoreStepUpIsExplicit reports whether a per-container choice is recorded, so
@@ -162,6 +168,7 @@ func (s *Server) handleSetRestoreStepUp(w http.ResponseWriter, r *http.Request) 
 	id := r.PathValue("id")
 	cid := r.PathValue("cid")
 	var body struct {
+		stepUpBody
 		Require *bool `json:"require"` // null clears the override, back to the derived default
 	}
 	if err := readJSON(r, &body); err != nil {
@@ -174,6 +181,13 @@ func (s *Server) handleSetRestoreStepUp(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	on := body.Require != nil && *body.Require
+	protectedAfter := on
+	if body.Require == nil {
+		protectedAfter = s.restoreStepUpDefault(id, name)
+	}
+	if !s.freshProofToUnprotectRestores(w, r, body.stepUpBody, id, name, protectedAfter) {
+		return
+	}
 	if err := s.setRestoreStepUp(id, name, on, body.Require != nil); err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return

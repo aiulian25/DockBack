@@ -64,7 +64,7 @@ func FSFreeBytes(ctx context.Context, c *client.Client, hostPath string) (FSUsag
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", "60"}, Labels: sidecarLabels()},
-		&container.HostConfig{Binds: []string{"/:" + hostProbeMount + ":ro"}},
+		confineHelper(&container.HostConfig{Binds: []string{"/:" + hostProbeMount + ":ro"}}),
 		nil, nil, "")
 	if err != nil {
 		return FSUsage{}, fmt.Errorf("free-space probe sidecar create: %w", err)

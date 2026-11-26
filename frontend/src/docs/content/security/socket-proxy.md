@@ -77,6 +77,11 @@ DockBack records the image's **digest** the first time it runs a sidecar on a se
 
 Without it, a repushed or hijacked `alpine:3.20` tag would simply be pulled and executed on every one of your servers, with no visible symptom.
 
+Two more things limit what a wrong image could do:
+
+- **Changing the image, or re-pinning it, asks for your password again.** A browser left signed in cannot swap it.
+- **Helper containers run with no network** and with only the capabilities that copying files needs (no raw sockets, no changing user, no new privileges). They hand their result back over the Docker connection, so they have nowhere else to send it.
+
 ### What you see
 
 Each server's page shows **Volume sidecar image** with its reference and pinned digest. Before the first backup it reads *"Not pinned yet — pins on the first backup"*.

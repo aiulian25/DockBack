@@ -295,7 +295,7 @@ func WriteHostFile(ctx context.Context, c *client.Client, hostPath string, conte
 	// when it is missing, which on a fresh host it usually is.
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", "180"}, Labels: sidecarLabels()},
-		&container.HostConfig{Binds: []string{parent + ":" + hostReconstructMount}},
+		confineHelper(&container.HostConfig{Binds: []string{parent + ":" + hostReconstructMount}}),
 		nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("host-file sidecar create: %w", err)
@@ -404,7 +404,7 @@ func ReconstructStackDirWithEnv(ctx context.Context, c *client.Client, stackDir,
 	// validated above and contains no ':' so the bind spec is unambiguous.
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", "180"}, Labels: sidecarLabels()},
-		&container.HostConfig{Binds: []string{parent + ":" + hostReconstructMount}},
+		confineHelper(&container.HostConfig{Binds: []string{parent + ":" + hostReconstructMount}}),
 		nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("host-write sidecar create: %w", err)

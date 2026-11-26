@@ -147,7 +147,7 @@ func volumeSizes(ctx context.Context, c *client.Client, names []string) map[stri
 	script := `i=0; for d in /v/*; do echo "$(basename "$d")|$(du -sb "$d" 2>/dev/null | cut -f1)"; done`
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sh", "-c", script}, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{Binds: binds}, nil, nil, "")
+		confineHelper(&container.HostConfig{Binds: binds}), nil, nil, "")
 	if err != nil {
 		return out
 	}
@@ -201,7 +201,7 @@ func TarNamedVolume(ctx context.Context, c *client.Client, volName string) (io.R
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"tar", "-cf", "-", "-C", "/voldata", "."}, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{Binds: []string{volName + ":/voldata:ro"}, AutoRemove: false}, nil, nil, "")
+		confineHelper(&container.HostConfig{Binds: []string{volName + ":/voldata:ro"}, AutoRemove: false}), nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("volume tar sidecar create: %w", err)
 	}
@@ -272,7 +272,7 @@ func UntarToNamedVolume(ctx context.Context, c *client.Client, volName string, t
 			Image: sidecarRef(), Cmd: []string{"tar", "-xf", "-", "-C", "/voldata"},
 			OpenStdin: true, StdinOnce: true, AttachStdin: true, Labels: sidecarLabels(),
 		},
-		&container.HostConfig{Binds: []string{volName + ":/voldata"}}, nil, nil, "")
+		confineHelper(&container.HostConfig{Binds: []string{volName + ":/voldata"}}), nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("volume restore sidecar create: %w", err)
 	}

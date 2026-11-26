@@ -13,6 +13,7 @@ import ExportPresetsCard from "../components/ExportPresetsCard";
 import { api, AdoptSkip, Destination, Policy, Schedule, Node, Container, AppBackup, AppDest, AppBackupSchedule, MigrateLayoutStatus, NamedSchedule, RetentionPreview, ScheduleTarget, ApiToken, SessionDevice, StepUpError, EgressAudit, fmtBytes, fmtAgo } from "../api";
 import { Button, Card, Input, Label, Select, Modal } from "../components/ui";
 import { useToast } from "../components/Toast";
+import { useStepUp } from "../components/StepUpDialog";
 import { THEMES, ThemeId, getTheme, setTheme } from "../theme";
 import KeyEscrowModal from "../components/KeyEscrowModal";
 import KeyRotateModal from "../components/KeyRotateModal";
@@ -203,6 +204,7 @@ export default function Settings() {
 
 function SettingsInner() {
   const toast = useToast();
+  const { confirmed, dialog: stepUpDialog } = useStepUp();
   const [tab, setTab] = useState<SettingsTab>(settingsInitialTab);
   // Legacy deep link: /settings#schedule lands on the Backups tab and scrolls to the
   // Schedules card (which is only in the DOM while that tab is active).
@@ -518,9 +520,11 @@ function SettingsInner() {
   const saveTuning = useCallback(async () => {
     const patch: Record<string, string> = {};
     for (const k of TUNE_KEYS) patch[k] = sRef.current[k] ?? "";
-    await api.setSettings(patch);
+    // One of these is the helper image, which the server will not change until the
+    // password is confirmed.
+    await confirmed((credentials) => api.setSettings(patch, credentials));
     setSBaseline((prev) => ({ ...prev, ...patch }));
-  }, []);
+  }, [confirmed]);
 
   // Persist the schedule list as a diff against the last-saved baseline: rows
   // gone from the list are deleted, drafts (id "") are created, and changed rows
@@ -854,6 +858,7 @@ function SettingsInner() {
 
   return (
     <div>
+      {stepUpDialog}
       <h1 className="text-2xl font-bold">System Settings</h1>
       <p className="mb-6 mt-1 text-on-surface-variant">Default backup policy, schedule, encryption and storage.</p>
 

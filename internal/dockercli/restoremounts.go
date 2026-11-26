@@ -62,5 +62,5 @@ func restoreHostConfig(ctx context.Context, c *client.Client, targetID string) (
 		return nil, fmt.Errorf("reading the target's mounts for the restore sidecar: %w", err)
 	}
 	binds, mounts := restoreMountsFor(info.Mounts)
-	return &container.HostConfig{Binds: binds, Mounts: mounts}, nil
+	return confineHelper(&container.HostConfig{Binds: binds, Mounts: mounts}), nil
 }

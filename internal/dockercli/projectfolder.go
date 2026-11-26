@@ -59,7 +59,7 @@ func OpenProjectFolder(ctx context.Context, c *client.Client, dir string) (*Proj
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", projectSidecarLifetime}, Labels: sidecarLabels()},
-		&container.HostConfig{Mounts: []mount.Mount{{Type: mount.TypeBind, Source: dir, Target: projectFolderMount, ReadOnly: true}}},
+		confineHelper(&container.HostConfig{Mounts: []mount.Mount{{Type: mount.TypeBind, Source: dir, Target: projectFolderMount, ReadOnly: true}}}),
 		nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("project folder sidecar: %w", err)
@@ -185,7 +185,7 @@ func RestoreProjectFolder(ctx context.Context, c *client.Client, dir string, arc
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", projectSidecarLifetime}, Labels: sidecarLabels()},
-		&container.HostConfig{Binds: []string{parent + ":" + hostReconstructMount}},
+		confineHelper(&container.HostConfig{Binds: []string{parent + ":" + hostReconstructMount}}),
 		nil, nil, "")
 	if err != nil {
 		return 0, fmt.Errorf("project restore sidecar: %w", err)

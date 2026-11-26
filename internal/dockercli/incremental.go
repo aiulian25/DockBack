@@ -90,7 +90,7 @@ func CaptureSidecarAs(ctx context.Context, c *client.Client, targetID, user stri
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: cmd, User: user, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID}, AutoRemove: false},
+		confineHelper(&container.HostConfig{VolumesFrom: []string{targetID}, AutoRemove: false}),
 		nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("write-test sidecar create: %w", err)
@@ -127,7 +127,7 @@ func CaptureSidecarRO(ctx context.Context, c *client.Client, targetID string, cm
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: cmd, AttachStdout: true, AttachStderr: true, Labels: sidecarLabels()},
-		&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}, AutoRemove: false},
+		confineHelper(&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}, AutoRemove: false}),
 		nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("index sidecar create: %w", err)
@@ -197,7 +197,7 @@ func tarFromList(ctx context.Context, c *client.Client, targetID string, relPath
 			OpenStdin: true, StdinOnce: true, AttachStdin: true, AttachStdout: true, AttachStderr: true,
 			Labels: sidecarLabels(),
 		},
-		&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}, AutoRemove: false},
+		confineHelper(&container.HostConfig{VolumesFrom: []string{targetID + ":ro"}, AutoRemove: false}),
 		nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("delta sidecar create: %w", err)

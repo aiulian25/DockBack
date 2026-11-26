@@ -850,6 +850,12 @@ export function csrf(): string {
 // StepUpError (F64): a security-critical endpoint wants the account password
 // re-entered ("sudo mode") — the session itself is still valid, so this must
 // NOT bounce to /login. The UI catches it, prompts, and retries with credentials.
+/** The password (and 2FA code, "" when none) sent again to confirm a protected action. */
+export interface StepUpCredentials {
+  password: string;
+  code: string;
+}
+
 export class StepUpError extends Error {
   step_up_required = true as const;
   totp_required: boolean;
@@ -1191,9 +1197,12 @@ export const api = {
     })}`),
   containerDetail: (id: string, cid: string) => req<ContainerDetailResp>("GET", `/api/nodes/${id}/containers/${cid}`),
   containerSizes: (id: string, cid: string) => req<ContainerSizes>("GET", `/api/nodes/${id}/containers/${cid}/sizes`),
-  setHooks: (id: string, cid: string, h: SavedHooks) => req<{ status: string }>("PUT", `/api/nodes/${id}/containers/${cid}/hooks`, h),
-  setExportProfile: (id: string, cid: string, p: { dir: string; export_cmd: string; import_cmd: string; verify_cmd?: string; user: string }) =>
-    req<{ status: string }>("PUT", `/api/nodes/${id}/containers/${cid}/export-profile`, p),
+  // Hooks and export profiles are commands DockBack runs inside the container, so a
+  // save that adds or changes one is refused until the password is confirmed.
+  setHooks: (id: string, cid: string, h: SavedHooks, credentials?: StepUpCredentials) =>
+    req<{ status: string }>("PUT", `/api/nodes/${id}/containers/${cid}/hooks`, { ...h, ...credentials }),
+  setExportProfile: (id: string, cid: string, p: { dir: string; export_cmd: string; import_cmd: string; verify_cmd?: string; user: string }, credentials?: StepUpCredentials) =>
+    req<{ status: string }>("PUT", `/api/nodes/${id}/containers/${cid}/export-profile`, { ...p, ...credentials }),
   // F151: empty the app-native export directory after a successful capture, so
   // the plaintext copy the exporter writes does not linger beside the encrypted
   // archive. Off by default.
@@ -1201,17 +1210,17 @@ export const api = {
     req<{ cleanup_export: boolean }>("PUT", `/api/nodes/${id}/containers/${cid}/export-cleanup`, { cleanup }),
   // F163: refuse a backup of this container unless write-only encryption is on.
   // Off by default; the response says whether the NEXT run would be refused.
-  setRequireWriteOnly: (id: string, cid: string, require: boolean) =>
-    req<{ require_write_only: boolean; write_only_blocked_reason: string }>("PUT", `/api/nodes/${id}/containers/${cid}/require-write-only`, { require }),
+  setRequireWriteOnly: (id: string, cid: string, require: boolean, credentials?: StepUpCredentials) =>
+    req<{ require_write_only: boolean; write_only_blocked_reason: string }>("PUT", `/api/nodes/${id}/containers/${cid}/require-write-only`, { require, ...credentials }),
   // F205: record (or clear, with "") the Redis password for a broker that set it
   // at runtime. Write-only — sealed at rest, and no endpoint reads it back.
   setRedisAuth: (id: string, cid: string, password: string) =>
     req<{ redis_auth_set: boolean }>("PUT", `/api/nodes/${id}/containers/${cid}/redis-auth`, { password }),
   // F206: require fresh proof of the password to OVERWRITE this container in
   // place. null clears the override, back to the derived default.
-  setRestoreStepUp: (id: string, cid: string, require: boolean | null) =>
+  setRestoreStepUp: (id: string, cid: string, require: boolean | null, credentials?: StepUpCredentials) =>
     req<{ restore_step_up: boolean; restore_step_up_default: boolean; restore_step_up_set: boolean }>(
-      "PUT", `/api/nodes/${id}/containers/${cid}/restore-step-up`, { require }),
+      "PUT", `/api/nodes/${id}/containers/${cid}/restore-step-up`, { require, ...credentials }),
 
   // F101: the fleet-level app-native export preset library. Saving one preset
   // upserts it; sending a whole library REPLACES it and needs replace:true, so an
@@ -1265,8 +1274,8 @@ export const api = {
   containerMounts: (id: string, cid: string) =>
     req<MountInfo[] | null>("GET", `/api/nodes/${id}/containers/${cid}/mounts`).then((r) => r || []),
   getCritical: (id: string, cid: string) => req<CriticalStatus>("GET", `/api/nodes/${id}/containers/${cid}/critical`),
-  setCritical: (id: string, cid: string, body: { enabled: boolean; rpo_seconds: number }) =>
-    req<{ ok: boolean }>("PUT", `/api/nodes/${id}/containers/${cid}/critical`, body),
+  setCritical: (id: string, cid: string, body: { enabled: boolean; rpo_seconds: number }, credentials?: StepUpCredentials) =>
+    req<{ ok: boolean }>("PUT", `/api/nodes/${id}/containers/${cid}/critical`, { ...body, ...credentials }),
   // Event-triggered "back up before changes" toggle (F7).
   setAutosnap: (id: string, cid: string, enabled: boolean) =>
     req<{ enabled: boolean }>("PUT", `/api/nodes/${id}/containers/${cid}/autosnap`, { enabled }),
@@ -1476,8 +1485,8 @@ export const api = {
   // F88: clear a node's pinned sidecar image so the next use re-pins what is
   // present. Deliberately does not accept a digest — a pin must be something
   // DockBack observed, never a value handed to it.
-  repinSidecar: (id: string) =>
-    req<{ status: string; previous: string }>("POST", `/api/nodes/${id}/sidecar/repin`, {}),
+  repinSidecar: (id: string, credentials?: StepUpCredentials) =>
+    req<{ status: string; previous: string }>("POST", `/api/nodes/${id}/sidecar/repin`, { ...credentials }),
   getNodePolicy: (id: string) => req<NodePolicy>("GET", `/api/nodes/${id}/policy`),
   setNodePolicy: (id: string, ov: PolicyOverride) => req<NodePolicy>("PUT", `/api/nodes/${id}/policy`, ov),
   getContainerPolicy: (id: string, cid: string) => req<ContainerPolicy>("GET", `/api/nodes/${id}/containers/${cid}/policy`),
@@ -1557,7 +1566,10 @@ export const api = {
   backfillDestination: (id: string) => req<{ status: string; candidates: number }>("POST", `/api/destinations/${id}/backfill`, {}),
   backfillStatus: (id: string) => req<{ total: number; done: number; failed: number; running: boolean; started_at?: number }>("GET", `/api/destinations/${id}/backfill`),
   getSettings: () => req<Record<string, string>>("GET", "/api/settings"),
-  setSettings: (s: Record<string, string>) => req<unknown>("POST", "/api/settings", s),
+  // Credentials for a protected setting ride in the same request under reserved
+  // keys; the server strips them before validation and never stores them.
+  setSettings: (s: Record<string, string>, credentials?: StepUpCredentials) =>
+    req<unknown>("POST", "/api/settings", credentials ? { ...s, __step_up_password: credentials.password, __step_up_code: credentials.code } : s),
   // F39: test whether a host would be permitted by the live egress allow-list.
   egressTest: (host: string) => req<{ ok: boolean; error?: string }>("POST", "/api/security/egress-test", { host }),
   // F54: hosts DockBack is already configured to reach (destinations, notifications,

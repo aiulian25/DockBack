@@ -28,6 +28,7 @@ import BackupCloudIcon from "../components/BackupCloudIcon";
 import ScheduleList from "../components/ScheduleList";
 import BackupConsole from "../components/BackupConsole";
 import { useToast } from "../components/Toast";
+import { useStepUp } from "../components/StepUpDialog";
 import { announceRunEnd, runEndNotice } from "../lib/runNotice";
 import { usePoll } from "../hooks/usePoll";
 
@@ -67,6 +68,7 @@ export default function ContainerBackup() {
   const { id = "", cid = "" } = useParams();
   const navigate = useNavigate();
   const toast = useToast();
+  const { confirmed, dialog: stepUpDialog } = useStepUp();
   const [c, setC] = useState<ContainerInfo | null>(null);
   const [nodeName, setNodeName] = useState("");
   const [backups, setBackups] = useState<Backup[]>([]);
@@ -383,7 +385,7 @@ export default function ContainerBackup() {
   const saveCritical = async (enabled: boolean, rpoSeconds: number) => {
     setCritSaving(true);
     try {
-      await api.setCritical(id, cid, { enabled, rpo_seconds: rpoSeconds });
+      await confirmed((credentials) => api.setCritical(id, cid, { enabled, rpo_seconds: rpoSeconds }, credentials));
       const s = await api.getCritical(id, cid);
       setCritical(s);
       setMsg(enabled ? `Low-RPO protection on (target ${fmtDuration(rpoSeconds)})` : "Low-RPO protection off");
@@ -504,13 +506,15 @@ export default function ContainerBackup() {
   const saveHooks = async () => {
     const toLines = (s: string) => s.split("\n").map((l) => l.trim()).filter(Boolean);
     try {
-      await api.setHooks(id, cid, { pre: toLines(preHooks), post: toLines(postHooks), post_restore: toLines(postRestoreHooks), user: hookUser.trim() });
+      const hooks = { pre: toLines(preHooks), post: toLines(postHooks), post_restore: toLines(postRestoreHooks), user: hookUser.trim() };
+      await confirmed((credentials) => api.setHooks(id, cid, hooks, credentials));
       toast.success("Backup hooks saved");
     } catch (e) { toast.error(`Couldn't save hooks: ${(e as Error).message}`); }
   };
   const saveExportProfile = async () => {
     try {
-      await api.setExportProfile(id, cid, { dir: exDir.trim(), export_cmd: exExport.trim(), import_cmd: exImport.trim(), verify_cmd: exVerify.trim(), user: hookUser.trim() });
+      const profile = { dir: exDir.trim(), export_cmd: exExport.trim(), import_cmd: exImport.trim(), verify_cmd: exVerify.trim(), user: hookUser.trim() };
+      await confirmed((credentials) => api.setExportProfile(id, cid, profile, credentials));
       setExportAvail(!!(exDir.trim() && exExport.trim() && exImport.trim()));
       toast.success("Export profile saved");
     } catch (e) { toast.error(`Couldn't save export profile: ${(e as Error).message}`); }
@@ -563,7 +567,7 @@ export default function ContainerBackup() {
   // while write-only is off finds out here rather than from a failed schedule.
   const changeRequireWriteOnly = async (on: boolean) => {
     setRequireWO(on); setWoSaving(true);
-    try { const r = await api.setRequireWriteOnly(id, cid, on); setWoBlocked(r.write_only_blocked_reason || ""); }
+    try { const r = await confirmed((credentials) => api.setRequireWriteOnly(id, cid, on, credentials)); setWoBlocked(r.write_only_blocked_reason || ""); }
     catch (e) { setRequireWO(!on); setMsg((e as Error).message); }
     finally { setWoSaving(false); }
   };
@@ -577,7 +581,7 @@ export default function ContainerBackup() {
     const prev = restoreStepUp;
     setRestoreStepUp(on); setStepUpSaving(true);
     try {
-      const r = await api.setRestoreStepUp(id, cid, on === stepUpDefault ? null : on);
+      const r = await confirmed((credentials) => api.setRestoreStepUp(id, cid, on === stepUpDefault ? null : on, credentials));
       setRestoreStepUp(r.restore_step_up); setStepUpDefault(r.restore_step_up_default); setStepUpExplicit(r.restore_step_up_set);
     } catch (e) { setRestoreStepUp(prev); setMsg((e as Error).message); }
     finally { setStepUpSaving(false); }
@@ -668,6 +672,7 @@ export default function ContainerBackup() {
 
   return (
     <div>
+      {stepUpDialog}
       <nav className="mb-6 flex flex-wrap items-center gap-2 text-xs uppercase tracking-wider text-on-surface-variant">
         <Link to="/servers" className="hover:text-primary">Servers</Link>
         <ChevronRight size={14} className="shrink-0" />

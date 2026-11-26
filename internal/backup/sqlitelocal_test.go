@@ -1,11 +1,13 @@
 package backup
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"dockback/internal/dockercli"
 )
@@ -85,5 +87,73 @@ func copyFile(t *testing.T, from, to string) {
 	}
 	if err := os.WriteFile(to, data, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// SEC-004: a container's database file is opened as untrusted input.
+
+func TestUntrustedSQLiteDSN(t *testing.T) {
+	got := untrustedSQLiteDSN("/work/d", "query_only(1)")
+	want := "/work/d?_pragma=trusted_schema(0)&_pragma=cell_size_check(1)&_pragma=query_only(1)"
+	if got != want {
+		t.Fatalf("dsn = %q, want %q", got, want)
+	}
+}
+
+func TestContainerDatabasesAreOpenedAsUntrusted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "d")
+	seed, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Exec(`CREATE TABLE notes(body TEXT); INSERT INTO notes VALUES('a'),('b')`); err != nil {
+		t.Fatal(err)
+	}
+	seed.Close()
+
+	db, err := openSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for pragma, want := range map[string]int{"trusted_schema": 0, "cell_size_check": 1, "query_only": 1} {
+		var got int
+		if err := db.QueryRow("PRAGMA " + pragma).Scan(&got); err != nil || got != want {
+			t.Errorf("PRAGMA %s = %d (%v), want %d", pragma, got, err, want)
+		}
+	}
+
+	// An ordinary database still snapshots, checks and counts as before.
+	snapshot := filepath.Join(t.TempDir(), "d.dbk")
+	if err := vacuumInto(path, snapshot); err != nil {
+		t.Fatalf("vacuum: %v", err)
+	}
+	if verdict := sqliteIntegrity(snapshot); verdict != sqliteIntegrityOK {
+		t.Fatalf("integrity = %q", verdict)
+	}
+	if tables, rows, _ := countSQLite(snapshot); tables != 1 || rows != 2 {
+		t.Fatalf("tables=%d rows=%d, want 1 and 2", tables, rows)
+	}
+}
+
+// The time limits only mean something if the engine really stops when its time is
+// up. A query that never ends by itself must come back at the deadline.
+func TestAStatementStopsAtItsTimeLimit(t *testing.T) {
+	db, err := openSnapshot(filepath.Join(t.TempDir(), "empty"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	const limit = 300 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	started := time.Now()
+	var count int64
+	err = db.QueryRowContext(ctx, `WITH RECURSIVE forever(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM forever) SELECT count(*) FROM forever`).Scan(&count)
+	if err == nil {
+		t.Fatal("an endless query must fail at its time limit")
+	}
+	if took := time.Since(started); took > 20*limit {
+		t.Fatalf("the query ran %s past a %s limit", took, limit)
 	}
 }

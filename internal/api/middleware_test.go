@@ -19,10 +19,23 @@ func reqFrom(remote string) *http.Request {
 }
 
 func TestTrustForwardedAllowlist(t *testing.T) {
-	// Trust-all when TrustProxy on and no allowlist (legacy).
+	// No allowlist: a peer on this machine or a private network may be the proxy
+	// nobody listed; a peer on a public address is a client making a claim (SEC-005).
 	s := &Server{cfg: &config.Config{TrustProxy: true}}
-	if !s.trustForwarded(reqFrom("203.0.113.9:5000")) {
-		t.Error("expected trust-all with no allowlist")
+	for _, local := range []string{"127.0.0.1:5000", "172.20.0.1:5000", "10.0.0.7:5000", "[::1]:5000"} {
+		if !s.trustForwarded(reqFrom(local)) {
+			t.Errorf("with no allowlist a local peer %s must be trusted", local)
+		}
+	}
+	for _, public := range []string{"203.0.113.9:5000", "198.51.100.7:5000", "[2001:db8::1]:5000"} {
+		if s.trustForwarded(reqFrom(public)) {
+			t.Errorf("with no allowlist a public peer %s must not be trusted", public)
+		}
+	}
+	spoofed := reqFrom("203.0.113.9:5000")
+	spoofed.Header.Set("X-Forwarded-For", "10.0.0.5")
+	if got := s.clientIP(spoofed); got != "203.0.113.9" {
+		t.Errorf("a public client's forwarded header must be ignored, got %s", got)
 	}
 	// With allowlist: only peers inside it are trusted.
 	s2 := &Server{cfg: &config.Config{TrustProxy: true, TrustedProxies: []*net.IPNet{cidr("172.16.0.0/12")}}}
@@ -105,6 +118,10 @@ func TestClientIPWalksTheForwardedChainFromTheRight(t *testing.T) {
 	}
 }
 
+// proxyPeerAddr is where a reverse proxy on the same Docker network connects from.
+// httptest's default peer is a public test address, which is never taken for a proxy.
+const proxyPeerAddr = "172.20.0.1:40000"
+
 func headerServer(trustProxy bool) *Server {
 	return &Server{cfg: &config.Config{TrustProxy: trustProxy}}
 }
@@ -113,6 +130,7 @@ func runHeaders(t *testing.T, s *Server, path string, https bool) http.Header {
 	t.Helper()
 	h := s.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	r := httptest.NewRequest("GET", path, nil)
+	r.RemoteAddr = proxyPeerAddr
 	if https {
 		r.Header.Set("X-Forwarded-Proto", "https")
 	}
@@ -203,6 +221,7 @@ func TestHostCookiePrefixGating(t *testing.T) {
 	// Behind https proxy: __Host- prefix + Secure.
 	s2 := headerServer(true)
 	r2 := httptest.NewRequest("POST", "/api/login", nil)
+	r2.RemoteAddr = proxyPeerAddr
 	r2.Header.Set("X-Forwarded-Proto", "https")
 	w2 := httptest.NewRecorder()
 	s2.setSessionCookies(w2, r2, "tok", "csrf", 3600)

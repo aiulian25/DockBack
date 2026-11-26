@@ -29,7 +29,16 @@ Enter your username + password as usual; you'll then be asked for the **authenti
 
 - The TOTP secret is **encrypted at rest** with your master key; recovery codes are stored only as one-time hashes.
 - Wrong codes count toward the **login lockout** (the same per-IP/account throttle as passwords), so the 6-digit code can't be brute-forced. A correct password doesn't clear those failures: they clear only after a sign-in or a 2FA disable that also passes the code.
-- Behind a reverse proxy, set `DOCKBACK_TRUST_PROXY` (and `DOCKBACK_TRUSTED_PROXIES`) so the lockout sees real client IPs — see *Socket-proxy permissions* / deployment notes.
+- Behind a reverse proxy, set `DOCKBACK_TRUST_PROXY` (and `DOCKBACK_TRUSTED_PROXIES`) so the lockout sees real client IPs — see *Socket-proxy permissions* / deployment notes. With no list set, DockBack believes the forwarded address only from a proxy on this machine or a private network; a proxy on a public address must be listed.
+
+## Actions that ask for your password again
+
+Being signed in lets you look around and run backups. A few actions ask you to confirm your password first (and your 2FA code, if you use one), so that a browser left signed in, or a copied session, cannot be used for them. After you confirm, you are not asked again for five minutes.
+
+- **Running commands in a container:** saving new or changed backup hooks or an export profile.
+- **Choosing what runs against your data:** changing the volume sidecar image, and re-pinning it on a server.
+- **Taking protection off a restore:** switching off "ask for the password before restoring" for a container, or removing the mark (critical database, write-only required) that turned it on.
+- **Reading or replacing secrets and data:** revealing or rotating the encryption key, downloading a decrypted backup, creating an API token, adding a passkey, changing the sign-in policy, restoring DockBack itself, and restoring a protected container or a whole server.
 
 ## Locked out (no app, no recovery codes)
 

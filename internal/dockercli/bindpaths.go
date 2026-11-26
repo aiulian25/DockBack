@@ -134,7 +134,7 @@ func ProbeHostPaths(ctx context.Context, c *client.Client, paths []string) (map[
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", "60"}, Labels: sidecarLabels()},
-		&container.HostConfig{Binds: []string{"/:" + hostProbeMount + ":ro"}},
+		confineHelper(&container.HostConfig{Binds: []string{"/:" + hostProbeMount + ":ro"}}),
 		nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("host-path probe sidecar create: %w", err)
@@ -290,7 +290,7 @@ func ensureHostPathBatch(ctx context.Context, c *client.Client, groups []hostPat
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", "180"}, Labels: sidecarLabels()},
-		&container.HostConfig{Binds: binds}, nil, nil, "")
+		confineHelper(&container.HostConfig{Binds: binds}), nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("bind-source sidecar create: %w", err)
 	}

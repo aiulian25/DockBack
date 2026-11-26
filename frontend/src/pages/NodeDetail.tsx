@@ -17,6 +17,7 @@ import BackupCloudIcon from "../components/BackupCloudIcon";
 import { useEventStream } from "../hooks/useEventStream";
 import { useStickyScroll } from "../hooks/useStickyScroll";
 import { useToast } from "../components/Toast";
+import { useStepUp } from "../components/StepUpDialog";
 import { announceRunEnd, runEndNotice } from "../lib/runNotice";
 import { copyText, hasTextSelection } from "../clipboard";
 import UnprotectedBanner from "../components/UnprotectedBanner";
@@ -50,6 +51,7 @@ export default function NodeDetail() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
   const toast = useToast();
+  const { confirmed, dialog: stepUpDialog } = useStepUp();
   const [page, setPage] = useState<ContainerPage | null>(null);
   const [q, setQ] = useState("");          // container search (server-side)
   const [pageNum, setPageNum] = useState(1);
@@ -447,7 +449,7 @@ export default function NodeDetail() {
       "check the image before re-pinning."
     )) return;
     try {
-      await api.repinSidecar(id);
+      await confirmed((credentials) => api.repinSidecar(id, credentials));
       toast.success("Sidecar image will be re-pinned on the next backup");
       refresh();
     } catch (e) { toast.error(`Couldn't re-pin: ${(e as Error).message}`); }
@@ -461,6 +463,7 @@ export default function NodeDetail() {
 
   return (
     <div>
+      {stepUpDialog}
       {/* Per-run destination picker for the full-server bulk backup. */}
       <BackupTargetsModal
         open={!!pending}

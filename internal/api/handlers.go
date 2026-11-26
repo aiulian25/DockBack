@@ -830,12 +830,19 @@ func (s *Server) handleSetContainerHooks(w http.ResponseWriter, r *http.Request)
 		errJSON(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	var hooks backup.SavedHooks
-	if err := readJSON(r, &hooks); err != nil {
+	var req struct {
+		stepUpBody
+		backup.SavedHooks
+	}
+	if err := readJSON(r, &req); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	js, _ := json.Marshal(hooks)
+	js, _ := json.Marshal(req.SavedHooks)
+	// Hooks are shell commands DockBack runs inside the container, as any user.
+	if !s.freshProofForCommands(w, r, req.stepUpBody, backup.HooksSettingKey(id, d.Name), string(js)) {
+		return
+	}
 	if err := s.store.SetSetting(backup.HooksSettingKey(id, d.Name), string(js)); err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -947,6 +954,7 @@ func (s *Server) handleSetExcludeRegenerable(w http.ResponseWriter, r *http.Requ
 // Auth + CSRF gated and audited, like every other per-container backup option.
 func (s *Server) handleSetRequireWriteOnly(w http.ResponseWriter, r *http.Request) {
 	var body struct {
+		stepUpBody
 		Require bool `json:"require"`
 	}
 	if err := readJSON(r, &body); err != nil {
@@ -955,6 +963,12 @@ func (s *Server) handleSetRequireWriteOnly(w http.ResponseWriter, r *http.Reques
 	}
 	id, name, image, ok := s.resolveContainerForEdit(w, r)
 	if !ok {
+		return
+	}
+	// A container that requires write-only backups has its restores ask for the
+	// password by default, so dropping the requirement can take that off.
+	protectedAfter := s.restoreProtectedWith(id, name, s.isCriticalDB(id, name), body.Require)
+	if !s.freshProofToUnprotectRestores(w, r, body.stepUpBody, id, name, protectedAfter) {
 		return
 	}
 	if err := s.engine.SetRequireWriteOnly(id, name, body.Require); err != nil {
@@ -1262,12 +1276,19 @@ func (s *Server) handleSetExportProfile(w http.ResponseWriter, r *http.Request) 
 		errJSON(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	var sp backup.SavedExportProfile
-	if err := readJSON(r, &sp); err != nil {
+	var req struct {
+		stepUpBody
+		backup.SavedExportProfile
+	}
+	if err := readJSON(r, &req); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	js, _ := json.Marshal(sp)
+	js, _ := json.Marshal(req.SavedExportProfile)
+	// An export profile is shell commands too: export, import and verify lines.
+	if !s.freshProofForCommands(w, r, req.stepUpBody, backup.ExportProfileKey(id, d.Name), string(js)) {
+		return
+	}
 	if err := s.store.SetSetting(backup.ExportProfileKey(id, d.Name), string(js)); err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1305,11 +1326,15 @@ func (s *Server) handleExportProfileExport(w http.ResponseWriter, r *http.Reques
 // an operator-authored shell recipe that runs in the container with its privileges
 // (an intentional operator-level capability, SEC-7), not an external vector.
 func (s *Server) handleExportProfileImport(w http.ResponseWriter, r *http.Request) {
-	var sp backup.SavedExportProfile
-	if err := readJSON(r, &sp); err != nil {
+	var req struct {
+		stepUpBody
+		backup.SavedExportProfile
+	}
+	if err := readJSON(r, &req); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid export profile JSON")
 		return
 	}
+	sp := req.SavedExportProfile
 	sp.Dir = strings.TrimSpace(sp.Dir)
 	sp.ExportCmd = strings.TrimSpace(sp.ExportCmd)
 	sp.ImportCmd = strings.TrimSpace(sp.ImportCmd)
@@ -1333,6 +1358,9 @@ func (s *Server) handleExportProfileImport(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	js, _ := json.Marshal(sp)
+	if !s.freshProofForCommands(w, r, req.stepUpBody, backup.ExportProfileKey(id, d.Name), string(js)) {
+		return
+	}
 	if err := s.store.SetSetting(backup.ExportProfileKey(id, d.Name), string(js)); err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -3997,7 +4025,10 @@ func (s *Server) handleSetSettings(w http.ResponseWriter, r *http.Request) {
 	stepUp := stepUpBody{Password: req[stepUpPasswordKey], Code: req[stepUpCodeKey]}
 	delete(req, stepUpPasswordKey)
 	delete(req, stepUpCodeKey)
-	if authPolicyChange(req) && !s.requireFreshAuth(w, r, stepUp) {
+	// The helper image is started against every container's data, so choosing
+	// another one is gated the same way (SEC-002).
+	needsFreshProof := authPolicyChange(req) || helperImageChange(req)
+	if needsFreshProof && !s.requireFreshAuth(w, r, stepUp) {
 		return
 	}
 	// Validate + coerce every key against the allow-list up front; reject the whole
@@ -4371,9 +4402,20 @@ func promLabel(s string) string {
 // trust-on-first-use rule that established the original.
 func (s *Server) handleRepinSidecar(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	var credentials stepUpBody
+	if r.ContentLength != 0 {
+		if err := readJSON(r, &credentials); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid request")
+			return
+		}
+	}
 	n, err := s.store.GetNode(id)
 	if err != nil {
 		errJSON(w, http.StatusNotFound, "node not found")
+		return
+	}
+	// Accepting a changed image is what makes a substituted one run (SEC-002).
+	if !s.requireFreshAuth(w, r, credentials) {
 		return
 	}
 	old, _ := s.store.GetSidecarPin(id)

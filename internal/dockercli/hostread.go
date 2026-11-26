@@ -68,7 +68,7 @@ func ReadHostFile(ctx context.Context, c *client.Client, hostPath string, maxByt
 	}
 	created, err := c.ContainerCreate(ctx,
 		&container.Config{Image: sidecarRef(), Cmd: []string{"sleep", "120"}, Labels: sidecarLabels()},
-		&container.HostConfig{Binds: []string{"/:" + hostReadMount + ":ro"}},
+		confineHelper(&container.HostConfig{Binds: []string{"/:" + hostReadMount + ":ro"}}),
 		nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("host-read sidecar create: %w", err)

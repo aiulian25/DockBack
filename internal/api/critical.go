@@ -232,6 +232,7 @@ func (s *Server) handleSetCritical(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	cid := r.PathValue("cid")
 	var body struct {
+		stepUpBody
 		Enabled    bool `json:"enabled"`
 		RPOSeconds int  `json:"rpo_seconds"`
 	}
@@ -256,6 +257,13 @@ func (s *Server) handleSetCritical(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(insp.Name, "/")
 	if backup.DBEngine(insp.Config.Image) == "" {
 		errJSON(w, http.StatusBadRequest, "low-RPO protection applies to database containers only")
+		return
+	}
+
+	// A critical database's restores ask for the password by default, so unmarking
+	// one can be the way that protection is taken off.
+	protectedAfter := s.restoreProtectedWith(id, name, body.Enabled, s.engine.RequireWriteOnly(id, name))
+	if !s.freshProofToUnprotectRestores(w, r, body.stepUpBody, id, name, protectedAfter) {
 		return
 	}
 

@@ -228,6 +228,9 @@ CSRF="$(curl -fsS -c "$JAR" -X POST "$BASE/api/login" -H 'Content-Type: applicat
   -d "{\"username\":\"$DOCKBACK_ADMIN_USER\",\"password\":\"$DOCKBACK_ADMIN_PASSWORD\"}" | jget 'd["csrf"]')"
 [ -n "$CSRF" ] || fail "login failed"
 auth=(-b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json')
+# Saving commands that run inside a container (hooks, an export profile) asks for the
+# password again, so those requests carry it as this JSON member.
+CONFIRM_PASSWORD="\"password\":\"$DOCKBACK_ADMIN_PASSWORD\""
 
 # ── shared helpers ───────────────────────────────────────────────────────────
 
@@ -1222,7 +1225,7 @@ case_hook_cleanup() {
   # set_hooks <pre-line> — the post-hook is always the same line.
   set_hooks() {
     curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/hooks" \
-      -d "{\"pre\":[\"$1\"],\"post\":[\"echo off >> $HOOK_LOG\"]}" >/dev/null
+      -d "{\"pre\":[\"$1\"],\"post\":[\"echo off >> $HOOK_LOG\"],$CONFIRM_PASSWORD}" >/dev/null
     docker exec "$TARGET" sh -c ": > $HOOK_LOG"
   }
   hook_log() { docker exec "$TARGET" cat "$HOOK_LOG" | tr '\n' ' '; }
@@ -1676,7 +1679,7 @@ case_restore_outcome() {
 
   step "A post-restore hook that fails, then a restore"
   curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/hooks" \
-    -d '{"post_restore":["sh -c \"exit 7\""]}' >/dev/null || fail "could not set the hook"
+    -d "{\"post_restore\":[\"sh -c \\\"exit 7\\\"\"],$CONFIRM_PASSWORD}" >/dev/null || fail "could not set the hook"
   BID="$(backup_and_verify "$CID" "$TARGET")"
   start_restore ""
   [ "$(await_outcome "")" = ok ] || fail "the hook is non-fatal, so the restore should have succeeded: $(status_field message)"
@@ -1789,7 +1792,7 @@ EOF
   curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/backup-options" \
     -d '{"compression":"balanced","save_image":true,"app_export":true,"incremental":true}' >/dev/null || fail "could not save the options"
   curl -fsS "${auth[@]}" -X PUT "$BASE/api/nodes/local/containers/$CID/export-profile" \
-    -d '{"dir":"/app/export","export_cmd":"mkdir -p /app/export && cp /app/data/recipe.txt /app/export/","import_cmd":"true"}' >/dev/null \
+    -d "{\"dir\":\"/app/export\",\"export_cmd\":\"mkdir -p /app/export && cp /app/data/recipe.txt /app/export/\",\"import_cmd\":\"true\",$CONFIRM_PASSWORD}" >/dev/null \
     || fail "could not save the export profile"
 
   step "Take an app-consistent snapshot of the stack"

@@ -15,7 +15,7 @@ Some apps need a moment of quiet to guarantee a consistent snapshot: flush cache
 
 On a container's detail page, expand **Advanced — Backup Hooks**. Enter the pre and post commands (one per line) and, if needed, the user to run them as. Hooks execute inside the container via the node's `EXEC`/`POST` permissions.
 
-> **Security:** Hook commands run inside the target container with that container's privileges and user — treat them like operator-level shell access and enter only commands you trust. Only a signed-in administrator can set hooks, and the change is protected against cross-site requests.
+> **Security:** Hook commands run inside the target container with that container's privileges and user — treat them like operator-level shell access and enter only commands you trust. Only a signed-in administrator can set hooks, and the change is protected against cross-site requests. Saving a new or changed command also asks for your **password again** (and your 2FA code, if you use one), so a browser left signed in cannot be used to run commands in your containers. The same applies to an app-native **export profile**, which is commands too. Saving a form unchanged, or clearing commands, asks for nothing.
 
 > Hooks require a shell in the target container. Containers built `FROM scratch`/distroless (no `/bin/sh`) can't run shell hooks — capture their data with the standard volume/dump strategy or an app-native export instead.
 
